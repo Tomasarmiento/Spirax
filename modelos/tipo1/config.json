@@ -1,0 +1,10 @@
+{
+  "corte_y_top_pct": 0.1604,
+  "corte_y_pct": 0.9896,
+  "corte_x_izq_pct": 0.1656,
+  "corte_x_der_pct": 0.8531,
+  "exposure": 1,
+  "gain": 60,
+  "saturation": 50,
+  "bg_diff_thresh": 30
+}
