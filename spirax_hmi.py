@@ -4,28 +4,13 @@ spirax_hmi.py - HMI Spirax (tkinter) + Servidor EKI integrado
 Multi-modelo: cada Tipo (1-6) tiene su carpeta modelos/tipoN/ con su
 referencia.png y su config.json.
 
-Pestania OPERAR:
-    - Selector de Tipo (1-6) - tilde verde si tiene referencia, X rojo si no
-    - Modo Manual / Automatico (camara)
-    - Botones de orientacion (modo Manual)
-    - Panel de la ultima deteccion
-    - Estado del robot
-
-Pestania CALIBRAR:
-    - Banner con el Tipo activo
-    - Selector de Tipo (1-6) - mismo estilo, indica cual esta calibrado
-    - Preview en vivo de la camara
-    - Capturar referencia para el tipo activo (modelos/tipoN/referencia.png)
-    - Ajustar recorte (4 lineas) para el tipo activo
-    - Sliders de exposicion, ganancia y threshold (persistidos en
-      modelos/tipoN/config.json)
-
-Pestania LOG:
-    - Eventos del servidor EKI y de la vision
+Servidor TCP robusto: keepalive activado, reconexion automatica si el
+socket se rompe, cleanup limpio al cerrar la HMI.
 """
 
 import os
 import socket
+import struct
 import threading
 import time
 import tkinter as tk
@@ -48,6 +33,7 @@ from spirax_vision import (
 HOST = '172.31.1.100'
 PORT = 54600
 BUFFER_SIZE = 1024
+RECV_TIMEOUT = 60.0  # segundos sin trafico antes de hacer poll
 
 # Tamano del panel de imagen
 PANEL_W = 400
@@ -72,6 +58,9 @@ class EstadoCompartido:
         self.ultimo_ratio = None
         self.ultimo_panel = None
         self.ultimo_error = None
+
+        # Flag para apagar el server al cerrar la HMI
+        self.shutdown = False
 
     def get_estado(self):
         with self.lock:
@@ -111,21 +100,74 @@ detector = DetectorOrientacion(tipo_inicial=1)
 
 
 # ======================================================================
-#  Servidor TCP
+#  Servidor TCP - robusto con keepalive
 # ======================================================================
 
+def configurar_keepalive(sock):
+    """Activa TCP keepalive en el socket para detectar caidas silenciosas
+    del cliente (robot apagado, cable desenchufado, etc).
+    
+    Tiempos cortos: idle 10s, probe cada 3s, 3 fallos -> kill.
+    Eso significa que una caida fisica se detecta en ~20s maximo.
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Windows: usar SIO_KEEPALIVE_VALS con tuple (onoff, time_ms, interval_ms)
+    if hasattr(socket, 'SIO_KEEPALIVE_VALS'):
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+        except (OSError, AttributeError, TypeError):
+            pass
+    
+    # Linux / Mac: TCP_KEEP* options
+    if hasattr(socket, 'TCP_KEEPIDLE'):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        except OSError:
+            pass
+    if hasattr(socket, 'TCP_KEEPINTVL'):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        except OSError:
+            pass
+    if hasattr(socket, 'TCP_KEEPCNT'):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError:
+            pass
+
 def manejar_robot(conn, addr, log_callback):
+    """Maneja la conversacion con un robot conectado.
+    Activa keepalive y timeout para detectar caidas.
+    """
     log_callback(f">>> Robot conectado desde {addr[0]}:{addr[1]}")
     estado.robot_conectado = True
+    
+    configurar_keepalive(conn)
+    conn.settimeout(RECV_TIMEOUT)
 
     try:
-        while True:
-            data = conn.recv(BUFFER_SIZE)
-            if not data:
-                log_callback("<<< Robot cerro la conexion")
+        while not estado.shutdown:
+            try:
+                data = conn.recv(BUFFER_SIZE)
+            except socket.timeout:
+                # Sin trafico en RECV_TIMEOUT: hacer poll para chequear vida
+                try:
+                    # send vacio: chequea sin enviar nada visible al robot
+                    conn.sendall(b'')
+                    continue
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    log_callback(f"<<< Robot no responde al poll: {e}")
+                    break
+            except (ConnectionResetError, ConnectionAbortedError) as e:
+                log_callback(f"<<< Conexion perdida con el robot: {e}")
                 break
 
-            mensaje = data.decode('utf-8').strip()
+            if not data:
+                log_callback("<<< Robot cerro la conexion (FIN)")
+                break
+
+            mensaje = data.decode('utf-8', errors='replace').strip()
             log_callback(f"<-- Recibido: {mensaje}")
 
             estado.registrar_consulta()
@@ -144,15 +186,25 @@ def manejar_robot(conn, addr, log_callback):
                 f"</Response>"
             )
 
-            conn.sendall(respuesta.encode('utf-8'))
-            log_callback(f"--> Enviado:  {respuesta}")
+            try:
+                conn.sendall(respuesta.encode('utf-8'))
+                log_callback(f"--> Enviado:  {respuesta}")
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                log_callback(f"!!! Error enviando respuesta: {e}")
+                break
 
-    except ConnectionResetError:
-        log_callback("!!! Conexion perdida con el robot")
     except Exception as e:
-        log_callback(f"!!! Error: {e}")
+        log_callback(f"!!! Error inesperado en manejar_robot: {e}")
     finally:
-        conn.close()
+        try:
+            # SHUT_RDWR para forzar cierre limpio en ambas direcciones
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
         estado.robot_conectado = False
 
 
@@ -163,7 +215,6 @@ def consultar_vision(tipo, log_callback):
         estado.set_deteccion("VACIO", None, None, error="Detector inactivo")
         return "VACIO"
 
-    # Apuntar al tipo correcto antes de analizar (carga referencia + config)
     try:
         if detector.tipo_activo() != tipo:
             detector.usa_tipo(tipo)
@@ -173,7 +224,6 @@ def consultar_vision(tipo, log_callback):
         estado.set_deteccion("VACIO", None, None, error=str(e))
         return "VACIO"
 
-    # Si no hay referencia para ese tipo, mandamos VACIO y avisamos
     if not detector.tiene_referencia_activa():
         log_callback(f"!!! Tipo {tipo} no tiene referencia calibrada -> VACIO")
         estado.set_deteccion("VACIO", None, None,
@@ -208,22 +258,57 @@ def consultar_vision(tipo, log_callback):
 
 
 def correr_servidor(log_callback):
+    """Loop externo: si el socket de escucha se rompe por cualquier
+    motivo, lo reabre. Asi sobrevive a problemas de SO, cambios de red,
+    etc.
+    """
     log_callback(f"=== Servidor EKI iniciado en {HOST}:{PORT} ===")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
-        servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        servidor.bind((HOST, PORT))
-        servidor.listen(1)
-
-        log_callback("Esperando conexion del robot KUKA...")
-
-        while True:
+    while not estado.shutdown:
+        servidor = None
+        try:
+            servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # SO_REUSEPORT solo existe en Linux/Mac
             try:
-                conn, addr = servidor.accept()
+                servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+
+            # Timeout corto en accept() para poder revisar shutdown
+            servidor.settimeout(1.0)
+            servidor.bind((HOST, PORT))
+            servidor.listen(1)
+
+            log_callback("Esperando conexion del robot KUKA...")
+
+            while not estado.shutdown:
+                try:
+                    conn, addr = servidor.accept()
+                except socket.timeout:
+                    continue  # vuelve a chequear shutdown
+                except OSError as e:
+                    log_callback(f"!!! accept() fallo: {e}")
+                    break  # cae al loop externo, reabre el socket
+
                 manejar_robot(conn, addr, log_callback)
-                log_callback("Esperando proxima conexion del robot...")
-            except Exception as e:
-                log_callback(f"!!! Error en servidor: {e}")
+                if not estado.shutdown:
+                    log_callback("Esperando proxima conexion del robot...")
+
+        except OSError as e:
+            log_callback(f"!!! Socket de escucha roto, reabriendo en 2s: {e}")
+            time.sleep(2)
+        except Exception as e:
+            log_callback(f"!!! Error fatal en servidor: {e}")
+            time.sleep(2)
+        finally:
+            if servidor is not None:
+                try:
+                    servidor.close()
+                except OSError:
+                    pass
+
+    log_callback("=== Servidor EKI detenido ===")
 
 
 # ======================================================================
@@ -310,10 +395,6 @@ class HMISpirax:
     #  Helper: estado visual de un boton de tipo
     # ==================================================================
     def _refrescar_boton_tipo(self, btn, tipo, seleccionado):
-        """Pinta el boton de tipo segun:
-        - Si es el seleccionado: azul.
-        - Sino: blanco con tilde verde (calibrado) o cruz roja (sin ref).
-        """
         if tiene_referencia(tipo):
             label = f"Tipo {tipo}\n  OK"
         else:
@@ -668,7 +749,6 @@ class HMISpirax:
     # ==================================================================
     def _seleccionar_tipo_operar(self, tipo):
         estado.set_tipo(tipo)
-        # Refrescar estado visual de los 6 botones
         for i, btn in enumerate(self.btns_tipo_operar):
             self._refrescar_boton_tipo(btn, i + 1, seleccionado=(i + 1 == tipo))
         self._actualizar_label_seleccion()
@@ -686,9 +766,6 @@ class HMISpirax:
     def _cambiar_modo(self, auto):
         if auto:
             if not detector.esta_activo():
-                # No requerimos referencia para arrancar la camara: el
-                # detector la cargara segun el tipo activo en cada consulta.
-                # Pero avisamos si el tipo seleccionado actualmente no la tiene.
                 est = estado.get_estado()
                 if not tiene_referencia(est["tipo"]):
                     if not messagebox.askyesno(
@@ -770,28 +847,20 @@ class HMISpirax:
     #  Handlers CALIBRAR
     # ==================================================================
     def _seleccionar_tipo_calibrar(self, tipo):
-        """Cambia el tipo activo en la pestana Calibrar.
-        Recarga sliders, recorte, banner y estado de archivos.
-        """
-        # Si hay preview corriendo lo paramos para reiniciar la camara con
-        # los params del nuevo tipo (exposicion/ganancia)
         venia_preview = self._preview_activo
         if venia_preview:
             self._detener_preview()
 
         self._tipo_calibrar = tipo
 
-        # Hacer que el detector use esa config (recarga referencia + params)
         try:
             detector.usa_tipo(tipo)
         except Exception as e:
             self._agregar_log(f"!!! Error cargando Tipo {tipo}: {e}")
 
-        # Refrescar botones
         for i, btn in enumerate(self.btns_tipo_calibrar):
             self._refrescar_boton_tipo(btn, i + 1, seleccionado=(i + 1 == tipo))
 
-        # Refrescar banner
         if tiene_referencia(tipo):
             self.lbl_banner_calibrar.configure(
                 text=f"CALIBRANDO: TIPO {tipo}", fg='#7fffd4')
@@ -803,7 +872,6 @@ class HMISpirax:
             self.lbl_estado_calibrar.configure(
                 text="(falta capturar referencia)", fg='#ff6b6b')
 
-        # Refrescar sliders con los params del tipo
         try:
             self.scl_exp.set(detector.exposure)
             self.scl_gain.set(detector.gain)
@@ -815,7 +883,6 @@ class HMISpirax:
         self._mostrar_referencia_calibrar()
         self._agregar_log(f"[CALIBRAR] Tipo activo: {tipo}")
 
-        # Si veniamos con preview activo, reanudarlo con los nuevos params
         if venia_preview:
             self._iniciar_preview()
 
@@ -890,11 +957,6 @@ class HMISpirax:
             pass
 
     def _mostrar_referencia_calibrar(self):
-        """Carga y muestra la referencia.png del tipo activo en Calibrar
-        con el recorte configurado superpuesto (4 lineas amarillas +
-        sombreado fuera del area util). Si no hay referencia, muestra
-        placeholder.
-        """
         tipo = self._tipo_calibrar
         ref_path = path_referencia(tipo)
 
@@ -909,7 +971,6 @@ class HMISpirax:
 
         try:
             from spirax_vision import cargar_config
-            import numpy as np
 
             ref = cv2.imread(ref_path)
             if ref is None:
@@ -922,7 +983,6 @@ class HMISpirax:
             x_izq = int(w * cfg.get("corte_x_izq_pct", 0.0))
             x_der = int(w * cfg.get("corte_x_der_pct", 1.0))
 
-            # Sombrear zonas fuera del recorte (igual que modo_recorte)
             debug = ref.copy()
             overlay = debug.copy()
             cv2.rectangle(overlay, (0, 0), (w, y_top), (0, 0, 0), -1)
@@ -931,7 +991,6 @@ class HMISpirax:
             cv2.rectangle(overlay, (x_der, y_top), (w, y_bot), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.5, debug, 0.5, 0, debug)
 
-            # Lineas amarillas del recorte
             cv2.line(debug, (0, y_top), (w, y_top), (0, 255, 255), 2)
             cv2.line(debug, (0, y_bot), (w, y_bot), (0, 255, 255), 2)
             cv2.line(debug, (x_izq, 0), (x_izq, h), (0, 255, 255), 2)
@@ -978,7 +1037,6 @@ class HMISpirax:
         if not respuesta:
             return
 
-        # Si hay preview activo usamos el ultimo frame del preview
         with self._frame_lock:
             frame = (self._ultimo_frame_preview.copy()
                      if self._ultimo_frame_preview is not None else None)
@@ -998,7 +1056,6 @@ class HMISpirax:
             messagebox.showinfo("Referencia",
                                 f"Guardada como {ref_path}.\n\n"
                                 f"Ya queda cargada en el detector.")
-            # Refrescar estado visual de todos los botones de tipo
             self._refrescar_estado_archivos()
             for i, btn in enumerate(self.btns_tipo_calibrar):
                 self._refrescar_boton_tipo(btn, i + 1,
@@ -1007,12 +1064,10 @@ class HMISpirax:
                 est = estado.get_estado()
                 self._refrescar_boton_tipo(btn, i + 1,
                                            seleccionado=(i + 1 == est["tipo"]))
-            # Banner
             self.lbl_banner_calibrar.configure(
                 text=f"CALIBRANDO: TIPO {tipo}", fg='#7fffd4')
             self.lbl_estado_calibrar.configure(
                 text="(referencia OK)", fg='#7fff7f')
-            # Mostrar la imagen recien capturada en el panel de la derecha
             self._mostrar_referencia_calibrar()
         except Exception as e:
             self._agregar_log(f"!!! Error guardando referencia: {e}")
@@ -1046,12 +1101,10 @@ class HMISpirax:
         try:
             ok = modo_recorte(imagen, tipo)
             if ok:
-                # Recargar referencia con el nuevo recorte
                 if os.path.exists(ref_path):
                     detector.recargar_referencia()
                 self._agregar_log(f"[CALIBRAR] Recorte Tipo {tipo} guardado.")
                 self._refrescar_estado_archivos()
-                # Refrescar la imagen de referencia con las lineas del nuevo recorte
                 self._mostrar_referencia_calibrar()
             else:
                 self._agregar_log("[CALIBRAR] Recorte cancelado.")
@@ -1078,9 +1131,6 @@ class HMISpirax:
             self._agregar_log(f"!!! threshold: {e}")
 
     def _persistir_sliders(self, _evt=None):
-        """Llamado al soltar cualquier slider: guarda los 4 valores
-        actuales en config.json del TIPO ACTIVO en Calibrar.
-        """
         try:
             detector.set_exposure(detector.exposure, persist=True)
             self._agregar_log(
@@ -1134,7 +1184,11 @@ class HMISpirax:
         self.txt_log.see('end')
 
     def _log_thread_safe(self, mensaje):
-        self.root.after(0, self._agregar_log, mensaje)
+        try:
+            self.root.after(0, self._agregar_log, mensaje)
+        except RuntimeError:
+            # root ya destruido durante shutdown
+            pass
 
     # ==================================================================
     #  Server
@@ -1201,12 +1255,17 @@ class HMISpirax:
     #  Cierre
     # ==================================================================
     def _on_close(self):
+        # Avisar al server que se baje
+        estado.shutdown = True
         self._preview_activo = False
         try:
             if detector.esta_activo():
                 detector.stop()
         except Exception:
             pass
+        # Pequena pausa para que el thread del server vea el flag
+        # y cierre limpio (en vez de que Tkinter mate el proceso)
+        time.sleep(0.2)
         self.root.destroy()
 
 
