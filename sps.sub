@@ -1,0 +1,222 @@
+&ACCESS  RVO
+&COMMENT PLC on control
+DEF  SPS ( )
+  ;FOLD DECLARATIONS
+  ;FOLD BASISTECH DECL
+  DECL STATE_T STAT
+  DECL MODUS_T MODE
+  ;ENDFOLD (BASISTECH DECL)
+  ;FOLD USER DECL
+  DECL EKI_STATUS EKI_RET
+  DECL INT INTENTOS_EKI
+  DECL INT SP_DELAY_CLAMP
+  DECL INT SP_RECONNECT_DELAY
+  DECL BOOL EKI_CONECTADO
+  ;ENDFOLD (USER DECL)
+  ;ENDFOLD (DECLARATIONS)
+  ;FOLD INI
+  ;FOLD BASISTECH INIT
+  BasisTech_PLC_INIT()
+  ;ENDFOLD (BASISTECH INIT)
+  ;FOLD AUTOEXT INIT
+  INTERRUPT DECL 91 WHEN $PRO_STATE1==#P_FREE DO RESET_OUT ()
+  INTERRUPT ON 91
+  INTERRUPT DECL 92 WHEN $PRO_MOVE==TRUE DO RESET_LINESEL()
+  INTERRUPT ON 92
+  $LOOP_MSG[]="                                                            "
+  MODE=#SYNC
+  $H_POS=$H_POS
+  IF $MODE_OP==#EX THEN
+    CWRITE($CMD,STAT,MODE,"RUN /R1/CELL()")
+  ENDIF
+  ;ENDFOLD (AUTOEXT INIT)
+  ;FOLD BACKUPMANAGER PLC INIT
+  BM_ENABLED = FALSE
+  BM_OUTPUTVALUE = 0
+  ;ENDFOLD (BACKUPMANAGER PLC INIT)
+  ;FOLD USER INIT
+  TIPO_GLOBAL = 0
+  ORIENT_GLOBAL[] = "       "
+  FILA_GLOBAL = 0
+  COLUMNA_GLOBAL = 0
+  ESTACION_PEDIDO = 1
+  $FLAG[20] = FALSE
+  $FLAG[21] = FALSE
+  $FLAG[22] = FALSE
+  $OUT[2] = FALSE
+  $OUT[3] = FALSE
+  $OUT[4] = FALSE
+  $OUT[10] = FALSE
+  SP_ESTADO = 0
+  SP_DELAY_CLAMP = 0
+  SP_RECONNECT_DELAY = 0
+  INTENTOS_EKI = 0
+  EKI_CONECTADO = FALSE
+
+  EKI_RET=EKI_Clear("Vision")
+  EKI_RET=EKI_Close("Vision")
+  EKI_RET=EKI_Init("Vision")
+  EKI_RET=EKI_Open("Vision")
+  ;ENDFOLD (USER INIT)
+  ;ENDFOLD (INI)
+  LOOP
+    WAIT FOR NOT($POWER_FAIL)
+	;FOLD BASISTECH PLC
+	   BasisTech_PLC_LOOP()
+	;ENDFOLD (BASISTECH PLC)
+    ;FOLD BACKUPMANAGER PLC
+    IF BM_ENABLED THEN
+      BM_OUTPUTSIGNAL = BM_OUTPUTVALUE
+    ENDIF
+    ;ENDFOLD (BACKUPMANAGER PLC)
+    ;FOLD USER PLC
+    ;-------------------------------------------------------------
+    ;Chequear si el robot esta en HOME (tolerancia 1 grado por eje)
+    ;-------------------------------------------------------------
+    IF (ABS($AXIS_ACT.A1 - XHOME.A1) < 1.0) AND (ABS($AXIS_ACT.A2 - XHOME.A2) < 1.0) AND (ABS($AXIS_ACT.A3 - XHOME.A3) < 1.0) AND (ABS($AXIS_ACT.A4 - XHOME.A4) < 1.0) AND (ABS($AXIS_ACT.A5 - XHOME.A5) < 1.0) AND (ABS($AXIS_ACT.A6 - XHOME.A6) < 1.0) THEN
+      $FLAG[22] = TRUE
+    ELSE
+      $FLAG[22] = FALSE
+    ENDIF
+
+    ;-------------------------------------------------------------
+    ;Sincronizar EKI_CONECTADO con la flag del canal
+    ;-------------------------------------------------------------
+    IF EKI_CONECTADO AND NOT $FLAG[12] THEN
+      EKI_CONECTADO = FALSE
+      IF SP_ESTADO == 1 THEN
+        SP_DELAY_CLAMP = 0
+        INTENTOS_EKI = 0
+      ENDIF
+    ENDIF
+
+    IF NOT EKI_CONECTADO THEN
+      IF $FLAG[12]==TRUE THEN
+        EKI_CONECTADO = TRUE
+        SP_RECONNECT_DELAY = 0
+      ELSE
+        SP_RECONNECT_DELAY = SP_RECONNECT_DELAY + 1
+        IF SP_RECONNECT_DELAY > 400 THEN
+          SP_RECONNECT_DELAY = 0
+          EKI_RET=EKI_Clear("Vision")
+          EKI_RET=EKI_Close("Vision")
+          EKI_RET=EKI_Init("Vision")
+          IF EKI_RET.MSG_NO==0 THEN
+            EKI_RET=EKI_Open("Vision")
+          ENDIF
+        ENDIF
+      ENDIF
+    ENDIF
+
+    ;-------------------------------------------------------------
+    ;Maquina de estados
+    ;-------------------------------------------------------------
+    SWITCH SP_ESTADO
+      CASE 0
+        ; IDLE: esperando que llegue una pieza al stopper
+        IF $IN[2]==TRUE THEN
+          $OUT[10] = TRUE
+          $FLAG[20] = FALSE
+          $FLAG[21] = FALSE
+          SP_DELAY_CLAMP = 0
+          INTENTOS_EKI = 0
+          SP_ESTADO = 1
+        ENDIF
+
+      CASE 1
+        ; Pidiendo vision al HMI
+        IF EKI_CONECTADO==TRUE THEN
+          IF SP_DELAY_CLAMP < 20 THEN
+            SP_DELAY_CLAMP = SP_DELAY_CLAMP + 1
+            IF SP_DELAY_CLAMP == 20 THEN
+              ; Mandar request con la estacion que pidio el Master
+              EKI_RET=EKI_SetInt("Vision", "Request/Estacion", ESTACION_PEDIDO)
+              IF EKI_RET.MSG_NO<>0 THEN
+                EKI_CONECTADO = FALSE
+              ELSE
+                EKI_RET=EKI_Send("Vision", "Request")
+                IF EKI_RET.MSG_NO<>0 THEN
+                  EKI_CONECTADO = FALSE
+                ENDIF
+              ENDIF
+              INTENTOS_EKI = 0
+            ENDIF
+          ELSE
+            EKI_RET=EKI_CheckBuffer("Vision", "Response/Tipo")
+            IF EKI_RET.BUFF>0 THEN
+              EKI_RET=EKI_GetInt("Vision", "Response/Tipo", TIPO_GLOBAL)
+              EKI_RET=EKI_GetString("Vision", "Response/Orientacion", ORIENT_GLOBAL[])
+              EKI_RET=EKI_GetInt("Vision", "Response/Fila", FILA_GLOBAL)
+              EKI_RET=EKI_GetInt("Vision", "Response/Columna", COLUMNA_GLOBAL)
+              
+              ; Validar respuesta segun estacion pedida
+              IF ESTACION_PEDIDO == 1 THEN
+                ; Cinta: TIPO_GLOBAL debe ser 1-6
+                IF (TIPO_GLOBAL>=1) AND (TIPO_GLOBAL<=6) THEN
+                  $FLAG[20] = TRUE
+                  SP_ESTADO = 2
+                ELSE
+                  SP_DELAY_CLAMP = 0
+                  INTENTOS_EKI = 0
+                ENDIF
+              ELSE
+                ; Mesa: TIPO_GLOBAL 1-6, dejamos que el Master valide
+                ; FILA/COLUMNA. Si son 0/0 el Master frena con MsgQuit.
+                IF (TIPO_GLOBAL>=1) AND (TIPO_GLOBAL<=6) THEN
+                  $FLAG[20] = TRUE
+                  SP_ESTADO = 2
+                ELSE
+                  SP_DELAY_CLAMP = 0
+                  INTENTOS_EKI = 0
+                ENDIF
+              ENDIF
+            ELSE
+              INTENTOS_EKI = INTENTOS_EKI + 1
+              IF INTENTOS_EKI > 200 THEN
+                SP_DELAY_CLAMP = 0
+                INTENTOS_EKI = 0
+              ENDIF
+            ENDIF
+          ENDIF
+        ENDIF
+
+      CASE 2
+        ; Datos listos: el Master procesa, esperamos $FLAG[21]
+        IF $FLAG[21]==TRUE THEN
+          $OUT[10] = FALSE
+          $FLAG[21] = FALSE
+          TIPO_GLOBAL = 0
+          ORIENT_GLOBAL[] = "       "
+          FILA_GLOBAL = 0
+          COLUMNA_GLOBAL = 0
+          SP_ESTADO = 0
+        ENDIF
+    ENDSWITCH
+    ;ENDFOLD (USER PLC)
+  ENDLOOP
+  ;FOLD ;%{H}
+  ;FOLD
+END
+  ;ENDFOLD
+DEF  RESET_OUT ( )
+  INT N
+  MsgLoop(" ")
+  IF REFLECT_PROG_NR == 1 THEN
+    FOR N = 0 TO PGNO_LENGTH - 1
+      $OUT[PGNO_FBIT_REFL + N] = FALSE
+    ENDFOR
+  ENDIF
+  IF (PGNO_REQ>0) THEN
+    $OUT[PGNO_REQ]=FALSE
+  ELSE
+    IF (PGNO_REQ<0) THEN
+      $OUT[-PGNO_REQ]=TRUE
+    ENDIF
+  ENDIF
+END
+DEF RESET_LINESEL()
+  $LINE_SEL_OK=FALSE
+END
+;FOLD USER SUBROUTINE
+;ENDFOLD (USER SUBROUTINE)
+;ENDFOLD

@@ -1,0 +1,25 @@
+<ETHERNETKRL>
+  <CONFIGURATION>
+    <EXTERNAL>
+      <TYPE>Server</TYPE>
+      <IP>172.31.1.100</IP>
+      <PORT>54600</PORT>
+    </EXTERNAL>
+    <INTERNAL>
+      <ALIVE Set_Flag="12" Ping="5"/>
+    </INTERNAL>
+  </CONFIGURATION>
+  <RECEIVE>
+    <XML>
+      <ELEMENT Tag="Response/Tipo" Type="INT" />
+      <ELEMENT Tag="Response/Orientacion" Type="STRING" />
+      <ELEMENT Tag="Response/Fila" Type="INT" />
+      <ELEMENT Tag="Response/Columna" Type="INT" />
+    </XML>
+  </RECEIVE>
+  <SEND>
+    <XML>
+      <ELEMENT Tag="Request/Estacion" Type="INT" />
+    </XML>
+  </SEND>
+</ETHERNETKRL>

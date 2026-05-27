@@ -1,16 +1,16 @@
 """
-spirax_hmi.py - HMI Spirax (tkinter) + Servidor EKI integrado
+spirax_hmi.py - HMI Spirax con soporte para Cinta + Mesa
 
-Multi-modelo: cada Tipo (1-6) tiene su carpeta modelos/tipoN/ con su
-referencia.png y su config.json.
-
-Servidor TCP robusto: keepalive activado, reconexion automatica si el
-socket se rompe, cleanup limpio al cerrar la HMI.
+Cambios vs version anterior:
+- Pestania CALIBRAR ahora tiene toggle [Cinta] [Mesa] (calibra una u otra
+  para el tipo activo)
+- Nueva pestania MESA en OPERAR con visualizacion de la matriz 10x8
+- Servidor TCP maneja <Estacion>1</Estacion> (cinta) y <Estacion>3</Estacion> (mesa)
+- Response unificado con campos Tipo, Orientacion, Fila, Columna
 """
 
 import os
 import socket
-import struct
 import threading
 import time
 import tkinter as tk
@@ -23,21 +23,29 @@ from PIL import Image, ImageTk
 from spirax_vision import (
     DetectorOrientacion,
     TIPOS_VALIDOS,
+    ESTACIONES_VALIDAS,
     tiene_referencia,
     path_referencia,
     path_config,
     modo_recorte,
+)
+from spirax_mesa import (
+    GRILLA_FILAS, GRILLA_COLS,
+    matriz_vacia, matriz_con_celda,
 )
 
 # --- Configuracion red ---
 HOST = '172.31.1.100'
 PORT = 54600
 BUFFER_SIZE = 1024
-RECV_TIMEOUT = 60.0  # segundos sin trafico antes de hacer poll
+RECV_TIMEOUT = 60.0
 
-# Tamano del panel de imagen
 PANEL_W = 400
 PANEL_H = 300
+
+# Tamano del visualizador de la matriz mesa (en pixels)
+MATRIZ_W = 360
+MATRIZ_H = 240
 
 
 # ======================================================================
@@ -46,80 +54,101 @@ PANEL_H = 300
 
 class EstadoCompartido:
     def __init__(self):
+        # Configuracion cinta
         self.tipo = 1
-        self.orientacion = "ARRIBA"
-        self.modo_auto = False
+        self.orientacion_manual = "ARRIBA"
+        self.modo_auto_cinta = False
+
+        # Configuracion mesa
+        self.modo_auto_mesa = False
+        self.mesa_manual_fila = 1
+        self.mesa_manual_columna = 1
+        # Cache de la ultima deteccion de mesa (para el panel)
+        self.ultima_matriz_mesa = None
+        self.ultima_fila_mesa = 0
+        self.ultima_columna_mesa = 0
+
         self.lock = threading.Lock()
         self.consultas = 0
         self.ultima_consulta = None
         self.robot_conectado = False
 
-        self.ultima_deteccion = None
-        self.ultimo_ratio = None
-        self.ultimo_panel = None
+        self.ultima_deteccion_cinta = None
+        self.ultimo_ratio_cinta = None
+        self.ultimo_panel_cinta = None
+        self.ultimo_panel_mesa = None
         self.ultimo_error = None
 
-        # Flag para apagar el server al cerrar la HMI
         self.shutdown = False
 
     def get_estado(self):
         with self.lock:
             return {
                 "tipo": self.tipo,
-                "orientacion": self.orientacion,
-                "modo_auto": self.modo_auto,
+                "orientacion_manual": self.orientacion_manual,
+                "modo_auto_cinta": self.modo_auto_cinta,
+                "modo_auto_mesa": self.modo_auto_mesa,
+                "mesa_manual_fila": self.mesa_manual_fila,
+                "mesa_manual_columna": self.mesa_manual_columna,
             }
 
     def set_tipo(self, tipo):
         with self.lock:
             self.tipo = tipo
 
-    def set_orientacion(self, orientacion):
+    def set_orientacion_manual(self, orientacion):
         with self.lock:
-            self.orientacion = orientacion
+            self.orientacion_manual = orientacion
 
-    def set_modo_auto(self, valor):
+    def set_modo_auto_cinta(self, valor):
         with self.lock:
-            self.modo_auto = bool(valor)
+            self.modo_auto_cinta = bool(valor)
+
+    def set_modo_auto_mesa(self, valor):
+        with self.lock:
+            self.modo_auto_mesa = bool(valor)
+
+    def set_mesa_manual(self, fila, columna):
+        with self.lock:
+            self.mesa_manual_fila = fila
+            self.mesa_manual_columna = columna
 
     def registrar_consulta(self):
         with self.lock:
             self.consultas += 1
             self.ultima_consulta = datetime.now()
 
-    def set_deteccion(self, orientacion, ratio, panel, error=None):
+    def set_deteccion_cinta(self, orientacion, ratio, panel, error=None):
         with self.lock:
-            self.ultima_deteccion = orientacion
-            self.ultimo_ratio = ratio
-            self.ultimo_panel = panel
+            self.ultima_deteccion_cinta = orientacion
+            self.ultimo_ratio_cinta = ratio
+            self.ultimo_panel_cinta = panel
+            self.ultimo_error = error
+
+    def set_deteccion_mesa(self, matriz, fila, columna, panel, error=None):
+        with self.lock:
+            self.ultima_matriz_mesa = matriz
+            self.ultima_fila_mesa = fila
+            self.ultima_columna_mesa = columna
+            self.ultimo_panel_mesa = panel
             self.ultimo_error = error
 
 
 estado = EstadoCompartido()
-detector = DetectorOrientacion(tipo_inicial=1)
+detector = DetectorOrientacion(tipo_inicial=1, estacion_inicial="cinta")
 
 
 # ======================================================================
-#  Servidor TCP - robusto con keepalive
+#  Servidor TCP - keepalive + reconexion
 # ======================================================================
 
 def configurar_keepalive(sock):
-    """Activa TCP keepalive en el socket para detectar caidas silenciosas
-    del cliente (robot apagado, cable desenchufado, etc).
-    
-    Tiempos cortos: idle 10s, probe cada 3s, 3 fallos -> kill.
-    Eso significa que una caida fisica se detecta en ~20s maximo.
-    """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    
-    # Windows: usar SIO_KEEPALIVE_VALS con tuple (onoff, time_ms, interval_ms)
     if hasattr(socket, 'SIO_KEEPALIVE_VALS'):
         try:
             sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
         except (OSError, AttributeError, TypeError):
             pass
-    
-    # Linux / Mac: TCP_KEEP* options
     if hasattr(socket, 'TCP_KEEPIDLE'):
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
@@ -136,13 +165,25 @@ def configurar_keepalive(sock):
         except OSError:
             pass
 
-def manejar_robot(conn, addr, log_callback):
-    """Maneja la conversacion con un robot conectado.
-    Activa keepalive y timeout para detectar caidas.
+
+def _extraer_estacion(mensaje):
+    """Saca el numero de estacion del XML <Estacion>N</Estacion>.
+    Devuelve 1 si no encuentra (default = cinta para compatibilidad).
     """
+    import re
+    m = re.search(r"<Estacion>\s*(\d+)\s*</Estacion>", mensaje)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return 1
+    return 1
+
+
+def manejar_robot(conn, addr, log_callback):
     log_callback(f">>> Robot conectado desde {addr[0]}:{addr[1]}")
     estado.robot_conectado = True
-    
+
     configurar_keepalive(conn)
     conn.settimeout(RECV_TIMEOUT)
 
@@ -151,9 +192,7 @@ def manejar_robot(conn, addr, log_callback):
             try:
                 data = conn.recv(BUFFER_SIZE)
             except socket.timeout:
-                # Sin trafico en RECV_TIMEOUT: hacer poll para chequear vida
                 try:
-                    # send vacio: chequea sin enviar nada visible al robot
                     conn.sendall(b'')
                     continue
                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
@@ -174,15 +213,47 @@ def manejar_robot(conn, addr, log_callback):
             est = estado.get_estado()
             tipo = est["tipo"]
 
-            if est["modo_auto"]:
-                orientacion = consultar_vision(tipo, log_callback)
+            num_estacion = _extraer_estacion(mensaje)
+
+            # Defaults de la respuesta
+            orientacion = "VACIO"
+            fila = 0
+            columna = 0
+
+            if num_estacion == 1:
+                # Cinta: devolver Tipo + Orientacion
+                if est["modo_auto_cinta"]:
+                    orientacion = consultar_vision_cinta(tipo, log_callback)
+                else:
+                    orientacion = est["orientacion_manual"]
+
+            elif num_estacion == 3:
+                # Mesa: devolver Tipo + Fila + Columna
+                if est["modo_auto_mesa"]:
+                    fila, columna = consultar_vision_mesa(tipo, log_callback)
+                else:
+                    fila = est["mesa_manual_fila"]
+                    columna = est["mesa_manual_columna"]
+                    # Marcar el panel para que se vea en HMI
+                    estado.set_deteccion_mesa(
+                        matriz_con_celda(fila, columna),
+                        fila, columna, None,
+                    )
+
+                if fila == 0 or columna == 0:
+                    orientacion = "VACIO"
+                else:
+                    orientacion = "OK"
+
             else:
-                orientacion = est["orientacion"]
+                log_callback(f"!!! Estacion desconocida: {num_estacion}")
 
             respuesta = (
                 f"<Response>"
                 f"<Tipo>{tipo}</Tipo>"
                 f"<Orientacion>{orientacion}</Orientacion>"
+                f"<Fila>{fila}</Fila>"
+                f"<Columna>{columna}</Columna>"
                 f"</Response>"
             )
 
@@ -194,10 +265,9 @@ def manejar_robot(conn, addr, log_callback):
                 break
 
     except Exception as e:
-        log_callback(f"!!! Error inesperado en manejar_robot: {e}")
+        log_callback(f"!!! Error inesperado: {e}")
     finally:
         try:
-            # SHUT_RDWR para forzar cierre limpio en ambas direcciones
             conn.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
@@ -208,26 +278,27 @@ def manejar_robot(conn, addr, log_callback):
         estado.robot_conectado = False
 
 
-def consultar_vision(tipo, log_callback):
-    """Asegura que el detector use el tipo dado y analiza."""
+def consultar_vision_cinta(tipo, log_callback):
+    """Devuelve ARRIBA/ABAJO/VACIO segun la camara, en estacion cinta."""
     if not detector.esta_activo():
-        log_callback("!!! Modo Auto pero detector inactivo -> VACIO")
-        estado.set_deteccion("VACIO", None, None, error="Detector inactivo")
+        log_callback("!!! Detector inactivo -> VACIO")
+        estado.set_deteccion_cinta("VACIO", None, None, error="Detector inactivo")
         return "VACIO"
 
     try:
-        if detector.tipo_activo() != tipo:
-            detector.usa_tipo(tipo)
-            log_callback(f"[VISION] Cambio a Tipo {tipo}")
+        if (detector.tipo_activo() != tipo
+                or detector.estacion_activa() != "cinta"):
+            detector.usa_tipo(tipo, "cinta")
+            log_callback(f"[VISION] Cambio a Tipo {tipo} (cinta)")
     except Exception as e:
-        log_callback(f"!!! Error cambiando a Tipo {tipo}: {e}")
-        estado.set_deteccion("VACIO", None, None, error=str(e))
+        log_callback(f"!!! Error cambiando a Tipo {tipo} (cinta): {e}")
+        estado.set_deteccion_cinta("VACIO", None, None, error=str(e))
         return "VACIO"
 
     if not detector.tiene_referencia_activa():
-        log_callback(f"!!! Tipo {tipo} no tiene referencia calibrada -> VACIO")
-        estado.set_deteccion("VACIO", None, None,
-                             error=f"Tipo {tipo} sin referencia")
+        log_callback(f"!!! Tipo {tipo} (cinta) sin referencia -> VACIO")
+        estado.set_deteccion_cinta("VACIO", None, None,
+                                    error=f"Tipo {tipo} cinta sin referencia")
         return "VACIO"
 
     try:
@@ -236,32 +307,70 @@ def consultar_vision(tipo, log_callback):
         ratio = res["ratio"]
         panel = res["panel"]
 
-        estado.set_deteccion(orient, ratio, panel, error=None)
-
-        try:
-            cv2.imwrite("ultima_deteccion.png", panel)
-        except Exception:
-            pass
+        estado.set_deteccion_cinta(orient, ratio, panel, error=None)
 
         ratio_str = f"{ratio:.3f}" if ratio is not None else "---"
-        log_callback(f"[VISION] Tipo {tipo}: {orient} (ratio {ratio_str})")
+        log_callback(f"[VISION] Cinta Tipo {tipo}: {orient} (ratio {ratio_str})")
 
         if orient not in ("ARRIBA", "ABAJO", "VACIO"):
-            log_callback(f"[VISION] {orient} -> mando VACIO al robot")
+            log_callback(f"[VISION] {orient} -> mando VACIO")
             return "VACIO"
         return orient
 
     except Exception as e:
-        log_callback(f"!!! Error en vision: {e}")
-        estado.set_deteccion("VACIO", None, None, error=str(e))
+        log_callback(f"!!! Error en vision cinta: {e}")
+        estado.set_deteccion_cinta("VACIO", None, None, error=str(e))
         return "VACIO"
 
 
+def consultar_vision_mesa(tipo, log_callback):
+    """Devuelve (fila, columna) 1-indexed de la primera pieza en la mesa.
+    (0, 0) si mesa vacia."""
+    if not detector.esta_activo():
+        log_callback("!!! Detector inactivo -> mesa vacia")
+        estado.set_deteccion_mesa(None, 0, 0, None, error="Detector inactivo")
+        return (0, 0)
+
+    try:
+        if (detector.tipo_activo() != tipo
+                or detector.estacion_activa() != "mesa"):
+            detector.usa_tipo(tipo, "mesa")
+            log_callback(f"[VISION] Cambio a Tipo {tipo} (mesa)")
+    except Exception as e:
+        log_callback(f"!!! Error cambiando a Tipo {tipo} (mesa): {e}")
+        estado.set_deteccion_mesa(None, 0, 0, None, error=str(e))
+        return (0, 0)
+
+    if not detector.tiene_referencia_activa():
+        log_callback(f"!!! Tipo {tipo} (mesa) sin referencia -> 0,0")
+        estado.set_deteccion_mesa(None, 0, 0, None,
+                                   error=f"Tipo {tipo} mesa sin referencia")
+        return (0, 0)
+
+    try:
+        res = detector.analizar()
+        matriz = res.get("matriz")
+        fila = res.get("fila", 0)
+        columna = res.get("columna", 0)
+        panel = res.get("panel")
+
+        estado.set_deteccion_mesa(matriz, fila, columna, panel, error=None)
+
+        n_piezas = 0
+        if matriz is not None:
+            n_piezas = sum(sum(1 for c in f if c) for f in matriz)
+
+        log_callback(f"[VISION] Mesa Tipo {tipo}: {n_piezas} piezas, "
+                     f"elegida=({fila},{columna})")
+        return (fila, columna)
+
+    except Exception as e:
+        log_callback(f"!!! Error en vision mesa: {e}")
+        estado.set_deteccion_mesa(None, 0, 0, None, error=str(e))
+        return (0, 0)
+
+
 def correr_servidor(log_callback):
-    """Loop externo: si el socket de escucha se rompe por cualquier
-    motivo, lo reabre. Asi sobrevive a problemas de SO, cambios de red,
-    etc.
-    """
     log_callback(f"=== Servidor EKI iniciado en {HOST}:{PORT} ===")
 
     while not estado.shutdown:
@@ -269,13 +378,11 @@ def correr_servidor(log_callback):
         try:
             servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # SO_REUSEPORT solo existe en Linux/Mac
             try:
                 servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except (AttributeError, OSError):
                 pass
 
-            # Timeout corto en accept() para poder revisar shutdown
             servidor.settimeout(1.0)
             servidor.bind((HOST, PORT))
             servidor.listen(1)
@@ -286,20 +393,20 @@ def correr_servidor(log_callback):
                 try:
                     conn, addr = servidor.accept()
                 except socket.timeout:
-                    continue  # vuelve a chequear shutdown
+                    continue
                 except OSError as e:
                     log_callback(f"!!! accept() fallo: {e}")
-                    break  # cae al loop externo, reabre el socket
+                    break
 
                 manejar_robot(conn, addr, log_callback)
                 if not estado.shutdown:
                     log_callback("Esperando proxima conexion del robot...")
 
         except OSError as e:
-            log_callback(f"!!! Socket de escucha roto, reabriendo en 2s: {e}")
+            log_callback(f"!!! Socket roto, reabriendo en 2s: {e}")
             time.sleep(2)
         except Exception as e:
-            log_callback(f"!!! Error fatal en servidor: {e}")
+            log_callback(f"!!! Error fatal: {e}")
             time.sleep(2)
         finally:
             if servidor is not None:
@@ -319,13 +426,14 @@ class HMISpirax:
     def __init__(self, root):
         self.root = root
         self.root.title("Spirax HMI")
-        self.root.geometry("1500x820")
+        self.root.geometry("1600x900")
         self.root.configure(bg='#2b2b2b')
 
-        # Refs a imagenes
-        self._img_operar = None
+        # Refs a imagenes (evitan garbage collection)
+        self._img_cinta = None
         self._img_calibrar = None
         self._img_referencia = None
+        self._img_matriz = None
 
         # Preview
         self._preview_activo = False
@@ -333,13 +441,14 @@ class HMISpirax:
         self._ultimo_frame_preview = None
         self._frame_lock = threading.Lock()
 
-        # Botones de seleccion de tipo en cada pestana
+        # Botones (los referencio para poder pintarlos segun estado)
         self.btns_tipo_operar = []
         self.btns_tipo_calibrar = []
         self.btns_orient = []
 
-        # Tipo activo en CALIBRAR (independiente del de Operar)
+        # Estado de calibrar
         self._tipo_calibrar = 1
+        self._estacion_calibrar = "cinta"
 
         self._construir_ui()
         self._iniciar_servidor()
@@ -347,9 +456,6 @@ class HMISpirax:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------------------------------------------
-    #  UI raiz
-    # ------------------------------------------------------------------
     def _construir_ui(self):
         style = ttk.Style()
         try:
@@ -388,14 +494,16 @@ class HMISpirax:
 
         self._seleccionar_tipo_operar(1)
         self._seleccionar_orientacion("ARRIBA")
-        self._cambiar_modo(False)
+        self._cambiar_modo_cinta(False)
+        self._cambiar_modo_mesa(False)
         self._seleccionar_tipo_calibrar(1)
 
     # ==================================================================
-    #  Helper: estado visual de un boton de tipo
+    #  Boton de tipo (colores segun calibracion)
     # ==================================================================
-    def _refrescar_boton_tipo(self, btn, tipo, seleccionado):
-        if tiene_referencia(tipo):
+    def _refrescar_boton_tipo(self, btn, tipo, seleccionado,
+                               estacion="cinta"):
+        if tiene_referencia(tipo, estacion):
             label = f"Tipo {tipo}\n  OK"
         else:
             label = f"Tipo {tipo}\n  --"
@@ -404,7 +512,7 @@ class HMISpirax:
             btn.configure(text=label, bg='#4a90e2', fg='white',
                           relief='sunken', activebackground='#4a90e2')
         else:
-            color_fg = '#2d8f3a' if tiene_referencia(tipo) else '#cc4444'
+            color_fg = '#2d8f3a' if tiene_referencia(tipo, estacion) else '#cc4444'
             btn.configure(text=label, bg='SystemButtonFace', fg=color_fg,
                           relief='raised', activebackground='#dddddd')
 
@@ -416,12 +524,13 @@ class HMISpirax:
         cont.pack(fill='both', expand=True)
 
         col_izq = tk.Frame(cont, bg='#2b2b2b')
-        col_izq.pack(side='left', fill='both', expand=True, padx=(15, 8), pady=10)
+        col_izq.pack(side='left', fill='both', expand=True,
+                     padx=(15, 8), pady=10)
 
         col_der = tk.Frame(cont, bg='#2b2b2b')
         col_der.pack(side='right', fill='y', padx=(8, 15), pady=10)
 
-        # Tipo
+        # Tipo (afecta tanto cinta como mesa)
         f_tipo = tk.LabelFrame(col_izq, text=" TIPO DE PIEZA (Receta) ",
                                font=("Arial", 12, "bold"),
                                bg='#2b2b2b', fg='white', padx=10, pady=10)
@@ -437,102 +546,214 @@ class HMISpirax:
             btn.grid(row=0, column=i - 1, padx=5, pady=5)
             self.btns_tipo_operar.append(btn)
 
-        # Modo
-        f_modo = tk.LabelFrame(col_izq, text=" MODO ORIENTACION ",
-                               font=("Arial", 12, "bold"),
-                               bg='#2b2b2b', fg='white', padx=10, pady=10)
-        f_modo.pack(fill='x', pady=10)
-
-        c_modo = tk.Frame(f_modo, bg='#2b2b2b')
-        c_modo.pack(fill='x')
-
-        self.btn_manual = tk.Button(c_modo, text="MANUAL",
-                                    font=("Arial", 13, "bold"),
-                                    width=14, height=2,
-                                    command=lambda: self._cambiar_modo(False))
-        self.btn_manual.grid(row=0, column=0, padx=5, pady=5)
-
-        self.btn_auto = tk.Button(c_modo, text="AUTOMATICO (camara)",
-                                  font=("Arial", 13, "bold"),
-                                  width=22, height=2,
-                                  command=lambda: self._cambiar_modo(True))
-        self.btn_auto.grid(row=0, column=1, padx=5, pady=5)
-
-        self.lbl_camara = tk.Label(c_modo, text="Camara: apagada",
-                                   font=("Arial", 10),
-                                   bg='#2b2b2b', fg='#ff6b6b')
-        self.lbl_camara.grid(row=0, column=2, padx=15, sticky='w')
-
-        # Orientacion
-        f_orient = tk.LabelFrame(col_izq, text=" ORIENTACION ",
+        # =========== Seccion CINTA ===========
+        f_cinta = tk.LabelFrame(col_izq, text=" CINTA (Estacion 1) ",
                                  font=("Arial", 12, "bold"),
-                                 bg='#2b2b2b', fg='white', padx=10, pady=10)
-        f_orient.pack(fill='x', pady=5)
+                                 bg='#2b2b2b', fg='#7fffd4',
+                                 padx=10, pady=10)
+        f_cinta.pack(fill='x', pady=8)
 
-        c_orient = tk.Frame(f_orient, bg='#2b2b2b')
-        c_orient.pack()
+        c_modo_c = tk.Frame(f_cinta, bg='#2b2b2b')
+        c_modo_c.pack(fill='x')
+
+        self.btn_manual_cinta = tk.Button(c_modo_c, text="MANUAL",
+                                           font=("Arial", 12, "bold"),
+                                           width=14, height=2,
+                                           command=lambda: self._cambiar_modo_cinta(False))
+        self.btn_manual_cinta.grid(row=0, column=0, padx=5, pady=5)
+
+        self.btn_auto_cinta = tk.Button(c_modo_c, text="AUTOMATICO (camara)",
+                                         font=("Arial", 12, "bold"),
+                                         width=22, height=2,
+                                         command=lambda: self._cambiar_modo_cinta(True))
+        self.btn_auto_cinta.grid(row=0, column=1, padx=5, pady=5)
+
+        # Orientaciones manuales
+        c_orient = tk.Frame(f_cinta, bg='#2b2b2b')
+        c_orient.pack(pady=(8, 0))
         for i, op in enumerate(("ARRIBA", "ABAJO", "VACIO")):
             btn = tk.Button(c_orient, text=op,
-                            font=("Arial", 14, "bold"),
+                            font=("Arial", 13, "bold"),
                             width=12, height=2,
                             command=lambda o=op: self._seleccionar_orientacion(o))
             btn.grid(row=0, column=i, padx=8, pady=5)
             self.btns_orient.append(btn)
 
-        # Estado
+        # =========== Seccion MESA ===========
+        f_mesa = tk.LabelFrame(col_izq, text=" MESA (Estacion 3) ",
+                                font=("Arial", 12, "bold"),
+                                bg='#2b2b2b', fg='#ffd47f',
+                                padx=10, pady=10)
+        f_mesa.pack(fill='x', pady=8)
+
+        c_modo_m = tk.Frame(f_mesa, bg='#2b2b2b')
+        c_modo_m.pack(fill='x')
+
+        self.btn_manual_mesa = tk.Button(c_modo_m, text="MANUAL",
+                                          font=("Arial", 12, "bold"),
+                                          width=14, height=2,
+                                          command=lambda: self._cambiar_modo_mesa(False))
+        self.btn_manual_mesa.grid(row=0, column=0, padx=5, pady=5)
+
+        self.btn_auto_mesa = tk.Button(c_modo_m, text="AUTOMATICO (camara)",
+                                        font=("Arial", 12, "bold"),
+                                        width=22, height=2,
+                                        command=lambda: self._cambiar_modo_mesa(True))
+        self.btn_auto_mesa.grid(row=0, column=1, padx=5, pady=5)
+
+        # Spinboxes para fila/columna manual
+        c_man = tk.Frame(f_mesa, bg='#2b2b2b')
+        c_man.pack(pady=(8, 0))
+        tk.Label(c_man, text="Fila manual:", bg='#2b2b2b', fg='white',
+                 font=("Arial", 10)).grid(row=0, column=0, padx=5)
+        self.spn_fila = tk.Spinbox(c_man, from_=1, to=GRILLA_FILAS,
+                                    width=5, font=("Arial", 12),
+                                    command=self._cambio_mesa_manual)
+        self.spn_fila.grid(row=0, column=1, padx=5)
+        tk.Label(c_man, text="Columna manual:", bg='#2b2b2b', fg='white',
+                 font=("Arial", 10)).grid(row=0, column=2, padx=15)
+        self.spn_col = tk.Spinbox(c_man, from_=1, to=GRILLA_COLS,
+                                   width=5, font=("Arial", 12),
+                                   command=self._cambio_mesa_manual)
+        self.spn_col.grid(row=0, column=3, padx=5)
+
+        # Estado y conexion
         f_estado = tk.LabelFrame(col_izq, text=" ESTADO ",
                                  font=("Arial", 11, "bold"),
                                  bg='#2b2b2b', fg='white', padx=10, pady=10)
         f_estado.pack(fill='x', pady=5)
 
         self.lbl_seleccion = tk.Label(f_estado,
-                                      text="Tipo: 1   |   Orientacion: ARRIBA",
+                                      text="Tipo: 1",
                                       font=("Arial", 12),
                                       bg='#2b2b2b', fg='#7fffd4')
         self.lbl_seleccion.pack(anchor='w')
+
+        self.lbl_camara = tk.Label(f_estado, text="Camara: apagada",
+                                    font=("Arial", 10),
+                                    bg='#2b2b2b', fg='#ff6b6b')
+        self.lbl_camara.pack(anchor='w', pady=(3, 0))
 
         self.lbl_robot = tk.Label(f_estado, text="Robot: desconectado",
                                   font=("Arial", 11),
                                   bg='#2b2b2b', fg='#ff6b6b')
         self.lbl_robot.pack(anchor='w', pady=(5, 0))
 
-        self.lbl_consultas = tk.Label(f_estado, text="Consultas recibidas: 0",
-                                      font=("Arial", 11),
-                                      bg='#2b2b2b', fg='white')
+        self.lbl_consultas = tk.Label(f_estado,
+                                       text="Consultas recibidas: 0",
+                                       font=("Arial", 11),
+                                       bg='#2b2b2b', fg='white')
         self.lbl_consultas.pack(anchor='w', pady=(5, 0))
 
-        # Panel imagen
-        f_img = tk.LabelFrame(col_der, text=" ULTIMA DETECCION ",
-                              font=("Arial", 11, "bold"),
-                              bg='#2b2b2b', fg='white', padx=5, pady=5)
-        f_img.pack(fill='y', expand=False)
+        # =========== Columna derecha: paneles ===========
 
-        frame_canvas_op = tk.Frame(f_img, bg='#1a1a1a',
-                                   width=PANEL_W, height=PANEL_H)
+        # Panel cinta
+        f_img_cinta = tk.LabelFrame(col_der, text=" ULTIMA DETECCION CINTA ",
+                                     font=("Arial", 11, "bold"),
+                                     bg='#2b2b2b', fg='#7fffd4',
+                                     padx=5, pady=5)
+        f_img_cinta.pack(fill='x', pady=(0, 10))
+
+        frame_canvas_op = tk.Frame(f_img_cinta, bg='#1a1a1a',
+                                    width=PANEL_W, height=PANEL_H)
         frame_canvas_op.pack(padx=5, pady=5)
         frame_canvas_op.pack_propagate(False)
 
-        self.canvas_operar = tk.Label(frame_canvas_op,
+        self.canvas_cinta = tk.Label(frame_canvas_op,
                                       bg='#1a1a1a', fg='#888888',
                                       text="(sin detecciones aun)",
                                       font=("Arial", 11))
-        self.canvas_operar.pack(fill='both', expand=True)
+        self.canvas_cinta.pack(fill='both', expand=True)
 
-        self.lbl_deteccion = tk.Label(f_img, text="Resultado: ---",
-                                      font=("Arial", 11, "bold"),
-                                      bg='#2b2b2b', fg='white')
-        self.lbl_deteccion.pack(anchor='w', padx=5, pady=(5, 0))
+        self.lbl_deteccion_cinta = tk.Label(f_img_cinta,
+                                             text="Resultado: ---",
+                                             font=("Arial", 11, "bold"),
+                                             bg='#2b2b2b', fg='white')
+        self.lbl_deteccion_cinta.pack(anchor='w', padx=5, pady=(5, 0))
 
-        self.lbl_ratio = tk.Label(f_img, text="Ratio: ---",
-                                  font=("Arial", 10),
-                                  bg='#2b2b2b', fg='#cfcfcf')
-        self.lbl_ratio.pack(anchor='w', padx=5, pady=(0, 5))
+        self.lbl_ratio_cinta = tk.Label(f_img_cinta, text="Ratio: ---",
+                                         font=("Arial", 10),
+                                         bg='#2b2b2b', fg='#cfcfcf')
+        self.lbl_ratio_cinta.pack(anchor='w', padx=5, pady=(0, 5))
 
-        self.btn_test = tk.Button(f_img, text="Capturar ahora (test)",
-                                  font=("Arial", 10),
-                                  command=self._capturar_test,
-                                  state='disabled')
-        self.btn_test.pack(fill='x', padx=5, pady=5)
+        # Panel mesa con visualizacion de matriz
+        f_img_mesa = tk.LabelFrame(col_der, text=" MATRIZ MESA ",
+                                    font=("Arial", 11, "bold"),
+                                    bg='#2b2b2b', fg='#ffd47f',
+                                    padx=5, pady=5)
+        f_img_mesa.pack(fill='x', pady=(0, 5))
+
+        frame_canvas_m = tk.Frame(f_img_mesa, bg='#1a1a1a',
+                                   width=MATRIZ_W, height=MATRIZ_H)
+        frame_canvas_m.pack(padx=5, pady=5)
+        frame_canvas_m.pack_propagate(False)
+
+        # Matriz dibujada con canvas (no imagen): mejor para ver en vivo
+        self.canvas_matriz = tk.Canvas(frame_canvas_m,
+                                        bg='#1a1a1a', highlightthickness=0)
+        self.canvas_matriz.pack(fill='both', expand=True)
+
+        self.lbl_deteccion_mesa = tk.Label(f_img_mesa,
+                                            text="Elegida: ---",
+                                            font=("Arial", 11, "bold"),
+                                            bg='#2b2b2b', fg='white')
+        self.lbl_deteccion_mesa.pack(anchor='w', padx=5, pady=(5, 0))
+
+        self.lbl_piezas_mesa = tk.Label(f_img_mesa, text="Piezas: ---",
+                                         font=("Arial", 10),
+                                         bg='#2b2b2b', fg='#cfcfcf')
+        self.lbl_piezas_mesa.pack(anchor='w', padx=5, pady=(0, 5))
+
+        # Inicializar matriz vacia
+        self._dibujar_matriz(matriz_vacia(), 0, 0)
+
+    def _dibujar_matriz(self, matriz, fila_elegida, columna_elegida):
+        """Dibuja la matriz 10x8 en el canvas. matriz puede ser None.
+        fila_elegida, columna_elegida son 1-indexed."""
+        canvas = self.canvas_matriz
+        canvas.delete("all")
+
+        # Esperar a que el canvas tenga tamanio (primer dibujado)
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            # Usar valores por defecto
+            w = MATRIZ_W
+            h = MATRIZ_H
+
+        cell_w = w / GRILLA_COLS
+        cell_h = h / GRILLA_FILAS
+
+        for fi in range(GRILLA_FILAS):
+            for ci in range(GRILLA_COLS):
+                x1 = ci * cell_w
+                y1 = fi * cell_h
+                x2 = (ci + 1) * cell_w
+                y2 = (fi + 1) * cell_h
+
+                ocupada = (matriz is not None and matriz[fi][ci])
+                elegida = (fi + 1 == fila_elegida and ci + 1 == columna_elegida)
+
+                if ocupada and elegida:
+                    fill = '#FAC775'  # amarillo
+                    outline = '#FAC775'
+                elif ocupada:
+                    fill = '#1D9E75'  # verde
+                    outline = '#0F6E56'
+                else:
+                    fill = '#3a3a3a'
+                    outline = '#2a2a2a'
+
+                canvas.create_rectangle(x1, y1, x2, y2,
+                                         fill=fill, outline=outline,
+                                         width=1)
+
+                # Texto opcional dentro de la celda
+                if ocupada:
+                    canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2,
+                                        text="★" if elegida else "●",
+                                        fill="white",
+                                        font=("Arial", 10, "bold"))
 
     # ------------------------------------------------------------------
     #  CALIBRAR
@@ -541,13 +762,13 @@ class HMISpirax:
         cont = tk.Frame(self.tab_calibrar, bg='#2b2b2b')
         cont.pack(fill='both', expand=True, padx=15, pady=10)
 
-        # Banner: tipo activo
+        # Banner
         f_banner = tk.Frame(cont, bg='#1a1a1a', height=60)
         f_banner.pack(fill='x', pady=(0, 10))
         f_banner.pack_propagate(False)
 
         self.lbl_banner_calibrar = tk.Label(
-            f_banner, text="CALIBRANDO: TIPO 1",
+            f_banner, text="CALIBRANDO: TIPO 1 (CINTA)",
             font=("Arial", 18, "bold"),
             bg='#1a1a1a', fg='#7fffd4')
         self.lbl_banner_calibrar.pack(side='left', padx=20, pady=10)
@@ -557,6 +778,26 @@ class HMISpirax:
             font=("Arial", 11),
             bg='#1a1a1a', fg='#cfcfcf')
         self.lbl_estado_calibrar.pack(side='right', padx=20)
+
+        # Toggle Cinta / Mesa
+        f_toggle = tk.LabelFrame(cont, text=" ESTACION ",
+                                  font=("Arial", 11, "bold"),
+                                  bg='#2b2b2b', fg='white',
+                                  padx=10, pady=8)
+        f_toggle.pack(fill='x', pady=(0, 8))
+
+        c_tog = tk.Frame(f_toggle, bg='#2b2b2b')
+        c_tog.pack()
+        self.btn_estac_cinta = tk.Button(c_tog, text="CINTA",
+                                          font=("Arial", 12, "bold"),
+                                          width=14, height=2,
+                                          command=lambda: self._set_estacion_calibrar("cinta"))
+        self.btn_estac_cinta.grid(row=0, column=0, padx=5)
+        self.btn_estac_mesa = tk.Button(c_tog, text="MESA",
+                                         font=("Arial", 12, "bold"),
+                                         width=14, height=2,
+                                         command=lambda: self._set_estacion_calibrar("mesa"))
+        self.btn_estac_mesa.grid(row=0, column=1, padx=5)
 
         # Selector de tipo
         f_sel = tk.LabelFrame(cont, text=" TIPO A CALIBRAR ",
@@ -574,7 +815,7 @@ class HMISpirax:
             btn.grid(row=0, column=i - 1, padx=5, pady=3)
             self.btns_tipo_calibrar.append(btn)
 
-        # Cuerpo: preview + controles
+        # Cuerpo
         cuerpo = tk.Frame(cont, bg='#2b2b2b')
         cuerpo.pack(fill='both', expand=True)
         cuerpo.columnconfigure(0, weight=1)
@@ -588,14 +829,13 @@ class HMISpirax:
         col_der.grid(row=0, column=1, sticky='ns')
         col_der.grid_propagate(False)
 
-        # Preview en vivo + referencia (lado a lado)
+        # Preview + referencia
         f_visual = tk.Frame(col_izq, bg='#2b2b2b')
         f_visual.pack(fill='both', expand=True)
         f_visual.columnconfigure(0, weight=1, uniform='cols')
         f_visual.columnconfigure(1, weight=1, uniform='cols')
         f_visual.rowconfigure(0, weight=1)
 
-        # --- Preview en vivo ---
         f_prev = tk.LabelFrame(f_visual, text=" PREVIEW EN VIVO ",
                                font=("Arial", 11, "bold"),
                                bg='#2b2b2b', fg='white', padx=5, pady=5)
@@ -609,7 +849,7 @@ class HMISpirax:
         self.canvas_calibrar = tk.Label(
             frame_canvas,
             bg='#1a1a1a', fg='#888888',
-            text="(preview apagado)\n\nApreta INICIAR PREVIEW",
+            text="(preview apagado)",
             font=("Arial", 11))
         self.canvas_calibrar.pack(fill='both', expand=True)
 
@@ -628,7 +868,6 @@ class HMISpirax:
                                 bg='#2b2b2b', fg='#cfcfcf')
         self.lbl_fps.pack(side='left', padx=10)
 
-        # --- Referencia guardada del tipo activo ---
         f_ref = tk.LabelFrame(f_visual, text=" REFERENCIA GUARDADA ",
                               font=("Arial", 11, "bold"),
                               bg='#2b2b2b', fg='white', padx=5, pady=5)
@@ -674,13 +913,13 @@ class HMISpirax:
                               bg='#2b2b2b', fg='white', padx=10, pady=10)
         f_est.pack(fill='x', pady=5)
 
-        self.lbl_ref = tk.Label(f_est, text="referencia.png: ?",
+        self.lbl_ref = tk.Label(f_est, text="referencia: ?",
                                 font=("Consolas", 10),
                                 bg='#2b2b2b', fg='white',
                                 justify='left', anchor='w', wraplength=240)
         self.lbl_ref.pack(anchor='w')
 
-        self.lbl_cfg = tk.Label(f_est, text="config.json: ?",
+        self.lbl_cfg = tk.Label(f_est, text="config: ?",
                                 font=("Consolas", 10),
                                 bg='#2b2b2b', fg='white',
                                 justify='left', anchor='w', wraplength=240)
@@ -692,8 +931,7 @@ class HMISpirax:
                               bg='#2b2b2b', fg='white', padx=10, pady=10)
         f_sld.pack(fill='x', pady=5)
 
-        tk.Label(f_sld, text="Exposicion:",
-                 font=("Arial", 10),
+        tk.Label(f_sld, text="Exposicion:", font=("Arial", 10),
                  bg='#2b2b2b', fg='white').pack(anchor='w')
         self.scl_exp = tk.Scale(f_sld, from_=1, to=200,
                                 orient='horizontal', length=220,
@@ -704,8 +942,7 @@ class HMISpirax:
         self.scl_exp.pack(fill='x')
         self.scl_exp.bind('<ButtonRelease-1>', self._persistir_sliders)
 
-        tk.Label(f_sld, text="Ganancia:",
-                 font=("Arial", 10),
+        tk.Label(f_sld, text="Ganancia:", font=("Arial", 10),
                  bg='#2b2b2b', fg='white').pack(anchor='w', pady=(5, 0))
         self.scl_gain = tk.Scale(f_sld, from_=0, to=128,
                                  orient='horizontal', length=220,
@@ -716,8 +953,7 @@ class HMISpirax:
         self.scl_gain.pack(fill='x')
         self.scl_gain.bind('<ButtonRelease-1>', self._persistir_sliders)
 
-        tk.Label(f_sld, text="Threshold BG Subtract:",
-                 font=("Arial", 10),
+        tk.Label(f_sld, text="Threshold BG Subtract:", font=("Arial", 10),
                  bg='#2b2b2b', fg='white').pack(anchor='w', pady=(5, 0))
         self.scl_thr = tk.Scale(f_sld, from_=5, to=120,
                                 orient='horizontal', length=220,
@@ -750,125 +986,171 @@ class HMISpirax:
     def _seleccionar_tipo_operar(self, tipo):
         estado.set_tipo(tipo)
         for i, btn in enumerate(self.btns_tipo_operar):
-            self._refrescar_boton_tipo(btn, i + 1, seleccionado=(i + 1 == tipo))
+            self._refrescar_boton_tipo(btn, i + 1,
+                                         seleccionado=(i + 1 == tipo),
+                                         estacion="cinta")
         self._actualizar_label_seleccion()
 
     def _seleccionar_orientacion(self, orient):
-        estado.set_orientacion(orient)
-        colores = {"ARRIBA": "#2d8f3a", "ABAJO": "#cc7a00", "VACIO": "#777777"}
+        estado.set_orientacion_manual(orient)
+        colores = {"ARRIBA": "#2d8f3a", "ABAJO": "#cc7a00",
+                   "VACIO": "#777777"}
         for btn in self.btns_orient:
             if btn['text'] == orient:
-                btn.configure(bg=colores[orient], fg='white', relief='sunken')
+                btn.configure(bg=colores[orient], fg='white',
+                              relief='sunken')
             else:
-                btn.configure(bg='SystemButtonFace', fg='black', relief='raised')
+                btn.configure(bg='SystemButtonFace', fg='black',
+                              relief='raised')
         self._actualizar_label_seleccion()
 
-    def _cambiar_modo(self, auto):
+    def _cambiar_modo_cinta(self, auto):
         if auto:
-            if not detector.esta_activo():
-                est = estado.get_estado()
-                if not tiene_referencia(est["tipo"]):
-                    if not messagebox.askyesno(
-                        "Atencion",
-                        f"El Tipo {est['tipo']} no tiene referencia calibrada.\n"
-                        f"Si el robot pide una deteccion ahora, se va a "
-                        f"responder VACIO.\n\n"
-                        f"Continuar igual?"):
-                        return
-
-                self._agregar_log("[VISION] Iniciando camara...")
-                self.root.update_idletasks()
-                try:
-                    detector.start(requiere_referencia=False)
-                    self._agregar_log("[VISION] Camara lista.")
-                except Exception as e:
-                    self._agregar_log(f"!!! Error iniciando camara: {e}")
-                    messagebox.showerror("Camara",
-                                         f"No se pudo iniciar la camara:\n\n{e}")
-                    return
-
-            estado.set_modo_auto(True)
-            self.btn_auto.configure(bg='#2d8f3a', fg='white', relief='sunken')
-            self.btn_manual.configure(bg='SystemButtonFace', fg='black', relief='raised')
-            self.btn_test.configure(state='disabled')
+            if not self._asegurar_camara():
+                return
+            estado.set_modo_auto_cinta(True)
+            self.btn_auto_cinta.configure(bg='#2d8f3a', fg='white',
+                                           relief='sunken')
+            self.btn_manual_cinta.configure(bg='SystemButtonFace', fg='black',
+                                             relief='raised')
             for btn in self.btns_orient:
                 btn.configure(state='disabled',
                               bg='#3a3a3a', fg='#777777',
                               relief='flat',
                               disabledforeground='#777777')
         else:
-            estado.set_modo_auto(False)
-            self.btn_manual.configure(bg='#4a90e2', fg='white', relief='sunken')
-            self.btn_auto.configure(bg='SystemButtonFace', fg='black', relief='raised')
-            self.btn_test.configure(state='normal')
+            estado.set_modo_auto_cinta(False)
+            self.btn_manual_cinta.configure(bg='#4a90e2', fg='white',
+                                             relief='sunken')
+            self.btn_auto_cinta.configure(bg='SystemButtonFace', fg='black',
+                                           relief='raised')
             for btn in self.btns_orient:
                 btn.configure(state='normal')
             est = estado.get_estado()
-            self._seleccionar_orientacion(est["orientacion"])
+            self._seleccionar_orientacion(est["orientacion_manual"])
 
         self._actualizar_label_seleccion()
 
-    def _capturar_test(self):
+    def _cambiar_modo_mesa(self, auto):
+        if auto:
+            if not self._asegurar_camara():
+                return
+            estado.set_modo_auto_mesa(True)
+            self.btn_auto_mesa.configure(bg='#2d8f3a', fg='white',
+                                          relief='sunken')
+            self.btn_manual_mesa.configure(bg='SystemButtonFace', fg='black',
+                                            relief='raised')
+            self.spn_fila.configure(state='disabled')
+            self.spn_col.configure(state='disabled')
+        else:
+            estado.set_modo_auto_mesa(False)
+            self.btn_manual_mesa.configure(bg='#4a90e2', fg='white',
+                                            relief='sunken')
+            self.btn_auto_mesa.configure(bg='SystemButtonFace', fg='black',
+                                          relief='raised')
+            self.spn_fila.configure(state='normal')
+            self.spn_col.configure(state='normal')
+
+        self._actualizar_label_seleccion()
+
+    def _asegurar_camara(self):
+        """Si la camara no esta activa, intenta encenderla. True si quedo
+        encendida."""
+        if detector.esta_activo():
+            return True
+
         est = estado.get_estado()
-        tipo = est["tipo"]
+        self._agregar_log("[VISION] Iniciando camara...")
+        self.root.update_idletasks()
+        try:
+            detector.start(requiere_referencia=False)
+            self._agregar_log("[VISION] Camara lista.")
+            return True
+        except Exception as e:
+            self._agregar_log(f"!!! Error iniciando camara: {e}")
+            messagebox.showerror("Camara",
+                                 f"No se pudo iniciar la camara:\n\n{e}")
+            return False
 
-        def trabajo():
-            camara_iniciada_aqui = False
-            try:
-                if not detector.esta_activo():
-                    self._log_thread_safe("[TEST] Iniciando camara...")
-                    detector.start(requiere_referencia=False)
-                    camara_iniciada_aqui = True
-                    self._log_thread_safe("[TEST] Camara lista.")
-
-                self._log_thread_safe(f"[TEST] Capturando con Tipo {tipo}...")
-                consultar_vision(tipo, self._log_thread_safe)
-            except Exception as e:
-                self._log_thread_safe(f"!!! Error en test: {e}")
-            finally:
-                if camara_iniciada_aqui and detector.esta_activo():
-                    try:
-                        detector.stop()
-                        self._log_thread_safe("[TEST] Camara apagada.")
-                    except Exception as e:
-                        self._log_thread_safe(f"!!! Error apagando camara: {e}")
-
-        threading.Thread(target=trabajo, daemon=True).start()
+    def _cambio_mesa_manual(self):
+        try:
+            fila = int(self.spn_fila.get())
+            col = int(self.spn_col.get())
+        except ValueError:
+            return
+        estado.set_mesa_manual(fila, col)
 
     def _actualizar_label_seleccion(self):
         est = estado.get_estado()
-        orient_txt = "(automatica - camara)" if est["modo_auto"] else est["orientacion"]
-        cal = "OK" if tiene_referencia(est["tipo"]) else "SIN CALIBRAR"
+        cinta_cal = "OK" if tiene_referencia(est["tipo"], "cinta") else "sin cal"
+        mesa_cal = "OK" if tiene_referencia(est["tipo"], "mesa") else "sin cal"
+
+        cinta_modo = "AUTO" if est["modo_auto_cinta"] else f"manual:{est['orientacion_manual']}"
+        mesa_modo = "AUTO" if est["modo_auto_mesa"] else f"manual:({est['mesa_manual_fila']},{est['mesa_manual_columna']})"
+
         self.lbl_seleccion.configure(
-            text=f"Tipo: {est['tipo']} ({cal})   |   Orientacion: {orient_txt}"
+            text=f"Tipo: {est['tipo']}   |   "
+                 f"Cinta ({cinta_cal}, {cinta_modo})   |   "
+                 f"Mesa ({mesa_cal}, {mesa_modo})"
         )
 
     # ==================================================================
     #  Handlers CALIBRAR
     # ==================================================================
+    def _set_estacion_calibrar(self, estacion):
+        venia_preview = self._preview_activo
+        if venia_preview:
+            self._detener_preview()
+
+        self._estacion_calibrar = estacion
+
+        # Refrescar boton activo
+        if estacion == "cinta":
+            self.btn_estac_cinta.configure(bg='#4a90e2', fg='white',
+                                            relief='sunken')
+            self.btn_estac_mesa.configure(bg='SystemButtonFace', fg='black',
+                                           relief='raised')
+        else:
+            self.btn_estac_mesa.configure(bg='#ffd47f', fg='black',
+                                           relief='sunken')
+            self.btn_estac_cinta.configure(bg='SystemButtonFace', fg='black',
+                                            relief='raised')
+
+        # Recargar tipo en la nueva estacion
+        self._seleccionar_tipo_calibrar(self._tipo_calibrar)
+
+        if venia_preview:
+            self._iniciar_preview()
+
     def _seleccionar_tipo_calibrar(self, tipo):
         venia_preview = self._preview_activo
         if venia_preview:
             self._detener_preview()
 
         self._tipo_calibrar = tipo
+        est = self._estacion_calibrar
 
         try:
-            detector.usa_tipo(tipo)
+            detector.usa_tipo(tipo, est)
         except Exception as e:
-            self._agregar_log(f"!!! Error cargando Tipo {tipo}: {e}")
+            self._agregar_log(f"!!! Error cargando Tipo {tipo} ({est}): {e}")
 
         for i, btn in enumerate(self.btns_tipo_calibrar):
-            self._refrescar_boton_tipo(btn, i + 1, seleccionado=(i + 1 == tipo))
+            self._refrescar_boton_tipo(btn, i + 1,
+                                         seleccionado=(i + 1 == tipo),
+                                         estacion=est)
 
-        if tiene_referencia(tipo):
+        # Banner
+        if tiene_referencia(tipo, est):
             self.lbl_banner_calibrar.configure(
-                text=f"CALIBRANDO: TIPO {tipo}", fg='#7fffd4')
-            self.lbl_estado_calibrar.configure(
-                text="(referencia OK)", fg='#7fff7f')
+                text=f"CALIBRANDO: TIPO {tipo} ({est.upper()})",
+                fg='#7fffd4' if est == "cinta" else '#ffd47f')
+            self.lbl_estado_calibrar.configure(text="(referencia OK)",
+                                                 fg='#7fff7f')
         else:
             self.lbl_banner_calibrar.configure(
-                text=f"CALIBRANDO: TIPO {tipo}", fg='#ffaa55')
+                text=f"CALIBRANDO: TIPO {tipo} ({est.upper()})",
+                fg='#ffaa55')
             self.lbl_estado_calibrar.configure(
                 text="(falta capturar referencia)", fg='#ff6b6b')
 
@@ -881,7 +1163,7 @@ class HMISpirax:
 
         self._refrescar_estado_archivos()
         self._mostrar_referencia_calibrar()
-        self._agregar_log(f"[CALIBRAR] Tipo activo: {tipo}")
+        self._agregar_log(f"[CALIBRAR] Tipo {tipo} ({est}) activo")
 
         if venia_preview:
             self._iniciar_preview()
@@ -893,15 +1175,8 @@ class HMISpirax:
             self._iniciar_preview()
 
     def _iniciar_preview(self):
-        if not detector.esta_activo():
-            try:
-                detector.start(requiere_referencia=False)
-                self._agregar_log("[CALIBRAR] Camara iniciada para preview.")
-            except Exception as e:
-                self._agregar_log(f"!!! Error iniciando camara: {e}")
-                messagebox.showerror("Camara", f"No se pudo iniciar:\n\n{e}")
-                return
-
+        if not self._asegurar_camara():
+            return
         self._preview_activo = True
         self.btn_preview_start.configure(text="DETENER PREVIEW", bg='#cc4444')
 
@@ -958,12 +1233,13 @@ class HMISpirax:
 
     def _mostrar_referencia_calibrar(self):
         tipo = self._tipo_calibrar
-        ref_path = path_referencia(tipo)
+        est = self._estacion_calibrar
+        ref_path = path_referencia(tipo, est)
 
         if not os.path.exists(ref_path):
             self.canvas_referencia.configure(
                 image='',
-                text=f"(Tipo {tipo} sin referencia)\n\nCapturala con el boton\n'Capturar referencia'",
+                text=f"(Tipo {tipo} {est} sin referencia)",
                 fg='#ff6b6b')
             self._img_referencia = None
             self.lbl_ref_info.configure(text="")
@@ -976,7 +1252,7 @@ class HMISpirax:
             if ref is None:
                 raise RuntimeError("No se pudo leer la imagen")
 
-            cfg = cargar_config(tipo)
+            cfg = cargar_config(tipo, est)
             h, w = ref.shape[:2]
             y_top = int(h * cfg.get("corte_y_top_pct", 0.0))
             y_bot = int(h * cfg.get("corte_y_pct", 1.0))
@@ -996,6 +1272,20 @@ class HMISpirax:
             cv2.line(debug, (x_izq, 0), (x_izq, h), (0, 255, 255), 2)
             cv2.line(debug, (x_der, 0), (x_der, h), (0, 255, 255), 2)
 
+            # Si es mesa, dibujar tambien la grilla 10x8 sobre el area recortada
+            if est == "mesa":
+                roi_h = y_bot - y_top
+                roi_w = x_der - x_izq
+                if roi_h > 0 and roi_w > 0:
+                    for fi in range(1, GRILLA_FILAS):
+                        y = y_top + int(round(fi * roi_h / GRILLA_FILAS))
+                        cv2.line(debug, (x_izq, y), (x_der, y),
+                                 (50, 200, 255), 1)
+                    for ci in range(1, GRILLA_COLS):
+                        x = x_izq + int(round(ci * roi_w / GRILLA_COLS))
+                        cv2.line(debug, (x, y_top), (x, y_bot),
+                                 (50, 200, 255), 1)
+
             rgb = cv2.cvtColor(debug, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
             img.thumbnail((PANEL_W, PANEL_H), Image.LANCZOS)
@@ -1004,9 +1294,10 @@ class HMISpirax:
             self._img_referencia = photo
 
             ts = datetime.fromtimestamp(os.path.getmtime(ref_path))
+            extra = f"  |  grilla {GRILLA_COLS}x{GRILLA_FILAS}" if est == "mesa" else ""
             self.lbl_ref_info.configure(
-                text=(f"Tipo {tipo} - {ts.strftime('%Y-%m-%d %H:%M')}  |  "
-                      f"recorte: Y {y_top}-{y_bot}  X {x_izq}-{x_der}"))
+                text=(f"Tipo {tipo} ({est}) - {ts.strftime('%Y-%m-%d %H:%M')}"
+                      f"  |  Y {y_top}-{y_bot}  X {x_izq}-{x_der}{extra}"))
         except Exception as e:
             self.canvas_referencia.configure(
                 image='',
@@ -1017,21 +1308,15 @@ class HMISpirax:
 
     def _capturar_referencia(self):
         tipo = self._tipo_calibrar
+        est = self._estacion_calibrar
 
-        if not detector.esta_activo():
-            try:
-                detector.start(requiere_referencia=False)
-                self._agregar_log("[CALIBRAR] Camara iniciada.")
-            except Exception as e:
-                messagebox.showerror("Camara", f"No se pudo iniciar:\n\n{e}")
-                return
+        if not self._asegurar_camara():
+            return
 
         respuesta = messagebox.askyesno(
             "Capturar referencia",
-            f"Capturar referencia para TIPO {tipo}.\n\n"
-            f"Asegurate de que NO hay pieza en el setup.\n\n"
-            f"Se va a sacar una foto del fondo vacio para usar como "
-            f"referencia de Background Subtraction del Tipo {tipo}.\n\n"
+            f"Capturar referencia para TIPO {tipo} ({est.upper()}).\n\n"
+            f"Asegurate de que NO hay piezas en el setup.\n\n"
             f"Continuar?"
         )
         if not respuesta:
@@ -1049,25 +1334,29 @@ class HMISpirax:
                 return
 
         try:
-            ref_path = path_referencia(tipo)
+            ref_path = path_referencia(tipo, est)
             cv2.imwrite(ref_path, frame)
             detector.recargar_referencia()
-            self._agregar_log(f"[CALIBRAR] Referencia Tipo {tipo} guardada en {ref_path}")
-            messagebox.showinfo("Referencia",
-                                f"Guardada como {ref_path}.\n\n"
-                                f"Ya queda cargada en el detector.")
+            self._agregar_log(f"[CALIBRAR] Referencia Tipo {tipo} ({est}) guardada")
+            messagebox.showinfo("Referencia", f"Guardada como {ref_path}")
             self._refrescar_estado_archivos()
+
             for i, btn in enumerate(self.btns_tipo_calibrar):
                 self._refrescar_boton_tipo(btn, i + 1,
-                                           seleccionado=(i + 1 == tipo))
+                                             seleccionado=(i + 1 == tipo),
+                                             estacion=est)
+            # Tambien refrescar operar (cinta)
             for i, btn in enumerate(self.btns_tipo_operar):
-                est = estado.get_estado()
+                e2 = estado.get_estado()
                 self._refrescar_boton_tipo(btn, i + 1,
-                                           seleccionado=(i + 1 == est["tipo"]))
+                                             seleccionado=(i + 1 == e2["tipo"]),
+                                             estacion="cinta")
+
             self.lbl_banner_calibrar.configure(
-                text=f"CALIBRANDO: TIPO {tipo}", fg='#7fffd4')
-            self.lbl_estado_calibrar.configure(
-                text="(referencia OK)", fg='#7fff7f')
+                text=f"CALIBRANDO: TIPO {tipo} ({est.upper()})",
+                fg='#7fffd4' if est == "cinta" else '#ffd47f')
+            self.lbl_estado_calibrar.configure(text="(referencia OK)",
+                                                 fg='#7fff7f')
             self._mostrar_referencia_calibrar()
         except Exception as e:
             self._agregar_log(f"!!! Error guardando referencia: {e}")
@@ -1075,21 +1364,17 @@ class HMISpirax:
 
     def _ajustar_recorte(self):
         tipo = self._tipo_calibrar
-        ref_path = path_referencia(tipo)
+        est = self._estacion_calibrar
+        ref_path = path_referencia(tipo, est)
 
         if os.path.exists(ref_path):
             imagen = cv2.imread(ref_path)
-            self._agregar_log(f"[CALIBRAR] Ajustando recorte sobre referencia Tipo {tipo}")
+            self._agregar_log(f"[CALIBRAR] Ajustando recorte Tipo {tipo} ({est})")
         else:
-            if not detector.esta_activo():
-                try:
-                    detector.start(requiere_referencia=False)
-                except Exception as e:
-                    messagebox.showerror("Camara", f"No se pudo iniciar:\n\n{e}")
-                    return
+            if not self._asegurar_camara():
+                return
             try:
                 imagen = detector.capturar_frame()
-                self._agregar_log(f"[CALIBRAR] Ajustando recorte sobre frame en vivo (Tipo {tipo})")
             except Exception as e:
                 messagebox.showerror("Captura", f"No se pudo capturar:\n\n{e}")
                 return
@@ -1099,15 +1384,15 @@ class HMISpirax:
             self._detener_preview()
 
         try:
-            ok = modo_recorte(imagen, tipo)
+            ok = modo_recorte(imagen, tipo, est)
             if ok:
                 if os.path.exists(ref_path):
                     detector.recargar_referencia()
-                self._agregar_log(f"[CALIBRAR] Recorte Tipo {tipo} guardado.")
+                self._agregar_log(f"[CALIBRAR] Recorte Tipo {tipo} ({est}) guardado")
                 self._refrescar_estado_archivos()
                 self._mostrar_referencia_calibrar()
             else:
-                self._agregar_log("[CALIBRAR] Recorte cancelado.")
+                self._agregar_log("[CALIBRAR] Recorte cancelado")
         except Exception as e:
             self._agregar_log(f"!!! Error en ajustar_recorte: {e}")
             messagebox.showerror("Error", str(e))
@@ -1134,7 +1419,7 @@ class HMISpirax:
         try:
             detector.set_exposure(detector.exposure, persist=True)
             self._agregar_log(
-                f"[CONFIG] Tipo {self._tipo_calibrar}: "
+                f"[CONFIG] Tipo {self._tipo_calibrar} ({self._estacion_calibrar}): "
                 f"exp={detector.exposure} gain={detector.gain} "
                 f"thr={detector.bg_diff_thresh}"
             )
@@ -1143,8 +1428,9 @@ class HMISpirax:
 
     def _refrescar_estado_archivos(self):
         tipo = self._tipo_calibrar
-        ref_path = path_referencia(tipo)
-        cfg_path = path_config(tipo)
+        est = self._estacion_calibrar
+        ref_path = path_referencia(tipo, est)
+        cfg_path = path_config(tipo, est)
 
         if os.path.exists(ref_path):
             ts = datetime.fromtimestamp(os.path.getmtime(ref_path))
@@ -1152,14 +1438,12 @@ class HMISpirax:
                 text=f"referencia OK\n  {ts.strftime('%Y-%m-%d %H:%M')}",
                 fg='#7fff7f')
         else:
-            self.lbl_ref.configure(text="referencia FALTA",
-                                   fg='#ff6b6b')
+            self.lbl_ref.configure(text="referencia FALTA", fg='#ff6b6b')
         if os.path.exists(cfg_path):
-            self.lbl_cfg.configure(text="config OK",
-                                   fg='#7fff7f')
+            self.lbl_cfg.configure(text="config OK", fg='#7fff7f')
         else:
             self.lbl_cfg.configure(text="config FALTA (default)",
-                                   fg='#ffaa55')
+                                    fg='#ffaa55')
 
     # ==================================================================
     #  Tab change
@@ -1171,9 +1455,9 @@ class HMISpirax:
             return
         if tab != 'CALIBRAR' and self._preview_activo:
             self._detener_preview()
-            self._agregar_log("[CALIBRAR] Preview detenido (cambio de pestania).")
         if tab == 'CALIBRAR':
-            self._refrescar_estado_archivos()
+            # Refrescar el toggle de estacion activa
+            self._set_estacion_calibrar(self._estacion_calibrar)
 
     # ==================================================================
     #  Log
@@ -1187,7 +1471,6 @@ class HMISpirax:
         try:
             self.root.after(0, self._agregar_log, mensaje)
         except RuntimeError:
-            # root ya destruido durante shutdown
             pass
 
     # ==================================================================
@@ -1215,47 +1498,66 @@ class HMISpirax:
         else:
             self.lbl_camara.configure(text="Camara: apagada", fg='#ff6b6b')
 
+        # Refrescar paneles
         with estado.lock:
-            panel = estado.ultimo_panel
-            orient = estado.ultima_deteccion
-            ratio = estado.ultimo_ratio
+            panel_c = estado.ultimo_panel_cinta
+            orient = estado.ultima_deteccion_cinta
+            ratio = estado.ultimo_ratio_cinta
+            matriz = estado.ultima_matriz_mesa
+            fila_m = estado.ultima_fila_mesa
+            col_m = estado.ultima_columna_mesa
             error = estado.ultimo_error
 
-        if panel is not None:
-            self._mostrar_panel_operar(panel)
-        elif error:
-            self.canvas_operar.configure(text=f"Error:\n{error}",
+        if panel_c is not None:
+            self._mostrar_panel_cinta(panel_c)
+        elif error and orient is None:
+            self.canvas_cinta.configure(text=f"Error:\n{error}",
                                          image='', fg='#ff6b6b')
-            self._img_operar = None
+            self._img_cinta = None
 
         if orient is not None:
             colores = {"ARRIBA": "#7fff7f", "ABAJO": "#ffa500",
                        "VACIO": "#cccccc", "DUDOSO": "#ffff7f",
                        "N/A": "#ff6b6b"}
-            self.lbl_deteccion.configure(
+            self.lbl_deteccion_cinta.configure(
                 text=f"Resultado: {orient}",
                 fg=colores.get(orient, 'white'))
-            self.lbl_ratio.configure(
+            self.lbl_ratio_cinta.configure(
                 text=f"Ratio: {ratio:.3f}" if ratio is not None else "Ratio: ---")
+
+        # Refrescar matriz
+        self._dibujar_matriz(matriz if matriz is not None else matriz_vacia(),
+                              fila_m, col_m)
+        if matriz is not None:
+            n_piezas = sum(sum(1 for c in f if c) for f in matriz)
+            self.lbl_piezas_mesa.configure(text=f"Piezas: {n_piezas}")
+        else:
+            self.lbl_piezas_mesa.configure(text="Piezas: ---")
+
+        if fila_m > 0 and col_m > 0:
+            self.lbl_deteccion_mesa.configure(
+                text=f"Elegida: ({fila_m}, {col_m})", fg='#FAC775')
+        else:
+            self.lbl_deteccion_mesa.configure(text="Elegida: ---",
+                                                fg='#cccccc')
 
         self.root.after(500, self._actualizar_estado_loop)
 
-    def _mostrar_panel_operar(self, panel_bgr):
+    def _mostrar_panel_cinta(self, panel_bgr):
         try:
             rgb = cv2.cvtColor(panel_bgr, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
             img.thumbnail((PANEL_W, PANEL_H), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
-            self.canvas_operar.configure(image=photo, text='')
-            self._img_operar = photo
+            self.canvas_cinta.configure(image=photo, text='')
+            self._img_cinta = photo
         except Exception as e:
-            self._agregar_log(f"!!! Error mostrando panel: {e}")
+            self._agregar_log(f"!!! Error mostrando panel cinta: {e}")
 
     # ==================================================================
     #  Cierre
     # ==================================================================
     def _on_close(self):
-        # Avisar al server que se baje
         estado.shutdown = True
         self._preview_activo = False
         try:
@@ -1263,8 +1565,6 @@ class HMISpirax:
                 detector.stop()
         except Exception:
             pass
-        # Pequena pausa para que el thread del server vea el flag
-        # y cierre limpio (en vez de que Tkinter mate el proceso)
         time.sleep(0.2)
         self.root.destroy()
 

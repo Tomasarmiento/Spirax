@@ -1,0 +1,130 @@
+&ACCESS RVP
+&REL 1
+&PARAM EDITMASK = *
+&PARAM TEMPLATE = C:\KRC\Roboter\Template\vorgabe
+DEF Master( )
+;FOLD INI;%{PE}
+  ;FOLD BASISTECH INI
+    GLOBAL INTERRUPT DECL 3 WHEN $STOPMESS==TRUE DO IR_STOPM ( )
+    INTERRUPT ON 3 
+    BAS (#INITMOV,0 )
+  ;ENDFOLD (BASISTECH INI)
+  ;FOLD USER INI
+  ;ENDFOLD (USER INI)
+;ENDFOLD (INI)
+; ====================================================================
+; SPIRAX - Master
+; --------------------------------------------------------------------
+; Verifica conexion EKI y HOME antes de arrancar.
+; Loop:
+;   1. Pide vision CINTA (Estacion=1)
+;   2. ARRIBA -> da vuelta pieza (P1_ARR equivalente)
+;      VACIO  -> pide vision MESA (Estacion=3), carga pieza nueva
+;      ABAJO  -> error: la pieza no fue mecanizada por el torno
+; ====================================================================
+
+; --- Chequear conexion con HMI Python ---
+IF NOT $FLAG[12] THEN
+   MsgQuit("Sin conexion con el HMI de vision. Verifica que este encendido.")
+   HALT
+ENDIF
+
+; --- Chequear que el robot esta en HOME ---
+IF NOT $FLAG[22] THEN
+   MsgQuit("El robot no esta en HOME. Llevalo manualmente y reinicia.")
+   HALT
+ENDIF
+
+; --- Limpiar datos viejos y forzar reevaluacion ---
+$FLAG[20] = FALSE
+$FLAG[21] = FALSE
+TIPO_GLOBAL = 0
+ORIENT_GLOBAL[] = "       "
+FILA_GLOBAL = 0
+COLUMNA_GLOBAL = 0
+ESTACION_PEDIDO = 1   ; arrancamos pidiendo cinta
+SP_ESTADO = 0
+
+LOOP
+   ; --- Esperar respuesta del SUBMIT ---
+   WAIT FOR $FLAG[20]==TRUE
+   
+   ; Snapshot de las globales
+   TIPO_LOCAL = TIPO_GLOBAL
+   ORIENT_LOCAL[] = ORIENT_GLOBAL[]
+   FILA_LOCAL = FILA_GLOBAL
+   COLUMNA_LOCAL = COLUMNA_GLOBAL
+   
+   ; --- Procesar respuesta de la CINTA ---
+   IF ESTACION_PEDIDO == 1 THEN
+      
+      ; ARRIBA: pieza ya mecanizada por torno op10, hay que darla vuelta
+      IF (ORIENT_LOCAL[1]=="A") AND (ORIENT_LOCAL[2]=="R") THEN
+         SWITCH TIPO_LOCAL
+            CASE 1
+               P1_ARR()
+            CASE 2
+               MsgNotify("Tipo 2 ARRIBA: todavia no implementado")
+            CASE 3
+               MsgNotify("Tipo 3 ARRIBA: todavia no implementado")
+            CASE 4
+               MsgNotify("Tipo 4 ARRIBA: todavia no implementado")
+            CASE 5
+               MsgNotify("Tipo 5 ARRIBA: todavia no implementado")
+            CASE 6
+               MsgNotify("Tipo 6 ARRIBA: todavia no implementado")
+         ENDSWITCH
+      ENDIF
+      
+      ; ABAJO: error operacional - la pieza deberia haber sido mecanizada
+      IF (ORIENT_LOCAL[1]=="A") AND (ORIENT_LOCAL[2]=="B") THEN
+         MsgQuit("ERROR: Pieza ABAJO en la cinta. El torno no la procesó. Revisar.")
+         HALT
+      ENDIF
+      
+      ; VACIO: no hay pieza en cinta -> pedir mesa para cargar nueva
+      IF ORIENT_LOCAL[1]=="V" THEN
+         ; Cambiar pedido a estacion mesa para la proxima iteracion
+         $FLAG[20] = FALSE
+         $FLAG[21] = TRUE        ; liberar stopper SPS
+         ESTACION_PEDIDO = 3
+         CONTINUE                 ; vuelve al WAIT, pero ahora pidiendo mesa
+      ENDIF
+      
+   ENDIF
+   
+   ; --- Procesar respuesta de la MESA ---
+   IF ESTACION_PEDIDO == 3 THEN
+      
+      ; Mesa vacia (no hay pieza para cargar)
+      IF (FILA_LOCAL == 0) OR (COLUMNA_LOCAL == 0) THEN
+         MsgQuit("ERROR: Mesa vacia, no hay piezas para cargar. Reponer mesa.")
+         HALT
+      ENDIF
+      
+      ; Cargar pieza desde mesa(fila, columna)
+      SWITCH TIPO_LOCAL
+         CASE 1
+            ; Aca va una subrutina que use FILA_LOCAL y COLUMNA_LOCAL
+            ; para ir a la posicion correcta. Por ahora placeholder.
+            MsgNotify("Cargar Tipo 1 desde mesa (FILA, COL) - implementar")
+         CASE 2
+            MsgNotify("Cargar Tipo 2 desde mesa - todavia no implementado")
+         CASE 3
+            MsgNotify("Cargar Tipo 3 desde mesa - todavia no implementado")
+         CASE 4
+            MsgNotify("Cargar Tipo 4 desde mesa - todavia no implementado")
+         CASE 5
+            MsgNotify("Cargar Tipo 5 desde mesa - todavia no implementado")
+         CASE 6
+            MsgNotify("Cargar Tipo 6 desde mesa - todavia no implementado")
+      ENDSWITCH
+      
+      ; Despues de cargar, volver a pedir cinta en proxima vuelta
+      ESTACION_PEDIDO = 1
+   ENDIF
+   
+   $FLAG[20] = FALSE
+   $FLAG[21] = TRUE
+ENDLOOP
+END
