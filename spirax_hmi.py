@@ -56,13 +56,13 @@ class EstadoCompartido:
     def __init__(self):
         # Configuracion cinta
         self.tipo = 1
-        self.orientacion_manual = "ARRIBA"
+        self.orientacion_manual = None  # None = manual sin seleccion
         self.modo_auto_cinta = False
 
         # Configuracion mesa
         self.modo_auto_mesa = False
-        self.mesa_manual_fila = 1
-        self.mesa_manual_columna = 1
+        self.mesa_manual_fila = 0       # 0 = manual sin seleccion
+        self.mesa_manual_columna = 0
         # Cache de la ultima deteccion de mesa (para el panel)
         self.ultima_matriz_mesa = None
         self.ultima_fila_mesa = 0
@@ -80,6 +80,10 @@ class EstadoCompartido:
         self.ultimo_error = None
 
         self.shutdown = False
+
+        # Flags para pedir popups desde el server thread al HMI thread
+        self.pedir_popup_cinta = False
+        self.pedir_popup_mesa = False
 
     def get_estado(self):
         with self.lock:
@@ -223,22 +227,39 @@ def manejar_robot(conn, addr, log_callback):
             if num_estacion == 1:
                 # Cinta: devolver Tipo + Orientacion
                 if est["modo_auto_cinta"]:
+                    # Auto: siempre captura con camara
                     orientacion = consultar_vision_cinta(tipo, log_callback)
                 else:
-                    orientacion = est["orientacion_manual"]
+                    # Manual: si hay orientacion seteada, usar esa;
+                    # si no, pedir al usuario que setee algo (popup)
+                    if est["orientacion_manual"]:
+                        orientacion = est["orientacion_manual"]
+                    else:
+                        log_callback("!!! Cinta MANUAL sin seleccion -> popup")
+                        estado.pedir_popup_cinta = True
+                        orientacion = "VACIO"
 
             elif num_estacion == 3:
                 # Mesa: devolver Tipo + Fila + Columna
                 if est["modo_auto_mesa"]:
+                    # Auto: siempre captura con camara
                     fila, columna = consultar_vision_mesa(tipo, log_callback)
                 else:
-                    fila = est["mesa_manual_fila"]
-                    columna = est["mesa_manual_columna"]
-                    # Marcar el panel para que se vea en HMI
-                    estado.set_deteccion_mesa(
-                        matriz_con_celda(fila, columna),
-                        fila, columna, None,
-                    )
+                    # Manual: si hay posicion seteada (>0), usarla;
+                    # si no, pedir popup
+                    if est["mesa_manual_fila"] > 0 and est["mesa_manual_columna"] > 0:
+                        fila = est["mesa_manual_fila"]
+                        columna = est["mesa_manual_columna"]
+                        # Marcar el panel
+                        estado.set_deteccion_mesa(
+                            matriz_con_celda(fila, columna),
+                            fila, columna, None,
+                        )
+                    else:
+                        log_callback("!!! Mesa MANUAL sin seleccion -> popup")
+                        estado.pedir_popup_mesa = True
+                        fila = 0
+                        columna = 0
 
                 if fila == 0 or columna == 0:
                     orientacion = "VACIO"
@@ -434,6 +455,7 @@ class HMISpirax:
         self._img_calibrar = None
         self._img_referencia = None
         self._img_matriz = None
+        self._img_bg_mesa = None
 
         # Preview
         self._preview_activo = False
@@ -493,7 +515,8 @@ class HMISpirax:
         self._construir_tab_log()
 
         self._seleccionar_tipo_operar(1)
-        self._seleccionar_orientacion("ARRIBA")
+        # No setear orientacion: arranca en MANUAL sin seleccion
+        self._refrescar_botones_orientacion()
         self._cambiar_modo_cinta(False)
         self._cambiar_modo_mesa(False)
         self._seleccionar_tipo_calibrar(1)
@@ -568,16 +591,52 @@ class HMISpirax:
                                          command=lambda: self._cambiar_modo_cinta(True))
         self.btn_auto_cinta.grid(row=0, column=1, padx=5, pady=5)
 
-        # Orientaciones manuales
-        c_orient = tk.Frame(f_cinta, bg='#2b2b2b')
-        c_orient.pack(pady=(8, 0))
+        # Descripcion modo manual
+        tk.Label(f_cinta,
+                 text="Modo MANUAL: forzar una orientacion (tildá Activar y elegí)",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(8, 2))
+
+        # Checkbox de activacion + orientaciones manuales
+        c_orient_row = tk.Frame(f_cinta, bg='#2b2b2b')
+        c_orient_row.pack(pady=(0, 0))
+
+        self.var_cinta_manual_activo = tk.BooleanVar(value=False)
+        self.chk_cinta_manual = tk.Checkbutton(
+            c_orient_row, text="Activar",
+            variable=self.var_cinta_manual_activo,
+            command=self._toggle_cinta_manual,
+            font=("Arial", 10),
+            bg='#2b2b2b', fg='white',
+            selectcolor='#1a1a1a',
+            activebackground='#2b2b2b',
+            activeforeground='white')
+        self.chk_cinta_manual.grid(row=0, column=0, padx=(0, 10))
+
+        c_orient = tk.Frame(c_orient_row, bg='#2b2b2b')
+        c_orient.grid(row=0, column=1)
         for i, op in enumerate(("ARRIBA", "ABAJO", "VACIO")):
             btn = tk.Button(c_orient, text=op,
                             font=("Arial", 13, "bold"),
                             width=12, height=2,
-                            command=lambda o=op: self._seleccionar_orientacion(o))
+                            command=lambda o=op: self._toggle_orientacion(o))
             btn.grid(row=0, column=i, padx=8, pady=5)
             self.btns_orient.append(btn)
+
+        # Descripcion test
+        tk.Label(f_cinta,
+                 text="CAPTURAR AHORA: tomar foto y analizar (sin afectar al robot)",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(8, 2))
+
+        # Boton de test instantaneo de cinta
+        self.btn_capturar_test_cinta = tk.Button(
+            f_cinta, text="CAPTURAR AHORA (test)",
+            font=("Arial", 11, "bold"),
+            bg='#4a90e2', fg='white',
+            height=2,
+            command=self._capturar_test_cinta)
+        self.btn_capturar_test_cinta.pack(fill='x', pady=(0, 0))
 
         # =========== Seccion MESA ===========
         f_mesa = tk.LabelFrame(col_izq, text=" MESA (Estacion 3) ",
@@ -601,21 +660,55 @@ class HMISpirax:
                                         command=lambda: self._cambiar_modo_mesa(True))
         self.btn_auto_mesa.grid(row=0, column=1, padx=5, pady=5)
 
-        # Spinboxes para fila/columna manual
+        # Descripcion modo manual mesa
+        tk.Label(f_mesa,
+                 text="Modo MANUAL: forzar una posicion (activar tilde para usar fila/columna fija)",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(8, 2))
+
+        # Spinboxes para fila/columna manual con checkbox para activar
         c_man = tk.Frame(f_mesa, bg='#2b2b2b')
-        c_man.pack(pady=(8, 0))
-        tk.Label(c_man, text="Fila manual:", bg='#2b2b2b', fg='white',
-                 font=("Arial", 10)).grid(row=0, column=0, padx=5)
+        c_man.pack(pady=(0, 0))
+
+        self.var_mesa_manual_activo = tk.BooleanVar(value=False)
+        self.chk_mesa_manual = tk.Checkbutton(
+            c_man, text="Activar",
+            variable=self.var_mesa_manual_activo,
+            command=self._toggle_mesa_manual,
+            font=("Arial", 10),
+            bg='#2b2b2b', fg='white',
+            selectcolor='#1a1a1a',
+            activebackground='#2b2b2b',
+            activeforeground='white')
+        self.chk_mesa_manual.grid(row=0, column=0, padx=5)
+
+        tk.Label(c_man, text="Fila:", bg='#2b2b2b', fg='white',
+                 font=("Arial", 10)).grid(row=0, column=1, padx=5)
         self.spn_fila = tk.Spinbox(c_man, from_=1, to=GRILLA_FILAS,
                                     width=5, font=("Arial", 12),
                                     command=self._cambio_mesa_manual)
-        self.spn_fila.grid(row=0, column=1, padx=5)
-        tk.Label(c_man, text="Columna manual:", bg='#2b2b2b', fg='white',
-                 font=("Arial", 10)).grid(row=0, column=2, padx=15)
+        self.spn_fila.grid(row=0, column=2, padx=5)
+        tk.Label(c_man, text="Columna:", bg='#2b2b2b', fg='white',
+                 font=("Arial", 10)).grid(row=0, column=3, padx=15)
         self.spn_col = tk.Spinbox(c_man, from_=1, to=GRILLA_COLS,
                                    width=5, font=("Arial", 12),
                                    command=self._cambio_mesa_manual)
-        self.spn_col.grid(row=0, column=3, padx=5)
+        self.spn_col.grid(row=0, column=4, padx=5)
+
+        # Descripcion test mesa
+        tk.Label(f_mesa,
+                 text="CAPTURAR AHORA: tomar foto y analizar matriz (sin afectar al robot)",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(8, 2))
+
+        # Boton de test instantaneo de mesa
+        self.btn_capturar_test_mesa = tk.Button(
+            f_mesa, text="CAPTURAR AHORA (test)",
+            font=("Arial", 11, "bold"),
+            bg='#ffd47f', fg='black',
+            height=2,
+            command=self._capturar_test_mesa)
+        self.btn_capturar_test_mesa.pack(fill='x', pady=(0, 0))
 
         # Estado y conexion
         f_estado = tk.LabelFrame(col_izq, text=" ESTADO ",
@@ -676,21 +769,79 @@ class HMISpirax:
                                          bg='#2b2b2b', fg='#cfcfcf')
         self.lbl_ratio_cinta.pack(anchor='w', padx=5, pady=(0, 5))
 
-        # Panel mesa con visualizacion de matriz
-        f_img_mesa = tk.LabelFrame(col_der, text=" MATRIZ MESA ",
+        # Boton ver en grande para cinta
+        tk.Button(f_img_cinta, text="Ver en grande (zoom)",
+                  font=("Arial", 9),
+                  command=self._ver_en_grande_cinta).pack(
+            fill='x', padx=5, pady=(0, 5))
+
+        # Panel mesa: alterna entre vista MATRIZ y vista BG SUBTRACTION
+        f_img_mesa = tk.LabelFrame(col_der, text=" MESA ",
                                     font=("Arial", 11, "bold"),
                                     bg='#2b2b2b', fg='#ffd47f',
                                     padx=5, pady=5)
         f_img_mesa.pack(fill='x', pady=(0, 5))
 
+        # Toggle Matriz / BG Subtraction
+        c_vista = tk.Frame(f_img_mesa, bg='#2b2b2b')
+        c_vista.pack(fill='x', padx=5, pady=(0, 4))
+
+        self.var_vista_mesa = tk.StringVar(value="matriz")
+
+        tk.Label(c_vista, text="Vista:", font=("Arial", 9),
+                 bg='#2b2b2b', fg='#cfcfcf').pack(side='left', padx=(0, 8))
+
+        self.rb_vista_matriz = tk.Radiobutton(
+            c_vista, text="Matriz",
+            variable=self.var_vista_mesa, value="matriz",
+            command=self._cambiar_vista_mesa,
+            font=("Arial", 9),
+            bg='#2b2b2b', fg='white',
+            selectcolor='#1a1a1a',
+            activebackground='#2b2b2b',
+            activeforeground='white')
+        self.rb_vista_matriz.pack(side='left')
+
+        self.rb_vista_bg = tk.Radiobutton(
+            c_vista, text="BG Subtract",
+            variable=self.var_vista_mesa, value="bg",
+            command=self._cambiar_vista_mesa,
+            font=("Arial", 9),
+            bg='#2b2b2b', fg='white',
+            selectcolor='#1a1a1a',
+            activebackground='#2b2b2b',
+            activeforeground='white')
+        self.rb_vista_bg.pack(side='left', padx=(8, 0))
+
+        # Toggle mostrar numeritos (solo aplica a vista matriz)
+        self.var_mostrar_numeros = tk.BooleanVar(value=False)
+        self.chk_numeros = tk.Checkbutton(
+            f_img_mesa,
+            text="Mostrar numeros de posicion (fila, columna)",
+            variable=self.var_mostrar_numeros,
+            command=lambda: self._dibujar_matriz_actual(),
+            font=("Arial", 9),
+            bg='#2b2b2b', fg='#cfcfcf',
+            selectcolor='#1a1a1a',
+            activebackground='#2b2b2b',
+            activeforeground='white')
+        self.chk_numeros.pack(anchor='w', padx=5, pady=(0, 4))
+
+        # Contenedor con tamaño fijo donde se alternan los dos visuales
         frame_canvas_m = tk.Frame(f_img_mesa, bg='#1a1a1a',
                                    width=MATRIZ_W, height=MATRIZ_H)
         frame_canvas_m.pack(padx=5, pady=5)
         frame_canvas_m.pack_propagate(False)
 
-        # Matriz dibujada con canvas (no imagen): mejor para ver en vivo
+        # Vista 1: Canvas con matriz de cuadraditos
         self.canvas_matriz = tk.Canvas(frame_canvas_m,
                                         bg='#1a1a1a', highlightthickness=0)
+        # Vista 2: Label con imagen de bg subtraction
+        self.canvas_bg_mesa = tk.Label(frame_canvas_m, bg='#1a1a1a',
+                                        fg='#888888',
+                                        text="(sin capturas aun)",
+                                        font=("Arial", 10))
+        # Empezamos mostrando la matriz
         self.canvas_matriz.pack(fill='both', expand=True)
 
         self.lbl_deteccion_mesa = tk.Label(f_img_mesa,
@@ -704,8 +855,61 @@ class HMISpirax:
                                          bg='#2b2b2b', fg='#cfcfcf')
         self.lbl_piezas_mesa.pack(anchor='w', padx=5, pady=(0, 5))
 
+        # Boton ver en grande para mesa (vista BG)
+        tk.Button(f_img_mesa, text="Ver BG Subtract en grande (zoom)",
+                  font=("Arial", 9),
+                  command=self._ver_en_grande_mesa).pack(
+            fill='x', padx=5, pady=(0, 5))
+
         # Inicializar matriz vacia
         self._dibujar_matriz(matriz_vacia(), 0, 0)
+
+    def _cambiar_vista_mesa(self):
+        """Alterna entre la vista de matriz y la vista de BG subtraction."""
+        vista = self.var_vista_mesa.get()
+        if vista == "matriz":
+            self.canvas_bg_mesa.pack_forget()
+            self.canvas_matriz.pack(fill='both', expand=True)
+            self.chk_numeros.configure(state='normal')
+            self._dibujar_matriz_actual()
+        else:
+            self.canvas_matriz.pack_forget()
+            self.canvas_bg_mesa.pack(fill='both', expand=True)
+            self.chk_numeros.configure(state='disabled')
+            self._refrescar_panel_bg_mesa()
+
+    def _refrescar_panel_bg_mesa(self):
+        """Muestra la imagen de bg subtraction de la ultima captura mesa."""
+        with estado.lock:
+            panel = estado.ultimo_panel_mesa
+
+        if panel is None:
+            self.canvas_bg_mesa.configure(
+                image='',
+                text="(todavia no se capturo nada en mesa)",
+                fg='#888888')
+            self._img_bg_mesa = None
+            return
+
+        try:
+            rgb = cv2.cvtColor(panel, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            img.thumbnail((MATRIZ_W, MATRIZ_H), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.canvas_bg_mesa.configure(image=photo, text='')
+            self._img_bg_mesa = photo
+        except Exception as e:
+            self._agregar_log(f"!!! Error mostrando bg mesa: {e}")
+
+    def _dibujar_matriz_actual(self):
+        """Redibuja la matriz con los ultimos datos guardados.
+        Util al cambiar el toggle de mostrar numeros."""
+        with estado.lock:
+            matriz = estado.ultima_matriz_mesa
+            fila_m = estado.ultima_fila_mesa
+            col_m = estado.ultima_columna_mesa
+        self._dibujar_matriz(matriz if matriz is not None else matriz_vacia(),
+                              fila_m, col_m)
 
     def _dibujar_matriz(self, matriz, fila_elegida, columna_elegida):
         """Dibuja la matriz 10x8 en el canvas. matriz puede ser None.
@@ -713,16 +917,21 @@ class HMISpirax:
         canvas = self.canvas_matriz
         canvas.delete("all")
 
-        # Esperar a que el canvas tenga tamanio (primer dibujado)
         w = canvas.winfo_width()
         h = canvas.winfo_height()
         if w <= 1 or h <= 1:
-            # Usar valores por defecto
             w = MATRIZ_W
             h = MATRIZ_H
 
         cell_w = w / GRILLA_COLS
         cell_h = h / GRILLA_FILAS
+
+        # Saber si mostrar numeritos
+        mostrar_nums = False
+        try:
+            mostrar_nums = self.var_mostrar_numeros.get()
+        except AttributeError:
+            pass  # todavia no se construyo el var
 
         for fi in range(GRILLA_FILAS):
             for ci in range(GRILLA_COLS):
@@ -748,12 +957,32 @@ class HMISpirax:
                                          fill=fill, outline=outline,
                                          width=1)
 
-                # Texto opcional dentro de la celda
-                if ocupada:
-                    canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2,
-                                        text="★" if elegida else "●",
-                                        fill="white",
-                                        font=("Arial", 10, "bold"))
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+
+                if mostrar_nums:
+                    # Numeritos siempre visibles
+                    if elegida and ocupada:
+                        text_color = "#000000"
+                        text_label = f"★\n{fi+1},{ci+1}"
+                    elif ocupada:
+                        text_color = "#ffffff"
+                        text_label = f"●\n{fi+1},{ci+1}"
+                    else:
+                        text_color = "#666666"
+                        text_label = f"{fi+1},{ci+1}"
+                    canvas.create_text(cx, cy,
+                                        text=text_label,
+                                        fill=text_color,
+                                        font=("Arial", 8, "bold"),
+                                        justify="center")
+                else:
+                    # Solo iconos en las ocupadas
+                    if ocupada:
+                        canvas.create_text(cx, cy,
+                                            text="★" if elegida else "●",
+                                            fill="white" if not elegida else "black",
+                                            font=("Arial", 10, "bold"))
 
     # ------------------------------------------------------------------
     #  CALIBRAR
@@ -964,6 +1193,22 @@ class HMISpirax:
         self.scl_thr.pack(fill='x')
         self.scl_thr.bind('<ButtonRelease-1>', self._persistir_sliders)
 
+        # Slider de umbral de ocupacion (solo aplica a MESA)
+        # Se guarda en config como 0.0-1.0 pero mostramos 0-100 (%)
+        self.lbl_umbral_titulo = tk.Label(
+            f_sld, text="Umbral ocupacion (%) [solo mesa]:",
+            font=("Arial", 10),
+            bg='#2b2b2b', fg='white')
+        self.lbl_umbral_titulo.pack(anchor='w', pady=(5, 0))
+        self.scl_umbral = tk.Scale(f_sld, from_=1, to=100,
+                                    orient='horizontal', length=220,
+                                    bg='#2b2b2b', fg='white',
+                                    troughcolor='#1a1a1a',
+                                    highlightthickness=0,
+                                    command=self._on_umbral_change)
+        self.scl_umbral.pack(fill='x')
+        self.scl_umbral.bind('<ButtonRelease-1>', self._persistir_sliders)
+
     # ------------------------------------------------------------------
     #  LOG
     # ------------------------------------------------------------------
@@ -991,17 +1236,130 @@ class HMISpirax:
                                          estacion="cinta")
         self._actualizar_label_seleccion()
 
-    def _seleccionar_orientacion(self, orient):
-        estado.set_orientacion_manual(orient)
+    def _toggle_cinta_manual(self):
+        """Activado/desactivado del modo manual de cinta con el checkbox.
+        Habilita/deshabilita los botones de orientacion y el capturar test."""
+        activo = self.var_cinta_manual_activo.get()
+        if not activo:
+            # Sin tildar: deshabilitamos botones de orientacion,
+            # limpiamos la seleccion
+            estado.set_orientacion_manual(None)
+        # Refrescar estado visual de todo
+        self._aplicar_estado_modos()
+        self._actualizar_label_seleccion()
+
+    def _toggle_orientacion(self, orient):
+        """Apreta un boton de orientacion (ARRIBA/ABAJO/VACIO).
+        Solo funciona si el checkbox Activar esta tildado.
+        Si ya estaba activo, lo desactiva. Si no, lo activa.
+        """
+        if not self.var_cinta_manual_activo.get():
+            return  # checkbox desactivado: ignorar
+        est = estado.get_estado()
+        if est["orientacion_manual"] == orient:
+            estado.set_orientacion_manual(None)
+        else:
+            estado.set_orientacion_manual(orient)
+        self._refrescar_botones_orientacion()
+        self._actualizar_label_seleccion()
+        # Si se selecciono una orientacion, el capturar ahora se desactiva
+        self._aplicar_estado_modos()
+
+    def _aplicar_estado_modos(self):
+        """Aplica las reglas de habilitar/deshabilitar controles segun los modos:
+        
+        AUTO cinta:
+          - btns_orient deshabilitados, chk_cinta_manual deshabilitado
+          - btn_capturar_test_cinta deshabilitado
+        MANUAL cinta + checkbox SIN tildar:
+          - btns_orient deshabilitados
+          - btn_capturar_test_cinta HABILITADO
+        MANUAL cinta + checkbox TILDADO:
+          - btns_orient HABILITADOS
+          - btn_capturar_test_cinta deshabilitado
+        
+        Mismo esquema para mesa con chk_mesa_manual.
+        """
+        est = estado.get_estado()
+        
+        # ========== CINTA ==========
+        if est["modo_auto_cinta"]:
+            # AUTO: nada manual disponible
+            self.chk_cinta_manual.configure(state='disabled')
+            for btn in self.btns_orient:
+                btn.configure(state='disabled',
+                              bg='#3a3a3a', fg='#777777',
+                              relief='flat',
+                              disabledforeground='#777777')
+            self.btn_capturar_test_cinta.configure(state='disabled',
+                                                    bg='#3a3a3a',
+                                                    disabledforeground='#777777')
+        else:
+            # MANUAL
+            self.chk_cinta_manual.configure(state='normal')
+            if self.var_cinta_manual_activo.get():
+                # Checkbox tildado: orientaciones disponibles, capturar OFF
+                for btn in self.btns_orient:
+                    btn.configure(state='normal')
+                self._refrescar_botones_orientacion()
+                self.btn_capturar_test_cinta.configure(state='disabled',
+                                                        bg='#3a3a3a',
+                                                        disabledforeground='#777777')
+            else:
+                # Checkbox sin tildar: orientaciones OFF, capturar disponible
+                for btn in self.btns_orient:
+                    btn.configure(state='disabled',
+                                  bg='#3a3a3a', fg='#777777',
+                                  relief='flat',
+                                  disabledforeground='#777777')
+                self.btn_capturar_test_cinta.configure(state='normal',
+                                                        bg='#4a90e2',
+                                                        fg='white')
+
+        # ========== MESA ==========
+        if est["modo_auto_mesa"]:
+            # AUTO
+            self.chk_mesa_manual.configure(state='disabled')
+            self.spn_fila.configure(state='disabled')
+            self.spn_col.configure(state='disabled')
+            self.btn_capturar_test_mesa.configure(state='disabled',
+                                                   bg='#3a3a3a',
+                                                   disabledforeground='#777777')
+        else:
+            # MANUAL
+            self.chk_mesa_manual.configure(state='normal')
+            if self.var_mesa_manual_activo.get():
+                self.spn_fila.configure(state='normal')
+                self.spn_col.configure(state='normal')
+                self.btn_capturar_test_mesa.configure(state='disabled',
+                                                       bg='#3a3a3a',
+                                                       disabledforeground='#777777')
+            else:
+                self.spn_fila.configure(state='disabled')
+                self.spn_col.configure(state='disabled')
+                self.btn_capturar_test_mesa.configure(state='normal',
+                                                       bg='#ffd47f',
+                                                       fg='black')
+
+    def _refrescar_botones_orientacion(self):
+        """Pinta los botones de orientacion segun cual esta activo."""
+        est = estado.get_estado()
+        activa = est["orientacion_manual"]
         colores = {"ARRIBA": "#2d8f3a", "ABAJO": "#cc7a00",
                    "VACIO": "#777777"}
         for btn in self.btns_orient:
-            if btn['text'] == orient:
-                btn.configure(bg=colores[orient], fg='white',
+            txt = btn['text']
+            if txt == activa:
+                btn.configure(bg=colores[txt], fg='white',
                               relief='sunken')
             else:
                 btn.configure(bg='SystemButtonFace', fg='black',
                               relief='raised')
+
+    def _seleccionar_orientacion(self, orient):
+        """Wrapper viejo. Setea sin toggle (lo deja activo)."""
+        estado.set_orientacion_manual(orient)
+        self._refrescar_botones_orientacion()
         self._actualizar_label_seleccion()
 
     def _cambiar_modo_cinta(self, auto):
@@ -1013,22 +1371,14 @@ class HMISpirax:
                                            relief='sunken')
             self.btn_manual_cinta.configure(bg='SystemButtonFace', fg='black',
                                              relief='raised')
-            for btn in self.btns_orient:
-                btn.configure(state='disabled',
-                              bg='#3a3a3a', fg='#777777',
-                              relief='flat',
-                              disabledforeground='#777777')
         else:
             estado.set_modo_auto_cinta(False)
             self.btn_manual_cinta.configure(bg='#4a90e2', fg='white',
                                              relief='sunken')
             self.btn_auto_cinta.configure(bg='SystemButtonFace', fg='black',
                                            relief='raised')
-            for btn in self.btns_orient:
-                btn.configure(state='normal')
-            est = estado.get_estado()
-            self._seleccionar_orientacion(est["orientacion_manual"])
 
+        self._aplicar_estado_modos()
         self._actualizar_label_seleccion()
 
     def _cambiar_modo_mesa(self, auto):
@@ -1040,18 +1390,75 @@ class HMISpirax:
                                           relief='sunken')
             self.btn_manual_mesa.configure(bg='SystemButtonFace', fg='black',
                                             relief='raised')
-            self.spn_fila.configure(state='disabled')
-            self.spn_col.configure(state='disabled')
         else:
             estado.set_modo_auto_mesa(False)
             self.btn_manual_mesa.configure(bg='#4a90e2', fg='white',
                                             relief='sunken')
             self.btn_auto_mesa.configure(bg='SystemButtonFace', fg='black',
                                           relief='raised')
-            self.spn_fila.configure(state='normal')
-            self.spn_col.configure(state='normal')
 
+        self._aplicar_estado_modos()
         self._actualizar_label_seleccion()
+
+    def _capturar_test_cinta(self):
+        """Captura una foto y la analiza como cinta. Muestra resultado
+        en el panel pero NO afecta al robot. Funciona en cualquier modo.
+        """
+        est_actual = estado.get_estado()
+        tipo = est_actual["tipo"]
+
+        def trabajo():
+            camara_iniciada_aqui = False
+            try:
+                if not detector.esta_activo():
+                    self._log_thread_safe("[TEST CINTA] Iniciando camara...")
+                    detector.start(requiere_referencia=False)
+                    camara_iniciada_aqui = True
+                    self._log_thread_safe("[TEST CINTA] Camara lista.")
+
+                self._log_thread_safe(f"[TEST CINTA] Capturando Tipo {tipo}...")
+                consultar_vision_cinta(tipo, self._log_thread_safe)
+            except Exception as e:
+                self._log_thread_safe(f"!!! Error en test cinta: {e}")
+            finally:
+                if camara_iniciada_aqui and detector.esta_activo():
+                    try:
+                        detector.stop()
+                        self._log_thread_safe("[TEST CINTA] Camara apagada.")
+                    except Exception as e:
+                        self._log_thread_safe(f"!!! Error apagando: {e}")
+
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _capturar_test_mesa(self):
+        """Captura una foto y la analiza como mesa. Muestra matriz en
+        el panel pero NO afecta al robot. Funciona en cualquier modo.
+        """
+        est_actual = estado.get_estado()
+        tipo = est_actual["tipo"]
+
+        def trabajo():
+            camara_iniciada_aqui = False
+            try:
+                if not detector.esta_activo():
+                    self._log_thread_safe("[TEST MESA] Iniciando camara...")
+                    detector.start(requiere_referencia=False)
+                    camara_iniciada_aqui = True
+                    self._log_thread_safe("[TEST MESA] Camara lista.")
+
+                self._log_thread_safe(f"[TEST MESA] Capturando Tipo {tipo}...")
+                consultar_vision_mesa(tipo, self._log_thread_safe)
+            except Exception as e:
+                self._log_thread_safe(f"!!! Error en test mesa: {e}")
+            finally:
+                if camara_iniciada_aqui and detector.esta_activo():
+                    try:
+                        detector.stop()
+                        self._log_thread_safe("[TEST MESA] Camara apagada.")
+                    except Exception as e:
+                        self._log_thread_safe(f"!!! Error apagando: {e}")
+
+        threading.Thread(target=trabajo, daemon=True).start()
 
     def _asegurar_camara(self):
         """Si la camara no esta activa, intenta encenderla. True si quedo
@@ -1072,21 +1479,50 @@ class HMISpirax:
                                  f"No se pudo iniciar la camara:\n\n{e}")
             return False
 
+    def _toggle_mesa_manual(self):
+        """Activado/desactivado del modo manual de mesa con el checkbox."""
+        if self.var_mesa_manual_activo.get():
+            try:
+                fila = int(self.spn_fila.get())
+                col = int(self.spn_col.get())
+            except ValueError:
+                fila, col = 1, 1
+            estado.set_mesa_manual(fila, col)
+        else:
+            estado.set_mesa_manual(0, 0)  # 0/0 = no hay manual
+        self._aplicar_estado_modos()
+        self._actualizar_label_seleccion()
+
     def _cambio_mesa_manual(self):
+        # Solo aplica si el checkbox de activacion esta tildado
+        if not self.var_mesa_manual_activo.get():
+            return
         try:
             fila = int(self.spn_fila.get())
             col = int(self.spn_col.get())
         except ValueError:
             return
         estado.set_mesa_manual(fila, col)
+        self._actualizar_label_seleccion()
 
     def _actualizar_label_seleccion(self):
         est = estado.get_estado()
         cinta_cal = "OK" if tiene_referencia(est["tipo"], "cinta") else "sin cal"
         mesa_cal = "OK" if tiene_referencia(est["tipo"], "mesa") else "sin cal"
 
-        cinta_modo = "AUTO" if est["modo_auto_cinta"] else f"manual:{est['orientacion_manual']}"
-        mesa_modo = "AUTO" if est["modo_auto_mesa"] else f"manual:({est['mesa_manual_fila']},{est['mesa_manual_columna']})"
+        if est["modo_auto_cinta"]:
+            cinta_modo = "AUTO"
+        elif est["orientacion_manual"]:
+            cinta_modo = f"manual:{est['orientacion_manual']}"
+        else:
+            cinta_modo = "manual:(sin seleccion)"
+
+        if est["modo_auto_mesa"]:
+            mesa_modo = "AUTO"
+        elif est["mesa_manual_fila"] > 0 and est["mesa_manual_columna"] > 0:
+            mesa_modo = f"manual:({est['mesa_manual_fila']},{est['mesa_manual_columna']})"
+        else:
+            mesa_modo = "manual:(sin seleccion)"
 
         self.lbl_seleccion.configure(
             text=f"Tipo: {est['tipo']}   |   "
@@ -1158,8 +1594,19 @@ class HMISpirax:
             self.scl_exp.set(detector.exposure)
             self.scl_gain.set(detector.gain)
             self.scl_thr.set(detector.bg_diff_thresh)
+            self.scl_umbral.set(detector.umbral_ocupacion)
         except Exception:
             pass
+
+        # Slider de umbral solo activo en estacion mesa
+        if est == "mesa":
+            self.scl_umbral.configure(state='normal',
+                                       fg='white', troughcolor='#1a1a1a')
+            self.lbl_umbral_titulo.configure(fg='white')
+        else:
+            self.scl_umbral.configure(state='disabled',
+                                       fg='#666666', troughcolor='#2a2a2a')
+            self.lbl_umbral_titulo.configure(fg='#666666')
 
         self._refrescar_estado_archivos()
         self._mostrar_referencia_calibrar()
@@ -1415,13 +1862,22 @@ class HMISpirax:
         except Exception as e:
             self._agregar_log(f"!!! threshold: {e}")
 
+    def _on_umbral_change(self, valor):
+        try:
+            detector.set_umbral_ocupacion(int(valor), persist=False)
+        except Exception as e:
+            self._agregar_log(f"!!! umbral: {e}")
+
     def _persistir_sliders(self, _evt=None):
         try:
             detector.set_exposure(detector.exposure, persist=True)
+            extra = ""
+            if self._estacion_calibrar == "mesa":
+                extra = f" umbral={detector.umbral_ocupacion}%"
             self._agregar_log(
                 f"[CONFIG] Tipo {self._tipo_calibrar} ({self._estacion_calibrar}): "
                 f"exp={detector.exposure} gain={detector.gain} "
-                f"thr={detector.bg_diff_thresh}"
+                f"thr={detector.bg_diff_thresh}{extra}"
             )
         except Exception as e:
             self._agregar_log(f"!!! persistiendo: {e}")
@@ -1485,7 +1941,36 @@ class HMISpirax:
     # ==================================================================
     #  Loop refresco
     # ==================================================================
+    def _mostrar_popup_manual_cinta(self):
+        """Aviso al operario que tiene que elegir una orientacion manual."""
+        messagebox.showwarning(
+            "Cinta MANUAL sin seleccion",
+            "El robot pidio vision de la CINTA pero estas en modo MANUAL\n"
+            "sin haber elegido ARRIBA / ABAJO / VACIO.\n\n"
+            "Apreta uno de los botones manuales o cambia a AUTOMATICO.\n\n"
+            "Mientras tanto, le respondi VACIO al robot."
+        )
+
+    def _mostrar_popup_manual_mesa(self):
+        """Aviso al operario que tiene que elegir una posicion manual."""
+        messagebox.showwarning(
+            "Mesa MANUAL sin seleccion",
+            "El robot pidio vision de la MESA pero estas en modo MANUAL\n"
+            "sin haber tildado 'Activar' en fila/columna.\n\n"
+            "Tilda el checkbox 'Activar' y elegi fila/columna,\n"
+            "o cambia a AUTOMATICO.\n\n"
+            "Mientras tanto, le respondi VACIO al robot."
+        )
+
     def _actualizar_estado_loop(self):
+        # Chequear si el server pidio popup manual
+        if estado.pedir_popup_cinta:
+            estado.pedir_popup_cinta = False
+            self._mostrar_popup_manual_cinta()
+        if estado.pedir_popup_mesa:
+            estado.pedir_popup_mesa = False
+            self._mostrar_popup_manual_mesa()
+
         if estado.robot_conectado:
             self.lbl_robot.configure(text="Robot: CONECTADO", fg='#7fff7f')
         else:
@@ -1525,9 +2010,16 @@ class HMISpirax:
             self.lbl_ratio_cinta.configure(
                 text=f"Ratio: {ratio:.3f}" if ratio is not None else "Ratio: ---")
 
-        # Refrescar matriz
+        # Refrescar matriz Y panel bg subtract segun cual este visible
         self._dibujar_matriz(matriz if matriz is not None else matriz_vacia(),
                               fila_m, col_m)
+        # Si la vista es bg subtract, tambien refrescar la imagen
+        try:
+            if self.var_vista_mesa.get() == "bg":
+                self._refrescar_panel_bg_mesa()
+        except AttributeError:
+            pass
+
         if matriz is not None:
             n_piezas = sum(sum(1 for c in f if c) for f in matriz)
             self.lbl_piezas_mesa.configure(text=f"Piezas: {n_piezas}")
@@ -1542,6 +2034,162 @@ class HMISpirax:
                                                 fg='#cccccc')
 
         self.root.after(500, self._actualizar_estado_loop)
+
+    def _ver_en_grande_cinta(self):
+        """Abre ventana con la imagen actual de cinta a tamano completo."""
+        with estado.lock:
+            panel = estado.ultimo_panel_cinta
+        if panel is None:
+            messagebox.showinfo("Sin imagen",
+                                 "Todavia no hay captura de cinta. Apreta "
+                                 "'Capturar Ahora' primero.")
+            return
+        self._abrir_ventana_zoom(panel, "Cinta - BG Subtract (zoom)")
+
+    def _ver_en_grande_mesa(self):
+        """Abre ventana con la imagen actual de mesa (BG subtract) a tamano completo."""
+        with estado.lock:
+            panel = estado.ultimo_panel_mesa
+        if panel is None:
+            messagebox.showinfo("Sin imagen",
+                                 "Todavia no hay captura de mesa. Apreta "
+                                 "'Capturar Ahora' primero.")
+            return
+        self._abrir_ventana_zoom(panel, "Mesa - BG Subtract (zoom)")
+
+    def _abrir_ventana_zoom(self, panel_bgr, titulo):
+        """Abre una ventana Toplevel con la imagen y soporte de zoom +
+        pan con drag.
+
+        Controles:
+          - Rueda del mouse: zoom in/out
+          - Botones +/- : zoom
+          - Boton "100%": volver a tamano original
+          - Click-drag: pan
+        """
+        win = tk.Toplevel(self.root)
+        win.title(titulo)
+        win.configure(bg='#1a1a1a')
+        # Tamano inicial razonable
+        win.geometry("1000x700")
+
+        # Convertir BGR -> RGB -> PIL para que se pueda escalar
+        rgb = cv2.cvtColor(panel_bgr, cv2.COLOR_BGR2RGB)
+        img_original = Image.fromarray(rgb)
+
+        # Barra de herramientas arriba
+        toolbar = tk.Frame(win, bg='#2b2b2b')
+        toolbar.pack(side='top', fill='x')
+
+        lbl_zoom = tk.Label(toolbar, text="Zoom: 100%",
+                             font=("Arial", 10), bg='#2b2b2b', fg='white',
+                             padx=10)
+        lbl_zoom.pack(side='left')
+
+        tk.Label(toolbar, text="(rueda del mouse: zoom | arrastrar: pan)",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(side='left', padx=10)
+
+        # Canvas con scrollbars
+        c_canvas = tk.Frame(win, bg='#1a1a1a')
+        c_canvas.pack(fill='both', expand=True)
+
+        h_scroll = tk.Scrollbar(c_canvas, orient='horizontal')
+        v_scroll = tk.Scrollbar(c_canvas, orient='vertical')
+        h_scroll.pack(side='bottom', fill='x')
+        v_scroll.pack(side='right', fill='y')
+
+        canvas = tk.Canvas(c_canvas, bg='#1a1a1a',
+                            xscrollcommand=h_scroll.set,
+                            yscrollcommand=v_scroll.set,
+                            highlightthickness=0)
+        canvas.pack(side='left', fill='both', expand=True)
+        h_scroll.config(command=canvas.xview)
+        v_scroll.config(command=canvas.yview)
+
+        # Estado del zoom
+        estado_zoom = {"factor": 1.0, "img_tk": None}
+
+        def redibujar():
+            factor = estado_zoom["factor"]
+            w = int(img_original.width * factor)
+            h = int(img_original.height * factor)
+            # Limites
+            if w < 50 or h < 50:
+                return
+            if w > 6000 or h > 6000:
+                return
+            img_scaled = img_original.resize((w, h), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(img_scaled)
+            estado_zoom["img_tk"] = img_tk
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=img_tk, anchor='nw')
+            canvas.config(scrollregion=(0, 0, w, h))
+            lbl_zoom.configure(text=f"Zoom: {int(factor * 100)}%")
+
+        def zoom_in():
+            estado_zoom["factor"] *= 1.25
+            redibujar()
+
+        def zoom_out():
+            estado_zoom["factor"] *= 0.8
+            redibujar()
+
+        def zoom_100():
+            estado_zoom["factor"] = 1.0
+            redibujar()
+
+        def fit_window():
+            # Ajustar al tamano de la ventana
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw <= 1 or ch <= 1:
+                return
+            fx = cw / img_original.width
+            fy = ch / img_original.height
+            estado_zoom["factor"] = min(fx, fy)
+            redibujar()
+
+        # Botones zoom
+        tk.Button(toolbar, text="−", width=3, command=zoom_out,
+                  font=("Arial", 12, "bold")).pack(side='right', padx=2)
+        tk.Button(toolbar, text="+", width=3, command=zoom_in,
+                  font=("Arial", 12, "bold")).pack(side='right', padx=2)
+        tk.Button(toolbar, text="100%", command=zoom_100).pack(side='right', padx=2)
+        tk.Button(toolbar, text="Ajustar", command=fit_window).pack(side='right', padx=2)
+
+        # Rueda del mouse zoom
+        def on_wheel(event):
+            # Windows / Mac
+            if event.delta > 0:
+                zoom_in()
+            elif event.delta < 0:
+                zoom_out()
+        def on_wheel_linux_up(event):
+            zoom_in()
+        def on_wheel_linux_down(event):
+            zoom_out()
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        canvas.bind("<Button-4>", on_wheel_linux_up)
+        canvas.bind("<Button-5>", on_wheel_linux_down)
+
+        # Pan con drag
+        def on_drag_start(event):
+            canvas.scan_mark(event.x, event.y)
+
+        def on_drag_move(event):
+            canvas.scan_dragto(event.x, event.y, gain=1)
+
+        canvas.bind("<ButtonPress-1>", on_drag_start)
+        canvas.bind("<B1-Motion>", on_drag_move)
+
+        # Cursor estilo "agarrar"
+        canvas.configure(cursor="fleur")
+
+        # Dibujado inicial: ajustar a la ventana
+        win.update_idletasks()
+        fit_window()
 
     def _mostrar_panel_cinta(self, panel_bgr):
         try:

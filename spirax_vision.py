@@ -106,6 +106,7 @@ def cargar_config(tipo, estacion="cinta"):
         cfg.setdefault("gain", 60)
         cfg.setdefault("saturation", 50)
         cfg.setdefault("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT)
+        cfg.setdefault("umbral_ocupacion", 0.15)
         return cfg
     return {
         "corte_y_top_pct": 0.0,
@@ -116,6 +117,7 @@ def cargar_config(tipo, estacion="cinta"):
         "gain": 60,
         "saturation": 50,
         "bg_diff_thresh": BG_DIFF_THRESH_DEFAULT,
+        "umbral_ocupacion": 0.15,
     }
 
 
@@ -707,6 +709,15 @@ class DetectorOrientacion:
             with self._lock:
                 self._persistir()
 
+    def set_umbral_ocupacion(self, valor, persist=True):
+        """valor entero 0-100 (porcentaje). Se guarda como 0.0-1.0 en config."""
+        valor_pct = max(0, min(100, int(valor)))
+        with self._lock:
+            self._config["umbral_ocupacion"] = valor_pct / 100.0
+        if persist:
+            with self._lock:
+                self._persistir()
+
     @property
     def exposure(self):
         return int(self._config.get("exposure", 10))
@@ -718,6 +729,11 @@ class DetectorOrientacion:
     @property
     def bg_diff_thresh(self):
         return int(self._config.get("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT))
+
+    @property
+    def umbral_ocupacion(self):
+        """Devuelve el porcentaje 0-100 (no la fraccion 0.0-1.0)."""
+        return int(self._config.get("umbral_ocupacion", 0.15) * 100)
 
     def recargar_referencia(self):
         with self._lock:

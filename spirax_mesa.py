@@ -32,7 +32,7 @@ UMBRAL_OCUPACION_DEFAULT = 0.15  # 15%
 
 def analizar_mesa_pipeline(imagen, referencia_blur, config,
                             diff_thresh=None,
-                            umbral_ocupacion=UMBRAL_OCUPACION_DEFAULT):
+                            umbral_ocupacion=None):
     """Pipeline completo de analisis de mesa.
 
     Recibe imagen capturada + referencia ya cargada + config del tipo.
@@ -43,10 +43,18 @@ def analizar_mesa_pipeline(imagen, referencia_blur, config,
             matriz[i][j] = celda fila i, columna j.
 
     fila, columna: 1-indexed, 0/0 = sin piezas disponibles.
+
+    umbral_ocupacion: si None, se toma del config (clave 'umbral_ocupacion').
+                      Si no esta en el config, se usa UMBRAL_OCUPACION_DEFAULT.
+                      Valor entre 0 y 1 (porcentaje de pixels cambiados
+                      por celda para considerarla ocupada).
     """
     if diff_thresh is None:
         from spirax_vision import BG_DIFF_THRESH_DEFAULT
         diff_thresh = config.get("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT)
+    if umbral_ocupacion is None:
+        umbral_ocupacion = config.get("umbral_ocupacion",
+                                       UMBRAL_OCUPACION_DEFAULT)
 
     # 1. ROI con el mismo recorte que usa la cinta
     roi_color, blur = preparar_roi(imagen, config)
