@@ -1,0 +1,74 @@
+--- spirax/Spirax/hmi.py	2026-05-29 19:50:31.406809621 +0000
++++ work/hmi.py	2026-05-29 19:57:16.807066734 +0000
+@@ -1233,6 +1233,23 @@
+         self.scl_umbral.pack(fill='x')
+         self.scl_umbral.bind('<ButtonRelease-1>', self._persistir_sliders)
+ 
++        # Slider de margen interno de celda (solo aplica a MESA).
++        # Se guarda en config como 0.0-0.4 pero mostramos 0-40 (%).
++        # 0 = celda entera, 25 = solo el 50% central se analiza.
++        self.lbl_margen_titulo = tk.Label(
++            f_sld, text="Margen interno celda (%) [solo mesa]:",
++            font=("Arial", 10),
++            bg='#2b2b2b', fg='white')
++        self.lbl_margen_titulo.pack(anchor='w', pady=(5, 0))
++        self.scl_margen = tk.Scale(f_sld, from_=0, to=40,
++                                    orient='horizontal', length=220,
++                                    bg='#2b2b2b', fg='white',
++                                    troughcolor='#1a1a1a',
++                                    highlightthickness=0,
++                                    command=self._on_margen_change)
++        self.scl_margen.pack(fill='x')
++        self.scl_margen.bind('<ButtonRelease-1>', self._persistir_sliders)
++
+     # ------------------------------------------------------------------
+     #  TORNO
+     # ------------------------------------------------------------------
+@@ -1909,18 +1926,25 @@
+             self.scl_gain.set(detector.gain)
+             self.scl_thr.set(detector.bg_diff_thresh)
+             self.scl_umbral.set(detector.umbral_ocupacion)
++            self.scl_margen.set(detector.margen_celda)
+         except Exception:
+             pass
+ 
+-        # Slider de umbral solo activo en estacion mesa
++        # Sliders de umbral y margen solo activos en estacion mesa
+         if est == "mesa":
+             self.scl_umbral.configure(state='normal',
+                                        fg='white', troughcolor='#1a1a1a')
+             self.lbl_umbral_titulo.configure(fg='white')
++            self.scl_margen.configure(state='normal',
++                                       fg='white', troughcolor='#1a1a1a')
++            self.lbl_margen_titulo.configure(fg='white')
+         else:
+             self.scl_umbral.configure(state='disabled',
+                                        fg='#666666', troughcolor='#2a2a2a')
+             self.lbl_umbral_titulo.configure(fg='#666666')
++            self.scl_margen.configure(state='disabled',
++                                       fg='#666666', troughcolor='#2a2a2a')
++            self.lbl_margen_titulo.configure(fg='#666666')
+ 
+         self._refrescar_estado_archivos()
+         self._mostrar_referencia_calibrar()
+@@ -2242,12 +2266,19 @@
+         except Exception as e:
+             self._agregar_log(f"!!! umbral: {e}")
+ 
++    def _on_margen_change(self, valor):
++        try:
++            detector.set_margen_celda(int(valor), persist=False)
++        except Exception as e:
++            self._agregar_log(f"!!! margen: {e}")
++
+     def _persistir_sliders(self, _evt=None):
+         try:
+             detector.set_exposure(detector.exposure, persist=True)
+             extra = ""
+             if self._estacion_calibrar == "mesa":
+-                extra = f" umbral={detector.umbral_ocupacion}%"
++                extra = (f" umbral={detector.umbral_ocupacion}%"
++                         f" margen={detector.margen_celda}%")
+             self._agregar_log(
+                 f"[CONFIG] Tipo {self._tipo_calibrar} ({self._estacion_calibrar}): "
+                 f"exp={detector.exposure} gain={detector.gain} "

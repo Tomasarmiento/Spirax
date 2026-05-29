@@ -1,0 +1,375 @@
+--- spirax/Spirax/vision.py	2026-05-29 19:50:31.431801159 +0000
++++ work/vision.py	2026-05-29 19:55:16.858353354 +0000
+@@ -111,6 +111,17 @@
+         cfg.setdefault("saturation", 50)
+         cfg.setdefault("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT)
+         cfg.setdefault("umbral_ocupacion", 0.15)
++        # Grilla interna de la mesa: 9 verticales y 7 horizontales, en
++        # porcentaje (0-1) dentro del cuadrilatero del recorte. Defaults
++        # uniformes (1/10, 2/10, ... y 1/8, 2/8, ...).
++        cfg.setdefault("grid_x", [i / GRILLA_COLS_OVERLAY
++                                   for i in range(1, GRILLA_COLS_OVERLAY)])
++        cfg.setdefault("grid_y", [i / GRILLA_FILAS_OVERLAY
++                                   for i in range(1, GRILLA_FILAS_OVERLAY)])
++        # Margen interno por celda (0.0 a 0.4). 0 = se analiza la celda
++        # entera, 0.25 = se ignora el 25% de cada borde (queda el 50%
++        # central).
++        cfg.setdefault("margen_celda", 0.0)
+         return cfg
+     return {
+         "corte_y_top_pct": 0.0,
+@@ -122,6 +133,11 @@
+         "saturation": 50,
+         "bg_diff_thresh": BG_DIFF_THRESH_DEFAULT,
+         "umbral_ocupacion": 0.15,
++        "grid_x": [i / GRILLA_COLS_OVERLAY
++                   for i in range(1, GRILLA_COLS_OVERLAY)],
++        "grid_y": [i / GRILLA_FILAS_OVERLAY
++                   for i in range(1, GRILLA_FILAS_OVERLAY)],
++        "margen_celda": 0.0,
+     }
+ 
+ 
+@@ -273,10 +289,13 @@
+ 
+     Controles:
+       - Click + drag sobre una esquina (puntos amarillos): mueve esa esquina
+-      - Click + drag sobre una linea (no en esquina): mueve esa linea
++      - Click + drag sobre una linea EXTERNA: mueve esa linea
++      - Click + drag sobre una linea INTERNA (solo mesa): mueve esa linea
+       - Shift + click + drag: mueve TODO el cuadrilatero
+       - Ctrl + click + drag: ROTA todo alrededor del centro
+       - Tecla R: resetea al recorte original (rectangulo lleno)
++      - Tecla G (solo mesa): toggle ver/ocultar grilla interna
++      - Tecla D (solo mesa): reset grilla interna a posiciones uniformes
+       - Tecla S: guarda
+       - Tecla Q / ESC: cancela
+ 
+@@ -317,17 +336,39 @@
+     # Snapshot original para reset
+     esquinas_orig = [list(p) for p in esquinas]
+ 
++    # Grilla interna (solo mesa). Cargada como lista de porcentajes
++    # dentro del cuadrilatero. Los defaults son uniformes.
++    es_mesa = (estacion == "mesa")
++    if es_mesa:
++        grid_x = list(config.get(
++            "grid_x",
++            [i / GRILLA_COLS_OVERLAY for i in range(1, GRILLA_COLS_OVERLAY)]))
++        grid_y = list(config.get(
++            "grid_y",
++            [i / GRILLA_FILAS_OVERLAY for i in range(1, GRILLA_FILAS_OVERLAY)]))
++        # Asegurar longitudes correctas (por si la config esta corrupta)
++        if len(grid_x) != GRILLA_COLS_OVERLAY - 1:
++            grid_x = [i / GRILLA_COLS_OVERLAY
++                      for i in range(1, GRILLA_COLS_OVERLAY)]
++        if len(grid_y) != GRILLA_FILAS_OVERLAY - 1:
++            grid_y = [i / GRILLA_FILAS_OVERLAY
++                      for i in range(1, GRILLA_FILAS_OVERLAY)]
++    else:
++        grid_x = []
++        grid_y = []
++
+     # Estado de interaccion
+     estado = {
+-        "modo": None,            # 'esquina', 'linea', 'mover_todo', 'rotar'
+-        "indice": None,          # esquina o linea
++        "modo": None,            # 'esquina', 'linea', 'linea_int_v',
++                                 # 'linea_int_h', 'mover_todo', 'rotar'
++        "indice": None,          # indice del elemento agarrado
+         "last_x": 0,
+         "last_y": 0,
+         "shift": False,
+         "ctrl": False,
+         "show_grid": True,
+-        "grid_filas": GRILLA_FILAS_OVERLAY if estacion == "mesa" else 0,
+-        "grid_cols": GRILLA_COLS_OVERLAY if estacion == "mesa" else 0,
++        "grid_filas": GRILLA_FILAS_OVERLAY if es_mesa else 0,
++        "grid_cols": GRILLA_COLS_OVERLAY if es_mesa else 0,
+     }
+ 
+     def dist_punto_punto(p1, p2):
+@@ -351,6 +392,46 @@
+         cy = sum(p[1] for p in esquinas) / 4
+         return cx, cy
+ 
++    def lineas_internas_segmentos():
++        """Devuelve dos listas de segmentos para las lineas internas.
++
++        verticales: lista de ((x_top, y_top), (x_bot, y_bot)) para cada
++                    grid_x. Va de borde superior a borde inferior del cuad.
++        horizontales: idem con grid_y, va de borde izq a borde der.
++        """
++        verticales = []
++        for t in grid_x:
++            p_top = (esquinas[0][0] + (esquinas[1][0] - esquinas[0][0]) * t,
++                     esquinas[0][1] + (esquinas[1][1] - esquinas[0][1]) * t)
++            p_bot = (esquinas[3][0] + (esquinas[2][0] - esquinas[3][0]) * t,
++                     esquinas[3][1] + (esquinas[2][1] - esquinas[3][1]) * t)
++            verticales.append((p_top, p_bot))
++        horizontales = []
++        for t in grid_y:
++            p_izq = (esquinas[0][0] + (esquinas[3][0] - esquinas[0][0]) * t,
++                     esquinas[0][1] + (esquinas[3][1] - esquinas[0][1]) * t)
++            p_der = (esquinas[1][0] + (esquinas[2][0] - esquinas[1][0]) * t,
++                     esquinas[1][1] + (esquinas[2][1] - esquinas[1][1]) * t)
++            horizontales.append((p_izq, p_der))
++        return verticales, horizontales
++
++    def xy_a_uv(x, y):
++        """Mapea un punto (x,y) en pixels al sistema (u,v) del cuadrilatero
++        donde u=0 es lado izq, u=1 es lado der, v=0 es lado sup, v=1 inf.
++        Robusto a rotacion y perspectiva.
++        """
++        src = np.array([esquinas[0], esquinas[1],
++                        esquinas[2], esquinas[3]], dtype=np.float32)
++        dst = np.array([[0.0, 0.0], [1.0, 0.0],
++                        [1.0, 1.0], [0.0, 1.0]], dtype=np.float32)
++        try:
++            M = cv2.getPerspectiveTransform(src, dst)
++        except Exception:
++            return None, None
++        pt = np.array([[[float(x), float(y)]]], dtype=np.float32)
++        res = cv2.perspectiveTransform(pt, M)
++        return float(res[0][0][0]), float(res[0][0][1])
++
+     def on_mouse(event, x, y, flags, param):
+         # Detectar Shift/Ctrl en el momento del click
+         shift = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+@@ -371,7 +452,7 @@
+                 estado["indice"] = None
+                 return
+ 
+-            # Buscar esquina cercana
++            # Buscar esquina cercana (mayor prioridad)
+             tol_esquina = 18
+             mejor_i = None
+             mejor_d = tol_esquina
+@@ -385,7 +466,7 @@
+                 estado["indice"] = mejor_i
+                 return
+ 
+-            # Buscar linea cercana
++            # Buscar linea EXTERNA cercana
+             tol_linea = 12
+             mejor_l = None
+             mejor_dl = tol_linea
+@@ -396,9 +477,39 @@
+                 if d < mejor_dl:
+                     mejor_dl = d
+                     mejor_l = i
++
++            # Buscar linea INTERNA cercana (solo mesa con grilla visible)
++            mejor_iv = None
++            mejor_div = 10  # tolerancia para internas
++            mejor_ih = None
++            mejor_dih = 10
++            if es_mesa and estado["show_grid"]:
++                verticales, horizontales = lineas_internas_segmentos()
++                for i, (a, b) in enumerate(verticales):
++                    d = dist_punto_segmento([x, y], a, b)
++                    if d < mejor_div:
++                        mejor_div = d
++                        mejor_iv = i
++                for i, (a, b) in enumerate(horizontales):
++                    d = dist_punto_segmento([x, y], a, b)
++                    if d < mejor_dih:
++                        mejor_dih = d
++                        mejor_ih = i
++
++            # Elegir el match mas cercano entre las tres opciones
++            opciones = []
+             if mejor_l is not None:
+-                estado["modo"] = "linea"
+-                estado["indice"] = mejor_l
++                opciones.append(("linea", mejor_l, mejor_dl))
++            if mejor_iv is not None:
++                opciones.append(("linea_int_v", mejor_iv, mejor_div))
++            if mejor_ih is not None:
++                opciones.append(("linea_int_h", mejor_ih, mejor_dih))
++
++            if opciones:
++                opciones.sort(key=lambda o: o[2])
++                modo_, idx_, _ = opciones[0]
++                estado["modo"] = modo_
++                estado["indice"] = idx_
+                 return
+ 
+             # Nada agarrado
+@@ -427,6 +538,28 @@
+                     esquinas[idx][0] = max(0, min(w - 1, esquinas[idx][0] + dx))
+                     esquinas[idx][1] = max(0, min(h - 1, esquinas[idx][1] + dy))
+ 
++            elif estado["modo"] == "linea_int_v":
++                # Arrastrar linea interna vertical: el nuevo grid_x es la
++                # coordenada u del puntero dentro del cuadrilatero.
++                i = estado["indice"]
++                u, _v = xy_a_uv(x, y)
++                if u is not None:
++                    eps = 0.005
++                    minimo = grid_x[i - 1] + eps if i > 0 else eps
++                    maximo = (grid_x[i + 1] - eps
++                              if i < len(grid_x) - 1 else 1.0 - eps)
++                    grid_x[i] = max(minimo, min(maximo, u))
++
++            elif estado["modo"] == "linea_int_h":
++                i = estado["indice"]
++                _u, v = xy_a_uv(x, y)
++                if v is not None:
++                    eps = 0.005
++                    minimo = grid_y[i - 1] + eps if i > 0 else eps
++                    maximo = (grid_y[i + 1] - eps
++                              if i < len(grid_y) - 1 else 1.0 - eps)
++                    grid_y[i] = max(minimo, min(maximo, v))
++
+             elif estado["modo"] == "mover_todo":
+                 for p in esquinas:
+                     p[0] = max(0, min(w - 1, p[0] + dx))
+@@ -477,34 +610,35 @@
+         # Dibujar contorno del cuadrilatero
+         cv2.polylines(debug, [pts_int], True, (0, 255, 255), 2)
+ 
+-        # Dibujar grilla 10x8 si es mesa
+-        if estado["grid_filas"] > 0 and estado["grid_cols"] > 0:
+-            # Interpolar las 4 esquinas para dibujar lineas internas
+-            filas = estado["grid_filas"]
+-            cols = estado["grid_cols"]
+-
+-            def interp(p1, p2, t):
+-                return (p1[0] + (p2[0] - p1[0]) * t,
+-                        p1[1] + (p2[1] - p1[1]) * t)
+-
+-            # Lineas verticales (cols)
+-            for c in range(1, cols):
+-                t = c / cols
+-                p_top = interp(esquinas[0], esquinas[1], t)
+-                p_bot = interp(esquinas[3], esquinas[2], t)
++        # Dibujar grilla 10x8 si es mesa y show_grid esta activo
++        if es_mesa and estado["show_grid"]:
++            verticales, horizontales = lineas_internas_segmentos()
++
++            # Si estoy arrastrando una linea interna, resalto esa en cian
++            # vivo y las demas en color habitual.
++            modo_act = estado["modo"]
++            idx_act = estado["indice"]
++
++            for i, (p_top, p_bot) in enumerate(verticales):
++                color = (50, 200, 255)
++                grosor = 1
++                if modo_act == "linea_int_v" and idx_act == i:
++                    color = (0, 255, 255)
++                    grosor = 2
+                 cv2.line(debug,
+                          (int(p_top[0]), int(p_top[1])),
+                          (int(p_bot[0]), int(p_bot[1])),
+-                         (50, 200, 255), 1)
+-            # Lineas horizontales (filas)
+-            for f in range(1, filas):
+-                t = f / filas
+-                p_izq = interp(esquinas[0], esquinas[3], t)
+-                p_der = interp(esquinas[1], esquinas[2], t)
++                         color, grosor)
++            for i, (p_izq, p_der) in enumerate(horizontales):
++                color = (50, 200, 255)
++                grosor = 1
++                if modo_act == "linea_int_h" and idx_act == i:
++                    color = (0, 255, 255)
++                    grosor = 2
+                 cv2.line(debug,
+                          (int(p_izq[0]), int(p_izq[1])),
+                          (int(p_der[0]), int(p_der[1])),
+-                         (50, 200, 255), 1)
++                         color, grosor)
+ 
+         # Dibujar esquinas como puntitos amarillos
+         labels = ["SI", "SD", "ID", "II"]  # sup-izq, sup-der, inf-der, inf-izq
+@@ -516,11 +650,19 @@
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+ 
+         # Texto de ayuda
+-        cv2.putText(debug,
+-                    f"Tipo {tipo} ({estacion.upper()}) | Drag esquina/linea | Shift=mover todo | Ctrl=rotar",
++        if es_mesa:
++            ayuda_top = (f"Tipo {tipo} (MESA) | Drag esquina/linea ext/linea int"
++                         " | Shift=mover Ctrl=rotar")
++            ayuda_bot = ("R=reset esquinas  D=reset grilla  "
++                         "G=mostrar/ocultar grilla  S=guardar  Q=salir")
++        else:
++            ayuda_top = (f"Tipo {tipo} (CINTA) | Drag esquina/linea"
++                         " | Shift=mover Ctrl=rotar")
++            ayuda_bot = "R=reset  S=guardar  Q=salir"
++        cv2.putText(debug, ayuda_top,
+                     (10, 22),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+-        cv2.putText(debug, "R=reset  S=guardar  Q=salir",
++        cv2.putText(debug, ayuda_bot,
+                     (10, h - 15),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+ 
+@@ -548,16 +690,32 @@
+             config["corte_y_pct"] = round(max(ys) / h, 4)
+             config["corte_x_izq_pct"] = round(min(xs) / w, 4)
+             config["corte_x_der_pct"] = round(max(xs) / w, 4)
++            # Guardar grilla interna (solo si es mesa)
++            if es_mesa:
++                config["grid_x"] = [round(v, 4) for v in grid_x]
++                config["grid_y"] = [round(v, 4) for v in grid_y]
+             guardar_config(tipo, config, estacion)
+             cv2.destroyAllWindows()
+             return True
+ 
+         elif key == ord('r'):
+-            # Reset al original
++            # Reset esquinas al original. La grilla interna NO se toca
++            # (usar D para eso).
+             for i in range(4):
+                 esquinas[i][0] = esquinas_orig[i][0]
+                 esquinas[i][1] = esquinas_orig[i][1]
+ 
++        elif key == ord('g') and es_mesa:
++            # Toggle visibilidad de la grilla interna
++            estado["show_grid"] = not estado["show_grid"]
++
++        elif key == ord('d') and es_mesa:
++            # Reset grilla interna a posiciones uniformes
++            for i in range(GRILLA_COLS_OVERLAY - 1):
++                grid_x[i] = (i + 1) / GRILLA_COLS_OVERLAY
++            for i in range(GRILLA_FILAS_OVERLAY - 1):
++                grid_y[i] = (i + 1) / GRILLA_FILAS_OVERLAY
++
+         elif key == ord('q') or key == 27:
+             print("[X] Recorte cancelado.")
+             cv2.destroyAllWindows()
+@@ -1001,6 +1159,20 @@
+             with self._lock:
+                 self._persistir()
+ 
++    def set_margen_celda(self, valor, persist=True):
++        """valor entero 0-40 (porcentaje). Se guarda como 0.0-0.4 en config.
++
++        Solo aplica a mesa. Se recorta ese porcentaje de cada borde de la
++        celda antes de contar pixels. 0 = celda entera, 25 = solo el 50%
++        central.
++        """
++        valor_pct = max(0, min(40, int(valor)))
++        with self._lock:
++            self._config["margen_celda"] = valor_pct / 100.0
++        if persist:
++            with self._lock:
++                self._persistir()
++
+     @property
+     def exposure(self):
+         return int(self._config.get("exposure", 10))
+@@ -1018,6 +1190,11 @@
+         """Devuelve el porcentaje 0-100 (no la fraccion 0.0-1.0)."""
+         return int(self._config.get("umbral_ocupacion", 0.15) * 100)
+ 
++    @property
++    def margen_celda(self):
++        """Devuelve el porcentaje 0-40 (no la fraccion 0.0-0.4)."""
++        return int(round(self._config.get("margen_celda", 0.0) * 100))
++
+     def recargar_referencia(self):
+         with self._lock:
+             ref_path = path_referencia(self._tipo, self._estacion)

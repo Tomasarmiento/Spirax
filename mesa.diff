@@ -1,0 +1,214 @@
+--- spirax/Spirax/mesa.py	2026-05-29 19:50:31.407218496 +0000
++++ work/mesa.py	2026-05-29 19:56:37.537352692 +0000
+@@ -32,7 +32,8 @@
+ 
+ def analizar_mesa_pipeline(imagen, referencia_blur, config,
+                             diff_thresh=None,
+-                            umbral_ocupacion=None):
++                            umbral_ocupacion=None,
++                            margen_celda=None):
+     """Pipeline completo de analisis de mesa.
+ 
+     Recibe imagen capturada + referencia ya cargada + config del tipo.
+@@ -48,6 +49,14 @@
+                       Si no esta en el config, se usa UMBRAL_OCUPACION_DEFAULT.
+                       Valor entre 0 y 1 (porcentaje de pixels cambiados
+                       por celda para considerarla ocupada).
++
++    margen_celda: 0.0 a 0.4. Si None, se toma del config. Se ignora ese
++                  porcentaje de cada borde de la celda antes de contar.
++                  0.0 = celda entera, 0.25 = solo el 50% central.
++
++    Los bordes de las celdas no son uniformes: se toman de config['grid_x']
++    (9 valores) y config['grid_y'] (7 valores), porcentajes dentro del ROI.
++    Si no estan, se usan posiciones uniformes (compatibilidad).
+     """
+     if diff_thresh is None:
+         from vision import BG_DIFF_THRESH_DEFAULT
+@@ -55,6 +64,9 @@
+     if umbral_ocupacion is None:
+         umbral_ocupacion = config.get("umbral_ocupacion",
+                                        UMBRAL_OCUPACION_DEFAULT)
++    if margen_celda is None:
++        margen_celda = config.get("margen_celda", 0.0)
++    margen_celda = max(0.0, min(0.4, float(margen_celda)))
+ 
+     # 1. ROI con el mismo recorte que usa la cinta
+     roi_color, blur = preparar_roi(imagen, config)
+@@ -63,7 +75,7 @@
+     thresh = metodo_d_bgsub(blur, referencia_blur, diff_thresh=diff_thresh)
+     if thresh is None:
+         panel = _panel_debug_mesa(roi_color, None, None, None, None,
+-                                   "SIN REFERENCIA")
++                                   "SIN REFERENCIA", config, margen_celda)
+         return {
+             "matriz": None,
+             "fila": 0,
+@@ -75,25 +87,40 @@
+     kernel = np.ones((3, 3), np.uint8)
+     mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+ 
+-    # 3. Dividir en grilla 10x8 uniforme
++    # 3. Calcular bordes de celdas a partir de grid_x / grid_y
+     h, w = mask.shape[:2]
+-    cell_h = h / GRILLA_FILAS
+-    cell_w = w / GRILLA_COLS
++    grid_x_pct, grid_y_pct = _grid_pcts(config)
++
++    # Bordes absolutos en pixels (0..w para columnas, 0..h para filas)
++    x_borders = [0] + [int(round(p * w)) for p in grid_x_pct] + [w]
++    y_borders = [0] + [int(round(p * h)) for p in grid_y_pct] + [h]
+ 
+     matriz = []
+-    area_celda = cell_h * cell_w
+ 
+     for fi in range(GRILLA_FILAS):
+         fila = []
+-        y1 = int(round(fi * cell_h))
+-        y2 = int(round((fi + 1) * cell_h))
++        y1 = y_borders[fi]
++        y2 = y_borders[fi + 1]
+         for ci in range(GRILLA_COLS):
+-            x1 = int(round(ci * cell_w))
+-            x2 = int(round((ci + 1) * cell_w))
+-            celda = mask[y1:y2, x1:x2]
+-            # Cuenta de pixels distintos a referencia
++            x1 = x_borders[ci]
++            x2 = x_borders[ci + 1]
++            # Aplicar margen interno: encoger la celda hacia el centro
++            cw = x2 - x1
++            ch = y2 - y1
++            mx = int(round(cw * margen_celda))
++            my = int(round(ch * margen_celda))
++            xa = x1 + mx
++            xb = x2 - mx
++            ya = y1 + my
++            yb = y2 - my
++            # Proteccion contra celdas degeneradas (margen muy grande)
++            if xb <= xa or yb <= ya:
++                xa, xb = x1, x2
++                ya, yb = y1, y2
++            celda = mask[ya:yb, xa:xb]
++            area = max(1, (xb - xa) * (yb - ya))
+             pixels_distintos = int(np.count_nonzero(celda))
+-            ocupacion = pixels_distintos / max(1, area_celda)
++            ocupacion = pixels_distintos / area
+             fila.append(ocupacion >= umbral_ocupacion)
+         matriz.append(fila)
+ 
+@@ -112,7 +139,8 @@
+ 
+     panel = _panel_debug_mesa(roi_color, mask, matriz,
+                                elegida_fila, elegida_col,
+-                               f"({elegida_fila},{elegida_col})" if elegida_fila else "VACIO")
++                               f"({elegida_fila},{elegida_col})" if elegida_fila else "VACIO",
++                               config, margen_celda)
+     return {
+         "matriz": matriz,
+         "fila": elegida_fila,
+@@ -121,14 +149,33 @@
+     }
+ 
+ 
++def _grid_pcts(config):
++    """Devuelve (grid_x, grid_y) leidos del config con defaults uniformes."""
++    grid_x = list(config.get(
++        "grid_x", [i / GRILLA_COLS for i in range(1, GRILLA_COLS)]))
++    grid_y = list(config.get(
++        "grid_y", [i / GRILLA_FILAS for i in range(1, GRILLA_FILAS)]))
++    # Validacion defensiva contra configs viejas/corruptas
++    if len(grid_x) != GRILLA_COLS - 1:
++        grid_x = [i / GRILLA_COLS for i in range(1, GRILLA_COLS)]
++    if len(grid_y) != GRILLA_FILAS - 1:
++        grid_y = [i / GRILLA_FILAS for i in range(1, GRILLA_FILAS)]
++    return grid_x, grid_y
++
++
+ # Alias publico mas corto
+ def analizar_imagen_mesa(imagen, referencia_blur, config, diff_thresh=None):
+     return analizar_mesa_pipeline(imagen, referencia_blur, config, diff_thresh)
+ 
+ 
+ def _panel_debug_mesa(roi_color, mask, matriz, elegida_fila, elegida_col,
+-                       texto_decision):
+-    """Genera un panel de debug visual con la grilla superpuesta."""
++                       texto_decision, config=None, margen_celda=0.0):
++    """Genera un panel de debug visual con la grilla superpuesta.
++
++    Si config tiene grid_x/grid_y los usa para las divisiones. Si no,
++    cae a divisiones uniformes. Si margen_celda > 0, dibuja tambien el
++    rectangulo interno (zona efectivamente analizada) en cada celda.
++    """
+     if roi_color is None:
+         return None
+ 
+@@ -143,26 +190,57 @@
+         mask_blue[:, :, 0] = mask  # canal B
+         panel = cv2.addWeighted(panel, 0.7, mask_blue, 0.3, 0)
+ 
+-    # Dibujar la grilla
+-    cell_h = h / GRILLA_FILAS
+-    cell_w = w / GRILLA_COLS
+-
+-    # Lineas de la grilla
+-    for fi in range(GRILLA_FILAS + 1):
+-        y = int(round(fi * cell_h))
++    # Calcular bordes de la grilla
++    if config is not None:
++        grid_x_pct, grid_y_pct = _grid_pcts(config)
++    else:
++        grid_x_pct = [i / GRILLA_COLS for i in range(1, GRILLA_COLS)]
++        grid_y_pct = [i / GRILLA_FILAS for i in range(1, GRILLA_FILAS)]
++
++    x_borders = [0] + [int(round(p * w)) for p in grid_x_pct] + [w]
++    y_borders = [0] + [int(round(p * h)) for p in grid_y_pct] + [h]
++
++    # Lineas de la grilla externa (en celeste-amarillo tenue)
++    for y in y_borders:
+         cv2.line(panel, (0, y), (w, y), (255, 200, 50), 1)
+-    for ci in range(GRILLA_COLS + 1):
+-        x = int(round(ci * cell_w))
++    for x in x_borders:
+         cv2.line(panel, (x, 0), (x, h), (255, 200, 50), 1)
+ 
+-    # Marcar celdas ocupadas y la elegida
++    # Si hay margen interno > 0, dibujar el rectangulo interno punteado
++    # de cada celda asi se ve la zona que realmente se analiza
++    if margen_celda > 0.0:
++        for fi in range(GRILLA_FILAS):
++            y1 = y_borders[fi]
++            y2 = y_borders[fi + 1]
++            for ci in range(GRILLA_COLS):
++                x1 = x_borders[ci]
++                x2 = x_borders[ci + 1]
++                cw = x2 - x1
++                ch = y2 - y1
++                mx = int(round(cw * margen_celda))
++                my = int(round(ch * margen_celda))
++                xa = x1 + mx
++                xb = x2 - mx
++                ya = y1 + my
++                yb = y2 - my
++                if xb > xa and yb > ya:
++                    cv2.rectangle(panel, (xa, ya), (xb, yb),
++                                  (180, 180, 180), 1)
++
++    # Marcar celdas ocupadas y la elegida (centro segun bordes)
+     if matriz is not None:
+         for fi in range(GRILLA_FILAS):
++            y1 = y_borders[fi]
++            y2 = y_borders[fi + 1]
++            cell_h = y2 - y1
+             for ci in range(GRILLA_COLS):
+                 if not matriz[fi][ci]:
+                     continue
+-                cx = int(round((ci + 0.5) * cell_w))
+-                cy = int(round((fi + 0.5) * cell_h))
++                x1 = x_borders[ci]
++                x2 = x_borders[ci + 1]
++                cell_w = x2 - x1
++                cx = (x1 + x2) // 2
++                cy = (y1 + y2) // 2
+                 radius = max(4, int(min(cell_h, cell_w) * 0.18))
+                 # Verde para ocupadas
+                 cv2.circle(panel, (cx, cy), radius, (0, 200, 0), -1)

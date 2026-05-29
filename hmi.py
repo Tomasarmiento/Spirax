@@ -1,5 +1,5 @@
 """
-spirax_hmi.py - HMI Spirax con soporte para Cinta + Mesa
+hmi.py - HMI Spirax con soporte para Cinta + Mesa
 
 Cambios vs version anterior:
 - Pestania CALIBRAR ahora tiene toggle [Cinta] [Mesa] (calibra una u otra
@@ -20,7 +20,7 @@ from datetime import datetime
 import cv2
 from PIL import Image, ImageTk
 
-from spirax_vision import (
+from vision import (
     DetectorOrientacion,
     TIPOS_VALIDOS,
     ESTACIONES_VALIDAS,
@@ -29,10 +29,11 @@ from spirax_vision import (
     path_config,
     modo_recorte,
 )
-from spirax_mesa import (
+from mesa import (
     GRILLA_FILAS, GRILLA_COLS,
     matriz_vacia, matriz_con_celda,
 )
+from torno import TornoFanuc, FANUC_DISPONIBLE
 
 # --- Configuracion red ---
 HOST = '172.31.1.100'
@@ -140,6 +141,7 @@ class EstadoCompartido:
 
 estado = EstadoCompartido()
 detector = DetectorOrientacion(tipo_inicial=1, estacion_inicial="cinta")
+torno = TornoFanuc()  # se inicia desde la HMI con start()
 
 
 # ======================================================================
@@ -238,6 +240,16 @@ def manejar_robot(conn, addr, log_callback):
                         log_callback("!!! Cinta MANUAL sin seleccion -> popup")
                         estado.pedir_popup_cinta = True
                         orientacion = "VACIO"
+
+                # ENCOLAR AL TORNO segun el resultado de la cinta:
+                #   VACIO  -> KUKA carga pieza nueva -> torno hara op10
+                #   ARRIBA -> KUKA da vuelta pieza   -> torno hara op20
+                #   ABAJO  -> error, no encolar
+                if orientacion == "VACIO":
+                    torno.encolar(tipo, 10)
+                elif orientacion == "ARRIBA":
+                    torno.encolar(tipo, 20)
+                # ABAJO no encola (es error)
 
             elif num_estacion == 3:
                 # Mesa: devolver Tipo + Fila + Columna
@@ -502,16 +514,19 @@ class HMISpirax:
 
         self.tab_operar = tk.Frame(self.nb, bg='#2b2b2b')
         self.tab_calibrar = tk.Frame(self.nb, bg='#2b2b2b')
+        self.tab_torno = tk.Frame(self.nb, bg='#2b2b2b')
         self.tab_log = tk.Frame(self.nb, bg='#2b2b2b')
 
         self.nb.add(self.tab_operar, text='  OPERAR  ')
         self.nb.add(self.tab_calibrar, text='  CALIBRAR  ')
+        self.nb.add(self.tab_torno, text='  TORNO  ')
         self.nb.add(self.tab_log, text='  LOG  ')
 
         self.nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
         self._construir_tab_operar()
         self._construir_tab_calibrar()
+        self._construir_tab_torno()
         self._construir_tab_log()
 
         self._seleccionar_tipo_operar(1)
@@ -879,7 +894,8 @@ class HMISpirax:
             self._refrescar_panel_bg_mesa()
 
     def _refrescar_panel_bg_mesa(self):
-        """Muestra la imagen de bg subtraction de la ultima captura mesa."""
+        """Muestra la imagen de bg subtraction de la ultima captura mesa.
+        Estira la imagen al tamaño del contenedor para no dejar bordes negros."""
         with estado.lock:
             panel = estado.ultimo_panel_mesa
 
@@ -894,7 +910,15 @@ class HMISpirax:
         try:
             rgb = cv2.cvtColor(panel, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
-            img.thumbnail((MATRIZ_W, MATRIZ_H), Image.LANCZOS)
+            # Tamano real del contenedor (puede que la primera vez sea 1x1)
+            w_dest = self.canvas_bg_mesa.winfo_width()
+            h_dest = self.canvas_bg_mesa.winfo_height()
+            if w_dest <= 1 or h_dest <= 1:
+                w_dest = MATRIZ_W
+                h_dest = MATRIZ_H
+            # Resize FORZANDO al tamaño exacto (sin preservar aspect ratio)
+            # Asi llena el contenedor completo y se eliminan los bordes negros
+            img = img.resize((w_dest, h_dest), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self.canvas_bg_mesa.configure(image=photo, text='')
             self._img_bg_mesa = photo
@@ -1208,6 +1232,313 @@ class HMISpirax:
                                     command=self._on_umbral_change)
         self.scl_umbral.pack(fill='x')
         self.scl_umbral.bind('<ButtonRelease-1>', self._persistir_sliders)
+
+        # Slider de margen interno de celda (solo aplica a MESA).
+        # Se guarda en config como 0.0-0.4 pero mostramos 0-40 (%).
+        # 0 = celda entera, 25 = solo el 50% central se analiza.
+        self.lbl_margen_titulo = tk.Label(
+            f_sld, text="Margen interno celda (%) [solo mesa]:",
+            font=("Arial", 10),
+            bg='#2b2b2b', fg='white')
+        self.lbl_margen_titulo.pack(anchor='w', pady=(5, 0))
+        self.scl_margen = tk.Scale(f_sld, from_=0, to=40,
+                                    orient='horizontal', length=220,
+                                    bg='#2b2b2b', fg='white',
+                                    troughcolor='#1a1a1a',
+                                    highlightthickness=0,
+                                    command=self._on_margen_change)
+        self.scl_margen.pack(fill='x')
+        self.scl_margen.bind('<ButtonRelease-1>', self._persistir_sliders)
+
+    # ------------------------------------------------------------------
+    #  TORNO
+    # ------------------------------------------------------------------
+    def _construir_tab_torno(self):
+        cont = tk.Frame(self.tab_torno, bg='#2b2b2b')
+        cont.pack(fill='both', expand=True, padx=15, pady=10)
+
+        # Header
+        f_header = tk.Frame(cont, bg='#1a1a1a')
+        f_header.pack(fill='x', pady=(0, 10))
+
+        tk.Label(f_header, text="TORNO FANUC",
+                 font=("Arial", 16, "bold"),
+                 bg='#1a1a1a', fg='#7fffd4').pack(side='left', padx=15, pady=10)
+
+        self.lbl_torno_estado = tk.Label(
+            f_header, text="Estado: ---",
+            font=("Arial", 12, "bold"),
+            bg='#1a1a1a', fg='#ff6b6b')
+        self.lbl_torno_estado.pack(side='right', padx=15)
+
+        # Columnas
+        cols = tk.Frame(cont, bg='#2b2b2b')
+        cols.pack(fill='both', expand=True)
+        cols.columnconfigure(0, weight=1, uniform='c')
+        cols.columnconfigure(1, weight=1, uniform='c')
+        cols.rowconfigure(0, weight=1)
+
+        col_izq = tk.Frame(cols, bg='#2b2b2b')
+        col_izq.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        col_der = tk.Frame(cols, bg='#2b2b2b')
+        col_der.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
+
+        # ========== Columna izquierda: COLA ==========
+        f_cola = tk.LabelFrame(col_izq, text=" COLA DE PIEZAS ",
+                                font=("Arial", 11, "bold"),
+                                bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_cola.pack(fill='both', expand=True)
+
+        tk.Label(f_cola,
+                 text="Primero = proximo que va a mecanizar el torno",
+                 font=("Arial", 9, "italic"),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(0, 4))
+
+        # Listbox
+        f_lb = tk.Frame(f_cola, bg='#2b2b2b')
+        f_lb.pack(fill='both', expand=True)
+
+        sb = tk.Scrollbar(f_lb)
+        sb.pack(side='right', fill='y')
+
+        self.lst_cola = tk.Listbox(f_lb, bg='#1a1a1a', fg='#cfcfcf',
+                                    font=("Consolas", 10),
+                                    yscrollcommand=sb.set,
+                                    selectmode='single',
+                                    highlightthickness=0)
+        self.lst_cola.pack(side='left', fill='both', expand=True)
+        sb.config(command=self.lst_cola.yview)
+
+        # Controles cola
+        c_ctrl = tk.Frame(f_cola, bg='#2b2b2b')
+        c_ctrl.pack(fill='x', pady=(8, 0))
+
+        tk.Button(c_ctrl, text="Encolar manual",
+                  font=("Arial", 9),
+                  command=self._encolar_manual_torno).pack(side='left', padx=2)
+        tk.Button(c_ctrl, text="Quitar seleccionado",
+                  font=("Arial", 9),
+                  command=self._quitar_seleccion_torno).pack(side='left', padx=2)
+        tk.Button(c_ctrl, text="Limpiar cola",
+                  font=("Arial", 9),
+                  bg='#cc4444', fg='white',
+                  command=self._limpiar_cola_torno).pack(side='left', padx=2)
+
+        # Stats
+        f_stats = tk.LabelFrame(col_izq, text=" ESTADISTICAS ",
+                                 font=("Arial", 11, "bold"),
+                                 bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_stats.pack(fill='x', pady=(10, 0))
+
+        self.lbl_cola_count = tk.Label(f_stats,
+                                        text="En cola: 0",
+                                        font=("Arial", 11),
+                                        bg='#2b2b2b', fg='white')
+        self.lbl_cola_count.pack(anchor='w')
+
+        self.lbl_torno_terminadas = tk.Label(f_stats,
+                                              text="Piezas terminadas: 0",
+                                              font=("Arial", 11),
+                                              bg='#2b2b2b', fg='white')
+        self.lbl_torno_terminadas.pack(anchor='w', pady=(3, 0))
+
+        self.lbl_torno_ultimo = tk.Label(f_stats,
+                                          text="Ultimo evento: ---",
+                                          font=("Arial", 9),
+                                          bg='#2b2b2b', fg='#a0a0a0',
+                                          wraplength=400, justify='left')
+        self.lbl_torno_ultimo.pack(anchor='w', pady=(5, 0))
+
+        # ========== Columna derecha: CONEXION + INSPECCION ==========
+        f_conn = tk.LabelFrame(col_der, text=" CONEXION ",
+                                font=("Arial", 11, "bold"),
+                                bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_conn.pack(fill='x')
+
+        tk.Label(f_conn,
+                 text=f"Host: {torno.config['torno_host']}:{torno.config['torno_port']}",
+                 font=("Consolas", 10),
+                 bg='#2b2b2b', fg='#cfcfcf').pack(anchor='w')
+
+        tk.Label(f_conn,
+                 text=f"Macros: #{torno.config['macro_tipo']}=tipo  "
+                      f"#{torno.config['macro_op']}=op  "
+                      f"#{torno.config['macro_fin']}=fin",
+                 font=("Consolas", 9),
+                 bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(2, 8))
+
+        c_btns_conn = tk.Frame(f_conn, bg='#2b2b2b')
+        c_btns_conn.pack(fill='x')
+
+        tk.Button(c_btns_conn, text="Reconectar",
+                  font=("Arial", 9),
+                  command=self._reconectar_torno).pack(side='left', padx=2)
+        tk.Button(c_btns_conn, text="Refrescar status",
+                  font=("Arial", 9),
+                  command=self._refrescar_torno_status).pack(side='left', padx=2)
+
+        # Status detallado
+        f_status = tk.LabelFrame(col_der, text=" STATUS DEL TORNO ",
+                                  font=("Arial", 11, "bold"),
+                                  bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_status.pack(fill='x', pady=(10, 0))
+
+        self.txt_torno_status = tk.Text(
+            f_status, height=10, bg='#1a1a1a', fg='#cfcfcf',
+            font=("Consolas", 9), wrap='word',
+            state='disabled', highlightthickness=0)
+        self.txt_torno_status.pack(fill='x')
+
+        # Inspector de macros
+        f_insp = tk.LabelFrame(col_der, text=" INSPECTOR DE MACROS ",
+                                font=("Arial", 11, "bold"),
+                                bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_insp.pack(fill='x', pady=(10, 0))
+
+        c_insp = tk.Frame(f_insp, bg='#2b2b2b')
+        c_insp.pack(fill='x')
+
+        tk.Label(c_insp, text="Macro #:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=0, padx=2)
+        self.ent_insp_num = tk.Entry(c_insp, width=8, font=("Consolas", 10))
+        self.ent_insp_num.grid(row=0, column=1, padx=2)
+        self.ent_insp_num.insert(0, "500")
+
+        tk.Button(c_insp, text="Leer",
+                  command=self._leer_macro_torno,
+                  font=("Arial", 9)).grid(row=0, column=2, padx=2)
+
+        tk.Label(c_insp, text="Valor:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=3, padx=2)
+        self.ent_insp_val = tk.Entry(c_insp, width=10, font=("Consolas", 10))
+        self.ent_insp_val.grid(row=0, column=4, padx=2)
+
+        tk.Button(c_insp, text="Escribir",
+                  command=self._escribir_macro_torno,
+                  font=("Arial", 9),
+                  bg='#cc7a00', fg='white').grid(row=0, column=5, padx=2)
+
+        self.lbl_insp_resultado = tk.Label(
+            f_insp, text="(sin lectura)",
+            font=("Consolas", 10),
+            bg='#2b2b2b', fg='#cfcfcf')
+        self.lbl_insp_resultado.pack(anchor='w', pady=(8, 0))
+
+    def _refrescar_cola_torno(self):
+        """Refresca el listbox de la cola del torno."""
+        items = torno.cola.snapshot()
+        seleccion = self.lst_cola.curselection()
+        idx_sel = seleccion[0] if seleccion else None
+
+        self.lst_cola.delete(0, 'end')
+        for i, item in enumerate(items):
+            marca = "►" if i == 0 else " "
+            linea = (f"{marca} #{i + 1:2}  tipo={item['tipo']}  "
+                     f"op={item['op']:2}  ({item.get('ts', '?')})")
+            self.lst_cola.insert('end', linea)
+            if i == 0:
+                self.lst_cola.itemconfig(0, fg='#FAC775')
+
+        if idx_sel is not None and idx_sel < len(items):
+            self.lst_cola.selection_set(idx_sel)
+
+        self.lbl_cola_count.configure(text=f"En cola: {len(items)}")
+
+    def _encolar_manual_torno(self):
+        from tkinter import simpledialog
+        tipo_s = simpledialog.askstring("Encolar pieza",
+                                         "Tipo (1-6):", parent=self.root)
+        if not tipo_s:
+            return
+        op_s = simpledialog.askstring("Encolar pieza",
+                                       "Operacion (10 o 20):", parent=self.root)
+        if not op_s:
+            return
+        try:
+            tipo = int(tipo_s)
+            op = int(op_s)
+            torno.encolar(tipo, op)
+            self._refrescar_cola_torno()
+        except ValueError:
+            messagebox.showerror("Error", "Valores invalidos")
+
+    def _quitar_seleccion_torno(self):
+        seleccion = self.lst_cola.curselection()
+        if not seleccion:
+            messagebox.showinfo("Quitar",
+                                 "Seleccioná un item de la cola primero.")
+            return
+        idx = seleccion[0]
+        if messagebox.askyesno("Confirmar",
+                                f"¿Quitar item #{idx + 1} de la cola?"):
+            torno.quitar_indice(idx)
+            self._refrescar_cola_torno()
+
+    def _limpiar_cola_torno(self):
+        n = len(torno.cola)
+        if n == 0:
+            return
+        if messagebox.askyesno("Confirmar",
+                                f"¿Limpiar toda la cola? ({n} items)"):
+            torno.limpiar_cola()
+            self._refrescar_cola_torno()
+
+    def _reconectar_torno(self):
+        self._agregar_log("[TORNO] Forzando reconexion...")
+        torno.reconectar()
+
+    def _refrescar_torno_status(self):
+        st = torno.status()
+        self.txt_torno_status.configure(state='normal')
+        self.txt_torno_status.delete('1.0', 'end')
+        if st is None:
+            self.txt_torno_status.insert('end',
+                                          "(torno no conectado)\n")
+        else:
+            txt = (f"Modo:         {st.modo}\n"
+                   f"Ejecucion:    {st.ejecucion}\n"
+                   f"Emergencia:   {st.emergencia}\n"
+                   f"Alarma:       {st.alarma}\n"
+                   f"Tipo:         {st.tipo}\n"
+                   f"Spindle RPM:  {st.spindle_rpm:.1f}\n"
+                   f"Spindle load: {st.spindle_load_pct}%\n"
+                   f"Posicion:     {st.posicion_ejes}\n"
+                   f"Programa:     {st.programa_actual}\n"
+                   f"Linea:        {st.linea}\n"
+                   f"Part count:   {st.part_count}\n"
+                   f"Mensaje op:   {st.mensaje_operador}\n"
+                   f"Alarma mask:  {st.alarma_bitmask}\n")
+            self.txt_torno_status.insert('end', txt)
+        self.txt_torno_status.configure(state='disabled')
+
+    def _leer_macro_torno(self):
+        try:
+            num = int(self.ent_insp_num.get())
+            v = torno.read_macro(num)
+            self.lbl_insp_resultado.configure(
+                text=f"#{num} = {v}", fg='#7fff7f')
+            self.ent_insp_val.delete(0, 'end')
+            self.ent_insp_val.insert(0, str(v))
+        except Exception as e:
+            self.lbl_insp_resultado.configure(
+                text=f"Error: {e}", fg='#ff6b6b')
+
+    def _escribir_macro_torno(self):
+        try:
+            num = int(self.ent_insp_num.get())
+            v = float(self.ent_insp_val.get())
+            if not messagebox.askyesno(
+                "Confirmar escritura",
+                f"¿Escribir #{num} = {v}?\n\n"
+                f"OJO: esto puede afectar al programa NC del torno."):
+                return
+            torno.write_macro(num, v)
+            self.lbl_insp_resultado.configure(
+                text=f"#{num} <- {v} OK", fg='#FAC775')
+            self._agregar_log(f"[TORNO] Escrito manual: #{num} = {v}")
+        except Exception as e:
+            self.lbl_insp_resultado.configure(
+                text=f"Error: {e}", fg='#ff6b6b')
 
     # ------------------------------------------------------------------
     #  LOG
@@ -1595,18 +1926,25 @@ class HMISpirax:
             self.scl_gain.set(detector.gain)
             self.scl_thr.set(detector.bg_diff_thresh)
             self.scl_umbral.set(detector.umbral_ocupacion)
+            self.scl_margen.set(detector.margen_celda)
         except Exception:
             pass
 
-        # Slider de umbral solo activo en estacion mesa
+        # Sliders de umbral y margen solo activos en estacion mesa
         if est == "mesa":
             self.scl_umbral.configure(state='normal',
                                        fg='white', troughcolor='#1a1a1a')
             self.lbl_umbral_titulo.configure(fg='white')
+            self.scl_margen.configure(state='normal',
+                                       fg='white', troughcolor='#1a1a1a')
+            self.lbl_margen_titulo.configure(fg='white')
         else:
             self.scl_umbral.configure(state='disabled',
                                        fg='#666666', troughcolor='#2a2a2a')
             self.lbl_umbral_titulo.configure(fg='#666666')
+            self.scl_margen.configure(state='disabled',
+                                       fg='#666666', troughcolor='#2a2a2a')
+            self.lbl_margen_titulo.configure(fg='#666666')
 
         self._refrescar_estado_archivos()
         self._mostrar_referencia_calibrar()
@@ -1693,7 +2031,7 @@ class HMISpirax:
             return
 
         try:
-            from spirax_vision import cargar_config
+            from vision import cargar_config
             import numpy as np
 
             ref = cv2.imread(ref_path)
@@ -1928,12 +2266,19 @@ class HMISpirax:
         except Exception as e:
             self._agregar_log(f"!!! umbral: {e}")
 
+    def _on_margen_change(self, valor):
+        try:
+            detector.set_margen_celda(int(valor), persist=False)
+        except Exception as e:
+            self._agregar_log(f"!!! margen: {e}")
+
     def _persistir_sliders(self, _evt=None):
         try:
             detector.set_exposure(detector.exposure, persist=True)
             extra = ""
             if self._estacion_calibrar == "mesa":
-                extra = f" umbral={detector.umbral_ocupacion}%"
+                extra = (f" umbral={detector.umbral_ocupacion}%"
+                         f" margen={detector.margen_celda}%")
             self._agregar_log(
                 f"[CONFIG] Tipo {self._tipo_calibrar} ({self._estacion_calibrar}): "
                 f"exp={detector.exposure} gain={detector.gain} "
@@ -1997,6 +2342,17 @@ class HMISpirax:
                                   args=(self._log_thread_safe,),
                                   daemon=True)
         thread.start()
+
+        # Iniciar tambien el thread de sincronizacion del torno
+        torno._log_callback = self._log_thread_safe
+        if FANUC_DISPONIBLE:
+            ok = torno.start()
+            if ok:
+                self._log_thread_safe("[TORNO] Thread sincronizador iniciado")
+        else:
+            self._log_thread_safe(
+                "[TORNO] fanuc_bridge NO disponible. "
+                "Pesta\u00f1a TORNO se ve pero no se conecta hasta instalarlo.")
 
     # ==================================================================
     #  Loop refresco
@@ -2093,6 +2449,24 @@ class HMISpirax:
         else:
             self.lbl_deteccion_mesa.configure(text="Elegida: ---",
                                                 fg='#cccccc')
+
+        # ===== Refresco pesta\u00f1a TORNO =====
+        try:
+            if torno.conectado:
+                self.lbl_torno_estado.configure(text="Estado: CONECTADO",
+                                                 fg='#7fff7f')
+            else:
+                err = torno.ultimo_error or "desconectado"
+                self.lbl_torno_estado.configure(
+                    text=f"Estado: {err[:40]}", fg='#ff6b6b')
+            self.lbl_torno_terminadas.configure(
+                text=f"Piezas terminadas: {torno.piezas_terminadas}")
+            self.lbl_torno_ultimo.configure(
+                text=f"Ultimo evento: {torno.ultimo_evento or '---'}")
+            self._refrescar_cola_torno()
+        except AttributeError:
+            # Pesta\u00f1a torno todavia no construida
+            pass
 
         self.root.after(500, self._actualizar_estado_loop)
 
@@ -2275,6 +2649,10 @@ class HMISpirax:
         try:
             if detector.esta_activo():
                 detector.stop()
+        except Exception:
+            pass
+        try:
+            torno.stop()
         except Exception:
             pass
         time.sleep(0.2)
