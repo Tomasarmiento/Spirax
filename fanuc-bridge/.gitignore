@@ -1,0 +1,22 @@
+# DLLs propietarias de Fanuc — NO versionar
+dlls/*.dll
+dlls/*.lib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs locales
+*.log

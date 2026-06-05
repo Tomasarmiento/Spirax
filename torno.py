@@ -20,8 +20,10 @@ de #500/#501 al pickear, y al terminar setear #503=1 y esperar a 0.
 
 import json
 import os
+import queue
 import threading
 import time
+from concurrent.futures import Future
 from collections import deque
 from datetime import datetime
 
@@ -210,6 +212,11 @@ class TornoFanuc:
         self._shutdown = False
         # Para saber si tenemos que reescribir macros (cuando cambia cola[0])
         self._ultimo_escrito = (None, None)  # (tipo, op)
+        # Cola de pedidos para que TODAS las llamadas FOCAS se hagan
+        # desde el thread sincronizador. La fwlib32 de FANUC exige que
+        # el handle se use desde el mismo thread que lo creo, sino
+        # devuelve EW_PROTOCOL (-8) y similares. Cada item es (Future, fn).
+        self._task_queue = queue.Queue()
 
     # ------------------------------------------------------------------
     #  Lifecycle
@@ -233,6 +240,9 @@ class TornoFanuc:
 
     def stop(self):
         self._shutdown = True
+        # Cancelar cualquier pedido pendiente para que los callers no
+        # se queden esperando un Future que nunca se va a resolver.
+        self._cancelar_queue("Torno detenido")
         # Esperar al thread (poco)
         if self._sync_thread is not None:
             self._sync_thread.join(timeout=2.0)
@@ -272,7 +282,12 @@ class TornoFanuc:
         return ok
 
     def reconectar(self):
-        """Forzar reconexion. El thread se da cuenta solo, pero esto lo apura."""
+        """Forzar reconexion. El thread se da cuenta solo, pero esto lo apura.
+
+        Tambien resetea el anti-spam del log de errores asi el proximo
+        intento de conectar SIEMPRE logea el error completo (util cuando
+        algo falla y solo se ve un mensaje viejo).
+        """
         with self._client_lock:
             if self._client is not None:
                 try:
@@ -281,55 +296,103 @@ class TornoFanuc:
                     pass
                 self._client = None
         self.conectado = False
+        # Borrar el cache del ultimo error logueado para que el proximo
+        # intento de _intentar_conectar lo loguee de nuevo (aunque sea
+        # el mismo error).
+        if "ultimo_log_error_conn" in self.__dict__:
+            del self.__dict__["ultimo_log_error_conn"]
+        if self.ultimo_error:
+            self._log(f"[TORNO] Ultimo error registrado: {self.ultimo_error}")
 
     # ------------------------------------------------------------------
     #  Inspeccion (para la HMI)
     # ------------------------------------------------------------------
 
+    def _run_in_focas_thread(self, fn, timeout=10.0):
+        """Ejecuta fn() en el thread sincronizador y devuelve su resultado.
+
+        Indispensable: la fwlib32 de FANUC requiere que TODAS las llamadas
+        a un handle FOCAS se hagan desde el mismo thread que lo creo. Si
+        un thread distinto (ej. el thread principal de Tkinter) llama
+        cnc_statinfo2/cnc_rdmacro/etc directamente, devuelve EW_PROTOCOL.
+
+        Esta funcion encola una task en _task_queue. El thread sync, en
+        cada vuelta de _loop_sync, drena la cola y resuelve los Futures.
+        """
+        if not self.conectado or self._client is None:
+            raise RuntimeError("Torno no conectado")
+        # Si el caller esta corriendo *dentro* del thread sync, hay que
+        # ejecutar directo: encolar generaria deadlock (esperar al mismo
+        # thread que esta esperando).
+        if threading.current_thread() is self._sync_thread:
+            return fn()
+        fut = Future()
+        self._task_queue.put((fut, fn))
+        return fut.result(timeout=timeout)
+
+    def _drenar_queue(self):
+        """Procesa todos los pedidos pendientes en la cola. Se llama desde
+        _loop_sync, asi cualquier fn() corre en el thread correcto."""
+        while True:
+            try:
+                fut, fn = self._task_queue.get_nowait()
+            except queue.Empty:
+                return
+            if fut.cancelled():
+                continue
+            try:
+                fut.set_result(fn())
+            except Exception as e:
+                fut.set_exception(e)
+
+    def _cancelar_queue(self, mensaje="Torno desconectado"):
+        """Si la conexion se cae, los Futures pendientes deben fallar
+        en vez de quedar colgados esperando timeout."""
+        while True:
+            try:
+                fut, _fn = self._task_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not fut.done():
+                fut.set_exception(RuntimeError(mensaje))
+
     def read_macro(self, num):
         """Lee una macro arbitraria. Devuelve float o lanza."""
-        with self._client_lock:
-            if self._client is None or not self.conectado:
-                raise RuntimeError("Torno no conectado")
-            return self._client.get_macro(int(num))
+        return self._run_in_focas_thread(
+            lambda: self._client.get_macro(int(num)))
 
     def write_macro(self, num, valor, decimals=0):
         """Escribe una macro arbitraria."""
-        with self._client_lock:
-            if self._client is None or not self.conectado:
-                raise RuntimeError("Torno no conectado")
-            self._client.set_macro(int(num), float(valor), int(decimals))
+        self._run_in_focas_thread(
+            lambda: self._client.set_macro(int(num), float(valor), int(decimals)))
 
     def status(self):
         """Devuelve el TornoStatus del cliente Fanuc, o None si no conectado."""
-        with self._client_lock:
-            if self._client is None or not self.conectado:
-                return None
-            try:
-                return self._client.status()
-            except Exception as e:
-                self._log(f"!!! Error leyendo status: {e}")
-                return None
+        if not self.conectado or self._client is None:
+            return None
+        try:
+            return self._run_in_focas_thread(lambda: self._client.status())
+        except Exception as e:
+            self._log(f"!!! Error leyendo status: {e}")
+            return None
 
     def position(self):
         """Dict con posicion de ejes (X, Z, ...)"""
-        with self._client_lock:
-            if self._client is None or not self.conectado:
-                return None
-            try:
-                return self._client.position()
-            except Exception as e:
-                self._log(f"!!! Error leyendo posicion: {e}")
-                return None
+        if not self.conectado or self._client is None:
+            return None
+        try:
+            return self._run_in_focas_thread(lambda: self._client.position())
+        except Exception as e:
+            self._log(f"!!! Error leyendo posicion: {e}")
+            return None
 
     def part_count(self):
-        with self._client_lock:
-            if self._client is None or not self.conectado:
-                return None
-            try:
-                return self._client.part_count()
-            except Exception as e:
-                return None
+        if not self.conectado or self._client is None:
+            return None
+        try:
+            return self._run_in_focas_thread(lambda: self._client.part_count())
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     #  Thread sincronizador
@@ -350,11 +413,21 @@ class TornoFanuc:
         while not self._shutdown:
             # Conectar si hace falta
             if not self.conectado:
+                # Antes de intentar conectar, fallar pedidos colgados:
+                # vienen de la HMI esperando una respuesta que no llegara.
+                self._cancelar_queue("Torno desconectado")
                 self._intentar_conectar()
                 if not self.conectado:
                     # Esperar mas antes del proximo intento
                     time.sleep(2.0)
                     continue
+
+            # Procesar pedidos de la HMI (read_macro, status, etc).
+            # Se hace en el mismo thread que creo el handle.
+            try:
+                self._drenar_queue()
+            except Exception as e:
+                self._log(f"!!! Error procesando pedidos: {e}")
 
             # Conectado: hacer la sincronizacion
             try:
@@ -374,6 +447,21 @@ class TornoFanuc:
 
     def _intentar_conectar(self):
         try:
+            # Registrar el directorio de DLLs en el search path de Windows
+            # para que las dependencias internas de fwlib*.dll se resuelvan.
+            # Sin esto, la primera DLL carga pero al pedir las dependientes
+            # Windows las busca en cwd/System32/PATH y falla -> EW_SOCKET.
+            dll_path = self.config["torno_dll_path"]
+            if hasattr(os, "add_dll_directory") and dll_path:
+                dll_abs = os.path.abspath(dll_path)
+                if os.path.isdir(dll_abs):
+                    # add_dll_directory se puede llamar varias veces sin
+                    # problema; devuelve un handle pero no nos importa.
+                    try:
+                        os.add_dll_directory(dll_abs)
+                    except (OSError, FileNotFoundError):
+                        pass
+
             client = FanucClient(
                 host=self.config["torno_host"],
                 port=self.config["torno_port"],
@@ -404,6 +492,7 @@ class TornoFanuc:
                     pass
                 self._client = None
         self.conectado = False
+        self._cancelar_queue("Torno desconectado durante operacion")
 
     def _tick_sincronizar(self):
         """Una iteracion del sync. Asume conectado."""
