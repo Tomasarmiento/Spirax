@@ -37,6 +37,171 @@ GRILLA_COLS_OVERLAY = 10
 
 
 # ======================================================================
+#  Orientacion global de camara (rotacion + flip horizontal)
+# ----------------------------------------------------------------------
+#  La camara esta montada fisicamente rotada y/o espejada respecto a
+#  la mesa. Aplicamos la transformacion APENAS se captura el frame,
+#  antes del ROI, para que todo el pipeline (display + ROI + grilla
+#  fila/columna) quede consistente.
+#
+#  Orden de operaciones: ROTACION -> FLIP HORIZONTAL.
+#
+#  k = cantidad de rotaciones 90 grados horario desde el raw.
+#     0 -> sin rotacion
+#     1 -> 90 CW
+#     2 -> 180
+#     3 -> 270 CW (= 90 CCW)
+#
+#  flip_h = espejo horizontal (left-right) aplicado DESPUES de la rotacion.
+#     False -> sin espejo
+#     True  -> invierte el eje X (mesa col 1 cae donde antes caia col N)
+#
+#  Persistencia: vision_rotacion.json en el cwd.
+#  El nombre del archivo se mantiene por compatibilidad — guarda
+#  ambos parametros: {"k": 0, "flip_h": false}.
+# ======================================================================
+
+ROT_CONFIG_PATH = "vision_rotacion.json"
+
+# Cache compartido. Se inicializa lazy en la primera llamada a cualquier
+# cargar_*(). Acceso protegido por _ROT_LOCK.
+_ROT_CACHE = {"k": 0, "flip_h": False, "espejo_col_salida": False}
+_ROT_LOADED = False
+_ROT_LOCK = threading.Lock()
+
+
+def _ensure_orientacion_loaded():
+    """Carga del JSON al cache si todavia no se cargo. Asume lock tomado."""
+    global _ROT_LOADED
+    if _ROT_LOADED:
+        return
+    try:
+        if os.path.exists(ROT_CONFIG_PATH):
+            with open(ROT_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _ROT_CACHE["k"] = int(data.get("k", 0)) % 4
+            _ROT_CACHE["flip_h"] = bool(data.get("flip_h", False))
+            _ROT_CACHE["espejo_col_salida"] = bool(
+                data.get("espejo_col_salida", False))
+    except Exception as e:
+        print(f"[ORIENT] No se pudo leer {ROT_CONFIG_PATH}: {e}. Uso defaults.")
+        _ROT_CACHE["k"] = 0
+        _ROT_CACHE["flip_h"] = False
+        _ROT_CACHE["espejo_col_salida"] = False
+    _ROT_LOADED = True
+
+
+def _persistir_orientacion():
+    """Escribe el cache actual al JSON. Asume lock tomado."""
+    try:
+        with open(ROT_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"k": _ROT_CACHE["k"],
+                       "flip_h": _ROT_CACHE["flip_h"],
+                       "espejo_col_salida": _ROT_CACHE["espejo_col_salida"]},
+                      f, indent=2)
+    except Exception as e:
+        print(f"[ORIENT] No se pudo escribir {ROT_CONFIG_PATH}: {e}")
+
+
+def cargar_rotacion():
+    """Devuelve la rotacion actual (0/1/2/3). Carga del JSON la primera vez."""
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        return _ROT_CACHE["k"]
+
+
+def guardar_rotacion(k):
+    """Persiste la rotacion (0/1/2/3) en JSON y actualiza el cache."""
+    k = int(k) % 4
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        _ROT_CACHE["k"] = k
+        _persistir_orientacion()
+    return k
+
+
+def cargar_flip_h():
+    """Devuelve si el flip horizontal esta activo (bool)."""
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        return _ROT_CACHE["flip_h"]
+
+
+def guardar_flip_h(flip):
+    """Persiste el flip horizontal (bool) en JSON y actualiza el cache."""
+    flip = bool(flip)
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        _ROT_CACHE["flip_h"] = flip
+        _persistir_orientacion()
+    return flip
+
+
+def cargar_espejo_col_salida():
+    """Devuelve si el espejo de columna en la SALIDA esta activo (bool).
+
+    No toca la imagen ni la deteccion interna: solo invierte el numero de
+    columna ANTES de mandarlo al robot. Util cuando la convencion fisica
+    del robot (col 1 a la izq) esta espejada respecto a lo que la camara ve.
+    """
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        return _ROT_CACHE["espejo_col_salida"]
+
+
+def guardar_espejo_col_salida(espejo):
+    """Persiste el espejo de columna de salida (bool)."""
+    espejo = bool(espejo)
+    with _ROT_LOCK:
+        _ensure_orientacion_loaded()
+        _ROT_CACHE["espejo_col_salida"] = espejo
+        _persistir_orientacion()
+    return espejo
+
+
+# Mapeo k -> codigo cv2 para rotaciones rapidas (sin remapeo bilineal).
+_ROT_CV2 = {
+    1: cv2.ROTATE_90_CLOCKWISE,
+    2: cv2.ROTATE_180,
+    3: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def aplicar_rotacion(frame, k=None):
+    """Rota el frame segun k. Si k es None usa la rotacion persistida."""
+    if frame is None:
+        return frame
+    if k is None:
+        k = cargar_rotacion()
+    k = int(k) % 4
+    if k == 0:
+        return frame
+    return cv2.rotate(frame, _ROT_CV2[k])
+
+
+def aplicar_flip_h(frame, flip=None):
+    """Aplica espejo horizontal al frame. Si flip es None usa el persistido."""
+    if frame is None:
+        return frame
+    if flip is None:
+        flip = cargar_flip_h()
+    if not flip:
+        return frame
+    return cv2.flip(frame, 1)  # 1 = flip horizontal (eje Y como eje de espejo)
+
+
+def aplicar_orientacion(frame):
+    """Aplica rotacion + flip persistidos. Es el punto unico de transformacion.
+
+    Llamar apenas se captura el frame, antes de cualquier procesamiento.
+    Orden: rotacion primero, flip despues.
+    """
+    frame = aplicar_rotacion(frame)
+    frame = aplicar_flip_h(frame)
+    return frame
+
+
+# ======================================================================
 #  Helpers de paths por tipo + estacion
 # ======================================================================
 
@@ -200,12 +365,15 @@ def capturar(tipo=1, estacion="cinta"):
     """Captura una imagen usando los parametros del tipo+estacion."""
     cfg = cargar_config(tipo, estacion)
     if USAR_REALSENSE:
-        return capturar_realsense(
+        frame = capturar_realsense(
             exposure=cfg.get("exposure", 10),
             gain=cfg.get("gain", 60),
             saturation=cfg.get("saturation", 50),
         )
-    return capturar_webcam()
+    else:
+        frame = capturar_webcam()
+    # Misma transformacion que el Detector: consistencia total.
+    return aplicar_orientacion(frame)
 
 
 # ======================================================================
@@ -1041,12 +1209,15 @@ class DetectorOrientacion:
             color_frame = frames.get_color_frame()
             if not color_frame:
                 raise RuntimeError("Frame de color no disponible.")
-            return np.asanyarray(color_frame.get_data())
+            frame = np.asanyarray(color_frame.get_data())
         else:
             ret, frame = self._pipeline.read()
             if not ret:
                 raise RuntimeError("No se pudo leer frame de webcam.")
-            return frame
+        # Orientacion global de camara (rotacion + flip horizontal) aplicada
+        # APENAS se captura, antes del ROI. Todo el pipeline downstream ve
+        # el frame ya transformado.
+        return aplicar_orientacion(frame)
 
     def analizar(self):
         """Captura un frame y lo analiza segun la estacion activa.
@@ -1194,6 +1365,38 @@ class DetectorOrientacion:
     def margen_celda(self):
         """Devuelve el porcentaje 0-40 (no la fraccion 0.0-0.4)."""
         return int(round(self._config.get("margen_celda", 0.0) * 100))
+
+    # ---------- rotacion global de camara ----------
+
+    def set_rotacion(self, k):
+        """Setea la rotacion global (0/1/2/3) y la persiste.
+
+        No es per-tipo: es de la camara. Se guarda en vision_rotacion.json
+        (no en el config del tipo). El siguiente frame ya sale rotado.
+        """
+        with self._lock:
+            guardar_rotacion(k)
+
+    @property
+    def rotacion(self):
+        """Rotacion actual (0/1/2/3) leida del cache/JSON."""
+        return cargar_rotacion()
+
+    # ---------- flip horizontal de camara ----------
+
+    def set_flip_h(self, flip):
+        """Setea el flip horizontal de camara (bool) y lo persiste.
+
+        Se aplica DESPUES de la rotacion. Se guarda en el mismo JSON
+        que la rotacion. El siguiente frame ya sale con el flip aplicado.
+        """
+        with self._lock:
+            guardar_flip_h(flip)
+
+    @property
+    def flip_h(self):
+        """Estado actual del flip horizontal (bool)."""
+        return cargar_flip_h()
 
     def recargar_referencia(self):
         with self._lock:

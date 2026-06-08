@@ -19,7 +19,7 @@ El flujo es:
 import cv2
 import numpy as np
 
-from vision import preparar_roi, metodo_d_bgsub
+from vision import preparar_roi, metodo_d_bgsub, cargar_espejo_col_salida
 
 # Tamano de la grilla de la mesa (fijo para todos los tipos)
 GRILLA_FILAS = 8
@@ -137,14 +137,37 @@ def analizar_mesa_pipeline(imagen, referencia_blur, config,
         if elegida_fila != 0:
             break
 
+    # 5. Espejo de columna en la salida (si esta activo).
+    # IMPORTANTE: La MATRIZ y los pixels del ROI quedan en coordenadas de
+    # IMAGEN (no se tocan). Solo "traducimos" el numero de columna a la
+    # convencion del robot para mostrarlo en el overlay y devolverlo al KUKA.
+    # El highlight visual (circulo verde) sigue cayendo donde esta la pieza
+    # fisicamente en el frame, lo cual es lo correcto: el usuario ve la
+    # pieza ahi y el numero de robot al lado.
+    espejar = cargar_espejo_col_salida()
+    if espejar and elegida_col > 0:
+        elegida_col_robot = GRILLA_COLS - elegida_col + 1
+    else:
+        elegida_col_robot = elegida_col
+
+    if elegida_fila > 0:
+        texto = f"({elegida_fila},{elegida_col_robot})"
+    else:
+        texto = "VACIO"
+
+    # Para dibujar el highlight en el panel pasamos elegida_col en coords
+    # de IMAGEN (donde realmente esta la pieza en los pixels del ROI).
     panel = _panel_debug_mesa(roi_color, mask, matriz,
                                elegida_fila, elegida_col,
-                               f"({elegida_fila},{elegida_col})" if elegida_fila else "VACIO",
+                               texto,
                                config, margen_celda)
     return {
         "matriz": matriz,
         "fila": elegida_fila,
-        "columna": elegida_col,
+        "columna": elegida_col_robot,        # <- ROBOT space (lo que va al KUKA)
+        "columna_imagen": elegida_col,       # <- IMAGE space (para que HMI sepa
+                                              #    donde dibujar el highlight)
+        "espejo_activo": espejar,
         "panel": panel,
     }
 

@@ -28,6 +28,12 @@ from vision import (
     path_referencia,
     path_config,
     modo_recorte,
+    cargar_rotacion,
+    guardar_rotacion,
+    cargar_flip_h,
+    guardar_flip_h,
+    cargar_espejo_col_salida,
+    guardar_espejo_col_salida,
 )
 from mesa import (
     GRILLA_FILAS, GRILLA_COLS,
@@ -957,15 +963,27 @@ class HMISpirax:
         except AttributeError:
             pass  # todavia no se construyo el var
 
+        # Si el espejo de columna esta activo, damos vuelta el orden VISUAL
+        # de las columnas para que la matriz se lea como la ve el robot
+        # (col 1 a la izquierda, col 10 a la derecha). ci_canvas es la
+        # posicion visual (0..9), ci_data es el indice en la matriz raw.
+        espejar = cargar_espejo_col_salida()
+
         for fi in range(GRILLA_FILAS):
-            for ci in range(GRILLA_COLS):
-                x1 = ci * cell_w
+            for ci_canvas in range(GRILLA_COLS):
+                ci_data = (GRILLA_COLS - 1 - ci_canvas) if espejar else ci_canvas
+
+                x1 = ci_canvas * cell_w
                 y1 = fi * cell_h
-                x2 = (ci + 1) * cell_w
+                x2 = (ci_canvas + 1) * cell_w
                 y2 = (fi + 1) * cell_h
 
-                ocupada = (matriz is not None and matriz[fi][ci])
-                elegida = (fi + 1 == fila_elegida and ci + 1 == columna_elegida)
+                ocupada = (matriz is not None and matriz[fi][ci_data])
+                # Tanto fila_elegida como columna_elegida vienen en coordenadas
+                # de salida (ya espejadas si corresponde), asi que comparamos
+                # contra ci_canvas+1 (que tambien es coord de salida).
+                elegida = (fi + 1 == fila_elegida
+                           and ci_canvas + 1 == columna_elegida)
 
                 if ocupada and elegida:
                     fill = '#FAC775'  # amarillo
@@ -988,13 +1006,13 @@ class HMISpirax:
                     # Numeritos siempre visibles
                     if elegida and ocupada:
                         text_color = "#000000"
-                        text_label = f"★\n{fi+1},{ci+1}"
+                        text_label = f"\u2605\n{fi+1},{ci_canvas+1}"
                     elif ocupada:
                         text_color = "#ffffff"
-                        text_label = f"●\n{fi+1},{ci+1}"
+                        text_label = f"\u25cf\n{fi+1},{ci_canvas+1}"
                     else:
                         text_color = "#666666"
-                        text_label = f"{fi+1},{ci+1}"
+                        text_label = f"{fi+1},{ci_canvas+1}"
                     canvas.create_text(cx, cy,
                                         text=text_label,
                                         fill=text_color,
@@ -1004,7 +1022,7 @@ class HMISpirax:
                     # Solo iconos en las ocupadas
                     if ocupada:
                         canvas.create_text(cx, cy,
-                                            text="★" if elegida else "●",
+                                            text="\u2605" if elegida else "\u25cf",
                                             fill="white" if not elegida else "black",
                                             font=("Arial", 10, "bold"))
 
@@ -1078,9 +1096,51 @@ class HMISpirax:
         col_izq = tk.Frame(cuerpo, bg='#2b2b2b')
         col_izq.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
 
-        col_der = tk.Frame(cuerpo, bg='#2b2b2b', width=280)
-        col_der.grid(row=0, column=1, sticky='ns')
-        col_der.grid_propagate(False)
+        # col_der: columna derecha CON SCROLL. Crecio mucho con los
+        # botones de orientacion + sliders + estado y deja de entrar en
+        # pantallas chicas. Envolvemos en Canvas + Scrollbar.
+        col_der_outer = tk.Frame(cuerpo, bg='#2b2b2b')
+        col_der_outer.grid(row=0, column=1, sticky='ns')
+
+        col_der_canvas = tk.Canvas(col_der_outer, bg='#2b2b2b',
+                                    highlightthickness=0, width=280)
+        col_der_canvas.pack(side='left', fill='y', expand=False)
+
+        col_der_scroll = ttk.Scrollbar(col_der_outer, orient='vertical',
+                                        command=col_der_canvas.yview)
+        col_der_scroll.pack(side='right', fill='y')
+        col_der_canvas.configure(yscrollcommand=col_der_scroll.set)
+
+        # Frame interior donde van TODOS los widgets que ya tenia col_der.
+        # Mantenemos el nombre 'col_der' asi el resto del codigo no cambia.
+        col_der = tk.Frame(col_der_canvas, bg='#2b2b2b')
+        col_der_window = col_der_canvas.create_window(
+            (0, 0), window=col_der, anchor='nw', width=280)
+
+        # Actualizar scrollregion cada vez que el contenido cambia de tamano
+        def _on_col_der_configure(event):
+            col_der_canvas.configure(scrollregion=col_der_canvas.bbox('all'))
+        col_der.bind('<Configure>', _on_col_der_configure)
+
+        # Rueda del mouse: solo bindea cuando el cursor esta sobre el canvas
+        # asi no roba el wheel a otras vistas (zoom de imagen, etc).
+        def _bind_wheel_calib(_):
+            col_der_canvas.bind_all('<MouseWheel>',
+                lambda ev: col_der_canvas.yview_scroll(
+                    int(-1 * (ev.delta / 120)), 'units'))
+            # Linux usa Button-4/5 en lugar de MouseWheel
+            col_der_canvas.bind_all('<Button-4>',
+                lambda ev: col_der_canvas.yview_scroll(-1, 'units'))
+            col_der_canvas.bind_all('<Button-5>',
+                lambda ev: col_der_canvas.yview_scroll(1, 'units'))
+
+        def _unbind_wheel_calib(_):
+            col_der_canvas.unbind_all('<MouseWheel>')
+            col_der_canvas.unbind_all('<Button-4>')
+            col_der_canvas.unbind_all('<Button-5>')
+
+        col_der_canvas.bind('<Enter>', _bind_wheel_calib)
+        col_der_canvas.bind('<Leave>', _unbind_wheel_calib)
 
         # Preview + referencia
         f_visual = tk.Frame(col_izq, bg='#2b2b2b')
@@ -1159,6 +1219,42 @@ class HMISpirax:
                   font=("Arial", 11),
                   width=22, height=2,
                   command=self._ajustar_recorte).pack(pady=4)
+
+        # Rotacion global de camara (no es per-tipo, es del montaje fisico).
+        # Cicla 0 -> 90 -> 180 -> 270 -> 0. Se aplica en vision.py apenas
+        # captura el frame, antes del ROI: todo el pipeline ve la imagen rotada.
+        # IMPORTANTE: despues de rotar hay que recapturar referencias y
+        # reajustar recortes de cada tipo/estacion.
+        self.btn_rotacion = tk.Button(
+            f_acc, text="Rotacion: 0\u00b0",
+            font=("Arial", 11),
+            width=22, height=2,
+            command=self._ciclar_rotacion)
+        self.btn_rotacion.pack(pady=4)
+
+        # Flip horizontal (espejo). Se aplica DESPUES de la rotacion en
+        # el mismo punto (vision._capturar_frame_raw). Combinado con la
+        # rotacion cubre las 8 orientaciones posibles del montaje de camara.
+        # Mismo caveat que rotacion: hay que recapturar refs y recortes.
+        self.btn_flip_h = tk.Button(
+            f_acc, text="Flip H: OFF",
+            font=("Arial", 11),
+            width=22, height=2,
+            command=self._alternar_flip_h)
+        self.btn_flip_h.pack(pady=4)
+
+        # Espejo de columna en la SALIDA al robot. NO toca la imagen ni
+        # la deteccion: la pantalla muestra la celda detectada como
+        # siempre, pero el valor que viaja al KUKA por EKI sale espejado
+        # (col_robot = 11 - col_vision). Util cuando la convencion del
+        # robot (col 1 a la izq fisicamente) esta espejada respecto a
+        # lo que la camara ve, sin necesidad de rehacer recortes/refs.
+        self.btn_espejo_col = tk.Button(
+            f_acc, text="Espejo Col \u2192 Robot: OFF",
+            font=("Arial", 11),
+            width=22, height=2,
+            command=self._alternar_espejo_col_salida)
+        self.btn_espejo_col.pack(pady=4)
 
         # Estado archivos
         f_est = tk.LabelFrame(col_der, text=" ESTADO ARCHIVOS ",
@@ -1249,6 +1345,11 @@ class HMISpirax:
                                     command=self._on_margen_change)
         self.scl_margen.pack(fill='x')
         self.scl_margen.bind('<ButtonRelease-1>', self._persistir_sliders)
+
+        # Inicializar texto del boton de rotacion con el valor persistido.
+        self._actualizar_label_rotacion()
+        self._actualizar_label_flip_h()
+        self._actualizar_label_espejo_col_salida()
 
     # ------------------------------------------------------------------
     #  TORNO
@@ -2212,17 +2313,27 @@ class HMISpirax:
         est = self._estacion_calibrar
         ref_path = path_referencia(tipo, est)
 
+        # IMPORTANTE: siempre capturamos un frame en VIVO para el recorte.
+        # No leemos la referencia del disco porque puede estar guardada con
+        # una orientacion (rotacion/flip) distinta a la activa ahora — en
+        # ese caso las 4 esquinas marcadas quedarian en coords del frame
+        # viejo y no coincidirian con la captura en operacion real.
+        # El frame en vivo siempre pasa por aplicar_orientacion() asi que
+        # esta sincronizado con lo que va a ver el detector.
+        if not self._asegurar_camara():
+            return
+        try:
+            imagen = detector.capturar_frame()
+        except Exception as e:
+            messagebox.showerror("Captura", f"No se pudo capturar:\n\n{e}")
+            return
+
         if os.path.exists(ref_path):
-            imagen = cv2.imread(ref_path)
-            self._agregar_log(f"[CALIBRAR] Ajustando recorte Tipo {tipo} ({est})")
+            self._agregar_log(f"[CALIBRAR] Ajustando recorte Tipo {tipo} ({est}) "
+                              f"(usando frame en vivo, no la ref guardada)")
         else:
-            if not self._asegurar_camara():
-                return
-            try:
-                imagen = detector.capturar_frame()
-            except Exception as e:
-                messagebox.showerror("Captura", f"No se pudo capturar:\n\n{e}")
-                return
+            self._agregar_log(f"[CALIBRAR] Ajustando recorte Tipo {tipo} ({est}) "
+                              f"(no hay referencia guardada todavia)")
 
         venia_preview = self._preview_activo
         if venia_preview:
@@ -2241,6 +2352,87 @@ class HMISpirax:
         except Exception as e:
             self._agregar_log(f"!!! Error en ajustar_recorte: {e}")
             messagebox.showerror("Error", str(e))
+
+    # ------------------------------------------------------------------
+    #  Rotacion global de camara
+    # ------------------------------------------------------------------
+    def _ciclar_rotacion(self):
+        """Cicla la rotacion de camara 0 -> 90 -> 180 -> 270 -> 0."""
+        k_actual = cargar_rotacion()
+        k_nuevo = (k_actual + 1) % 4
+        guardar_rotacion(k_nuevo)
+        self._actualizar_label_rotacion()
+        grados = k_nuevo * 90
+        self._agregar_log(f"[CALIBRAR] Rotacion de camara: {grados} grados")
+        self._agregar_log(
+            "[CALIBRAR] >>> ATENCION: hay que RECAPTURAR REFERENCIAS y "
+            "REAJUSTAR RECORTES de cada tipo/estacion. Las viejas "
+            "quedaron desfasadas.")
+        # Si hay preview corriendo, los frames siguientes ya salen rotados:
+        # no hace falta nada mas. El usuario va a ver el cambio al toque.
+
+    def _actualizar_label_rotacion(self):
+        """Refresca el texto del boton segun la rotacion persistida."""
+        try:
+            k = cargar_rotacion()
+            grados = k * 90
+            self.btn_rotacion.configure(text=f"Rotacion: {grados}\u00b0")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    #  Flip horizontal de camara
+    # ------------------------------------------------------------------
+    def _alternar_flip_h(self):
+        """Toggle del flip horizontal de camara."""
+        nuevo = not cargar_flip_h()
+        guardar_flip_h(nuevo)
+        self._actualizar_label_flip_h()
+        estado = "ON" if nuevo else "OFF"
+        self._agregar_log(f"[CALIBRAR] Flip H: {estado}")
+        self._agregar_log(
+            "[CALIBRAR] >>> ATENCION: hay que RECAPTURAR REFERENCIAS y "
+            "REAJUSTAR RECORTES de cada tipo/estacion. Las viejas "
+            "quedaron desfasadas.")
+
+    def _actualizar_label_flip_h(self):
+        """Refresca el texto del boton segun el flip persistido."""
+        try:
+            estado = "ON" if cargar_flip_h() else "OFF"
+            self.btn_flip_h.configure(text=f"Flip H: {estado}")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    #  Espejo de columna en la SALIDA al robot
+    # ------------------------------------------------------------------
+    def _alternar_espejo_col_salida(self):
+        """Toggle del espejo de columna en la salida hacia el KUKA.
+
+        NO toca la imagen ni la deteccion: solo invierte el numero de
+        columna que se manda al robot via EKI. No requiere recapturar
+        referencias ni reajustar recortes.
+        """
+        nuevo = not cargar_espejo_col_salida()
+        guardar_espejo_col_salida(nuevo)
+        self._actualizar_label_espejo_col_salida()
+        estado = "ON" if nuevo else "OFF"
+        self._agregar_log(f"[CALIBRAR] Espejo Col -> Robot: {estado}")
+        if nuevo:
+            self._agregar_log(
+                "[CALIBRAR] Vision sigue mostrando la celda detectada en "
+                "pantalla, pero al robot le manda col_robot = 11 - col_vision.")
+        else:
+            self._agregar_log(
+                "[CALIBRAR] Vision manda al robot la misma columna que muestra.")
+
+    def _actualizar_label_espejo_col_salida(self):
+        """Refresca el texto del boton segun el estado persistido."""
+        try:
+            estado = "ON" if cargar_espejo_col_salida() else "OFF"
+            self.btn_espejo_col.configure(text=f"Espejo Col \u2192 Robot: {estado}")
+        except Exception:
+            pass
 
     def _on_exposure_change(self, valor):
         try:

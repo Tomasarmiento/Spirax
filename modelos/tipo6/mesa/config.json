@@ -1,0 +1,50 @@
+{
+  "corte_y_top_pct": 0.0,
+  "corte_y_pct": 0.7715,
+  "corte_x_izq_pct": 0.0,
+  "corte_x_der_pct": 0.9812,
+  "exposure": 72,
+  "gain": 0,
+  "saturation": 50,
+  "bg_diff_thresh": 50,
+  "umbral_ocupacion": 0.01,
+  "grid_x": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9
+  ],
+  "grid_y": [
+    0.125,
+    0.2646,
+    0.4006,
+    0.5303,
+    0.6559,
+    0.7817,
+    0.9078
+  ],
+  "margen_celda": 0.0,
+  "esquinas": {
+    "sup_izq": [
+      0.9646,
+      0.0
+    ],
+    "sup_der": [
+      0.9812,
+      0.769
+    ],
+    "inf_der": [
+      0.0,
+      0.7715
+    ],
+    "inf_izq": [
+      0.0,
+      0.05
+    ]
+  }
+}
