@@ -14,6 +14,22 @@ Estaciones validas:
 
 Migracion: si existe modelos/tipoN/referencia.png al nivel viejo, se mueve
 automaticamente a modelos/tipoN/cinta/referencia.png al cargar.
+
+------------------------------------------------------------------------
+NOTA D555 (camara por Ethernet/DDS):
+  A diferencia de la D435 (USB), el D555 se descubre via DDS y NO aparece
+  con el contexto por defecto de pyrealsense2. Por eso creamos el contexto
+  con DDS habilitado (_crear_contexto_dds) y le damos unos segundos al
+  discovery antes de arrancar el pipeline.
+
+  Ademas el orden de sensores cambia respecto a la D435:
+      D435 -> el sensor de color suele ser query_sensors()[1]
+      D555 -> sensor[0]=RGB Camera, sensor[1]=Stereo Module, sensor[2]=Motion
+  Por eso buscamos el sensor RGB por NOMBRE (_get_color_sensor), que es
+  robusto para cualquier modelo.
+
+  IMPORTANTE: requiere Python 3.12 (pyrealsense2 no tiene wheel para 3.14).
+------------------------------------------------------------------------
 """
 
 import cv2
@@ -23,8 +39,25 @@ import os
 import json
 import shutil
 import threading
+import time
 
 USAR_REALSENSE = True
+
+# ======================================================================
+#  RESOLUCION / FPS DEL STREAM DE COLOR (D555)
+# ----------------------------------------------------------------------
+#  El D555 NO soporta 640x480. Resoluciones validas (bgr8):
+#     1280x800 @ 30fps  <- maxima (16:10), la que usamos
+#     1280x720 @ 30fps
+#     896x504  @ 60fps
+#     640x360  @ 60fps  <- la mas liviana
+#  Si por la red ves frame drops o cuelgues en wait_for_frames, baja a
+#  1280x720 o 896x504. Tu recorte se guarda en %, asi que escala solo,
+#  PERO las referencia.png hay que recapturarlas si cambias resolucion.
+# ======================================================================
+CAM_WIDTH = 1280
+CAM_HEIGHT = 800
+CAM_FPS = 30
 
 MODELOS_DIR = "modelos"
 TIPOS_VALIDOS = (1, 2, 3, 4, 5, 6)
@@ -34,6 +67,100 @@ BG_DIFF_THRESH_DEFAULT = 40
 # Grilla overlay para visualizar en modo_recorte (solo mesa)
 GRILLA_FILAS_OVERLAY = 8
 GRILLA_COLS_OVERLAY = 10
+
+# ======================================================================
+#  CONFIG DDS / DESCUBRIMIENTO DEL D555
+# ----------------------------------------------------------------------
+#  Settings JSON para habilitar DDS en el contexto de pyrealsense2.
+#  domain 0 es el default; cambialo solo si configuraste otro dominio
+#  DDS en la camara via rs-dds-config.
+# ======================================================================
+DDS_SETTINGS = '{"dds": {"enabled": true, "domain": 0}}'
+# Segundos a esperar para que el discovery DDS encuentre la camara antes
+# de arrancar el pipeline. El descubrimiento por red NO es instantaneo
+# como el USB.
+DDS_DISCOVERY_WAIT_S = 5.0
+# Reintentos de query_devices durante la espera de discovery.
+DDS_DISCOVERY_REINTENTOS = 10
+
+
+def _crear_contexto_dds():
+    """Crea un rs.context con DDS habilitado (necesario para el D555).
+
+    Si la build de pyrealsense2 no soporta el constructor con settings
+    (poco probable en 2.57+), cae al contexto por defecto.
+    """
+    import pyrealsense2 as rs
+    try:
+        return rs.context(DDS_SETTINGS)
+    except Exception as e:
+        print(f"[DDS] No se pudo crear contexto con DDS ({e}). "
+              f"Uso contexto por defecto (puede no ver el D555).")
+        return rs.context()
+
+
+def _esperar_discovery(ctx, timeout_s=DDS_DISCOVERY_WAIT_S,
+                       reintentos=DDS_DISCOVERY_REINTENTOS):
+    """Espera a que el discovery DDS encuentre al menos un dispositivo.
+
+    Devuelve la lista de devices encontrada (puede estar vacia si timeout).
+    """
+    intervalo = max(0.1, timeout_s / max(1, reintentos))
+    devices = ctx.query_devices()
+    intento = 0
+    while len(devices) == 0 and intento < reintentos:
+        time.sleep(intervalo)
+        devices = ctx.query_devices()
+        intento += 1
+    return devices
+
+
+def _get_color_sensor(device):
+    """Devuelve el sensor 'RGB Camera' del device, robusto al modelo.
+
+    D435 -> color suele ser query_sensors()[1]
+    D555 -> sensor[0] = RGB Camera
+
+    Buscamos por nombre. Si no lo encontramos, caemos a [0] y luego [1].
+    """
+    import pyrealsense2 as rs
+    sensores = device.query_sensors()
+    # Buscar por nombre exacto
+    for s in sensores:
+        try:
+            nombre = s.get_info(rs.camera_info.name)
+        except Exception:
+            nombre = ""
+        if nombre == "RGB Camera":
+            return s
+    # Fallback: cualquier sensor cuyo nombre contenga "RGB" o "Color"
+    for s in sensores:
+        try:
+            nombre = s.get_info(rs.camera_info.name).lower()
+        except Exception:
+            nombre = ""
+        if "rgb" in nombre or "color" in nombre:
+            return s
+    # Ultimo recurso: indice 0
+    if sensores:
+        return sensores[0]
+    raise RuntimeError("El dispositivo no expone sensores.")
+
+
+def _set_option_seguro(sensor, opcion, valor):
+    """set_option que no revienta si la opcion no existe en el sensor.
+
+    El D555 puede no soportar todas las opciones que tenia la D435
+    (p.ej. saturation o power_line_frequency en ciertos firmwares).
+    """
+    import pyrealsense2 as rs
+    try:
+        if sensor.supports(opcion):
+            sensor.set_option(opcion, valor)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ======================================================================
@@ -319,23 +446,32 @@ def guardar_config(tipo, config, estacion="cinta"):
 
 def capturar_realsense(exposure=10, gain=60, saturation=50):
     import pyrealsense2 as rs
-    pipeline = rs.pipeline()
+
+    # --- D555: contexto con DDS + espera de discovery ---
+    ctx = _crear_contexto_dds()
+    devices = _esperar_discovery(ctx)
+    if len(devices) == 0:
+        raise RuntimeError(
+            "No se descubrio ninguna camara RealSense por DDS. "
+            "Verifica conexion de red (IP 192.168.11.x) y que el viewer "
+            "la vea.")
+
+    pipeline = rs.pipeline(ctx)
     config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
+                         rs.format.bgr8, CAM_FPS)
     profile = pipeline.start(config)
 
-    sensor = profile.get_device().query_sensors()[1]
-    sensor.set_option(rs.option.enable_auto_exposure, 0)
+    # D555: el sensor de color es 'RGB Camera' (NO el indice [1] como D435)
+    sensor = _get_color_sensor(profile.get_device())
+    _set_option_seguro(sensor, rs.option.enable_auto_exposure, 0)
     # 50 Hz para evitar flicker (1=50Hz Arg/Europa, 2=60Hz USA)
-    try:
-        sensor.set_option(rs.option.power_line_frequency, 1)
-    except Exception:
-        pass
-    sensor.set_option(rs.option.exposure, exposure)
-    sensor.set_option(rs.option.gain, gain)
-    sensor.set_option(rs.option.saturation, saturation)
+    _set_option_seguro(sensor, rs.option.power_line_frequency, 1)
+    _set_option_seguro(sensor, rs.option.exposure, exposure)
+    _set_option_seguro(sensor, rs.option.gain, gain)
+    _set_option_seguro(sensor, rs.option.saturation, saturation)
 
-    print("[CAM] RealSense D435 capturando...")
+    print("[CAM] RealSense D555 capturando...")
     try:
         for _ in range(60):
             pipeline.wait_for_frames()
@@ -1067,6 +1203,7 @@ class DetectorOrientacion:
 
     def __init__(self, tipo_inicial=1, estacion_inicial="cinta"):
         self._pipeline = None
+        self._ctx = None          # D555: contexto DDS persistente
         self._sensor = None
         self._lock = threading.Lock()
         self._activo = False
@@ -1104,12 +1241,12 @@ class DetectorOrientacion:
             if self._activo and USAR_REALSENSE and self._sensor is not None:
                 try:
                     import pyrealsense2 as rs
-                    self._sensor.set_option(rs.option.exposure,
-                                            int(self._config.get("exposure", 10)))
-                    self._sensor.set_option(rs.option.gain,
-                                            int(self._config.get("gain", 60)))
-                    self._sensor.set_option(rs.option.saturation,
-                                            int(self._config.get("saturation", 50)))
+                    _set_option_seguro(self._sensor, rs.option.exposure,
+                                       int(self._config.get("exposure", 10)))
+                    _set_option_seguro(self._sensor, rs.option.gain,
+                                       int(self._config.get("gain", 60)))
+                    _set_option_seguro(self._sensor, rs.option.saturation,
+                                       int(self._config.get("saturation", 50)))
                 except Exception:
                     pass
 
@@ -1149,24 +1286,35 @@ class DetectorOrientacion:
 
             if USAR_REALSENSE:
                 import pyrealsense2 as rs
-                self._pipeline = rs.pipeline()
+
+                # --- D555: contexto con DDS + espera de discovery ---
+                self._ctx = _crear_contexto_dds()
+                devices = _esperar_discovery(self._ctx)
+                if len(devices) == 0:
+                    self._ctx = None
+                    raise RuntimeError(
+                        "No se descubrio ninguna camara RealSense por DDS. "
+                        "Verifica que la PC tenga IP en 192.168.11.x, que el "
+                        "cable de red este conectado y que el realsense-viewer "
+                        "vea la camara.")
+
+                self._pipeline = rs.pipeline(self._ctx)
                 cfg = rs.config()
-                cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                cfg.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
+                                  rs.format.bgr8, CAM_FPS)
                 profile = self._pipeline.start(cfg)
 
-                sensor = profile.get_device().query_sensors()[1]
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
+                # D555: sensor de color por NOMBRE (no indice [1] como D435)
+                sensor = _get_color_sensor(profile.get_device())
+                _set_option_seguro(sensor, rs.option.enable_auto_exposure, 0)
                 # 50 Hz para evitar flicker (1=50Hz Arg/Europa, 2=60Hz USA)
-                try:
-                    sensor.set_option(rs.option.power_line_frequency, 1)
-                except Exception:
-                    pass
-                sensor.set_option(rs.option.exposure,
-                                  int(self._config.get("exposure", 10)))
-                sensor.set_option(rs.option.gain,
-                                  int(self._config.get("gain", 60)))
-                sensor.set_option(rs.option.saturation,
-                                  int(self._config.get("saturation", 50)))
+                _set_option_seguro(sensor, rs.option.power_line_frequency, 1)
+                _set_option_seguro(sensor, rs.option.exposure,
+                                   int(self._config.get("exposure", 10)))
+                _set_option_seguro(sensor, rs.option.gain,
+                                   int(self._config.get("gain", 60)))
+                _set_option_seguro(sensor, rs.option.saturation,
+                                   int(self._config.get("saturation", 50)))
                 self._sensor = sensor
 
                 for _ in range(60):
@@ -1192,6 +1340,7 @@ class DetectorOrientacion:
             except Exception:
                 pass
             self._pipeline = None
+            self._ctx = None
             self._sensor = None
             self._activo = False
 
@@ -1293,7 +1442,7 @@ class DetectorOrientacion:
             if self._activo and USAR_REALSENSE and self._sensor is not None:
                 try:
                     import pyrealsense2 as rs
-                    self._sensor.set_option(rs.option.exposure, valor)
+                    _set_option_seguro(self._sensor, rs.option.exposure, valor)
                 except Exception:
                     pass
         if persist:
@@ -1307,7 +1456,7 @@ class DetectorOrientacion:
             if self._activo and USAR_REALSENSE and self._sensor is not None:
                 try:
                     import pyrealsense2 as rs
-                    self._sensor.set_option(rs.option.gain, valor)
+                    _set_option_seguro(self._sensor, rs.option.gain, valor)
                 except Exception:
                     pass
         if persist:
