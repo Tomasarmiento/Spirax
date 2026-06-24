@@ -1,5 +1,12 @@
 {
-  "k": 1,
-  "flip_h": false,
-  "espejo_col_salida": true
+  "cinta": {
+    "k": 0,
+    "flip_h": false,
+    "espejo_col_salida": false
+  },
+  "mesa": {
+    "k": 1,
+    "flip_h": false,
+    "espejo_col_salida": false
+  }
 }

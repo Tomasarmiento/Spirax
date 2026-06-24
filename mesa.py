@@ -144,7 +144,7 @@ def analizar_mesa_pipeline(imagen, referencia_blur, config,
     # El highlight visual (circulo verde) sigue cayendo donde esta la pieza
     # fisicamente en el frame, lo cual es lo correcto: el usuario ve la
     # pieza ahi y el numero de robot al lado.
-    espejar = cargar_espejo_col_salida()
+    espejar = cargar_espejo_col_salida("mesa")
     if espejar and elegida_col > 0:
         elegida_col_robot = GRILLA_COLS - elegida_col + 1
     else:

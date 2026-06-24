@@ -62,6 +62,22 @@ CAM_FPS = 30
 MODELOS_DIR = "modelos"
 TIPOS_VALIDOS = (1, 2, 3, 4, 5, 6)
 ESTACIONES_VALIDAS = ("cinta", "mesa")
+
+# ======================================================================
+#  SERIALES DE LAS CAMARAS POR ESTACION
+# ----------------------------------------------------------------------
+#  Cada D555 tiene un serial unico e inmutable (de fabrica). Lo usamos
+#  para que cada estacion abra SIEMPRE su camara fisica, sin importar
+#  orden de encendido, puerto o IP. Para obtenerlos, corre el script
+#  listar_seriales.py con las dos camaras conectadas.
+#
+#  Si dejas un serial en None, esa estacion abre la primera camara que
+#  el discovery encuentre (comportamiento viejo, solo util con 1 camara).
+# ======================================================================
+SERIAL_POR_ESTACION = {
+    "cinta": "261422303630",
+    "mesa":  "261422303633",
+}
 BG_DIFF_THRESH_DEFAULT = 40
 
 # Grilla overlay para visualizar en modo_recorte (solo mesa)
@@ -83,6 +99,18 @@ DDS_DISCOVERY_WAIT_S = 5.0
 # Reintentos de query_devices durante la espera de discovery.
 DDS_DISCOVERY_REINTENTOS = 10
 
+# Frames a descartar al arrancar el stream (estabilizacion de exposicion).
+# Antes era 60 (2s a 30fps), lo bajamos para que el arranque sea mas agil.
+FRAMES_WARMUP = 20
+# Timeout (ms) para el PRIMER frame al arrancar por red. La negociacion
+# inicial DDS del D555 puede tardar mas que el default de 5000ms, asi que
+# le damos margen para no tirar "Frame didn't arrive within 5000".
+PRIMER_FRAME_TIMEOUT_MS = 15000
+
+
+_CTX_DDS_COMPARTIDO = None
+_CTX_DDS_LOCK = threading.Lock()
+
 
 def _crear_contexto_dds():
     """Crea un rs.context con DDS habilitado (necesario para el D555).
@@ -99,16 +127,53 @@ def _crear_contexto_dds():
         return rs.context()
 
 
-def _esperar_discovery(ctx, timeout_s=DDS_DISCOVERY_WAIT_S,
-                       reintentos=DDS_DISCOVERY_REINTENTOS):
-    """Espera a que el discovery DDS encuentre al menos un dispositivo.
+def obtener_contexto_dds():
+    """Devuelve un UNICO contexto DDS compartido por todos los detectores.
 
-    Devuelve la lista de devices encontrada (puede estar vacia si timeout).
+    Con varias camaras D555, crear un contexto DDS por detector hace que
+    el discovery sea fragil (cada contexto puede ver solo un subconjunto
+    de las camaras). Un unico contexto compartido descubre TODAS las
+    camaras de forma confiable, y cada detector abre su pipeline filtrando
+    por serial sobre ese mismo contexto.
     """
+    global _CTX_DDS_COMPARTIDO
+    with _CTX_DDS_LOCK:
+        if _CTX_DDS_COMPARTIDO is None:
+            _CTX_DDS_COMPARTIDO = _crear_contexto_dds()
+        return _CTX_DDS_COMPARTIDO
+
+
+def _esperar_discovery(ctx, timeout_s=DDS_DISCOVERY_WAIT_S,
+                       reintentos=DDS_DISCOVERY_REINTENTOS,
+                       serial=None):
+    """Espera a que el discovery DDS encuentre dispositivos.
+
+    Si 'serial' es None, espera a encontrar al menos un dispositivo.
+    Si se pasa 'serial', espera hasta que ESE serial aparezca (o timeout),
+    asi no falla por timing cuando una camara tarda mas que otra en
+    anunciarse por la red.
+
+    Devuelve la lista de devices encontrada.
+    """
+    import pyrealsense2 as rs
+
+    def _tiene_objetivo(devs):
+        if len(devs) == 0:
+            return False
+        if serial is None:
+            return True
+        for d in devs:
+            try:
+                if d.get_info(rs.camera_info.serial_number) == serial:
+                    return True
+            except Exception:
+                pass
+        return False
+
     intervalo = max(0.1, timeout_s / max(1, reintentos))
     devices = ctx.query_devices()
     intento = 0
-    while len(devices) == 0 and intento < reintentos:
+    while not _tiene_objetivo(devices) and intento < reintentos:
         time.sleep(intervalo)
         devices = ctx.query_devices()
         intento += 1
@@ -190,15 +255,28 @@ def _set_option_seguro(sensor, opcion, valor):
 
 ROT_CONFIG_PATH = "vision_rotacion.json"
 
-# Cache compartido. Se inicializa lazy en la primera llamada a cualquier
-# cargar_*(). Acceso protegido por _ROT_LOCK.
-_ROT_CACHE = {"k": 0, "flip_h": False, "espejo_col_salida": False}
+# Cache de orientacion POR ESTACION. Cada camara esta montada distinto, asi
+# que cinta y mesa tienen su propia rotacion/flip/espejo independientes.
+# Se inicializa lazy. Acceso protegido por _ROT_LOCK.
+def _rot_default():
+    return {"k": 0, "flip_h": False, "espejo_col_salida": False}
+
+_ROT_CACHE = {"cinta": _rot_default(), "mesa": _rot_default()}
 _ROT_LOADED = False
 _ROT_LOCK = threading.Lock()
 
 
 def _ensure_orientacion_loaded():
-    """Carga del JSON al cache si todavia no se cargo. Asume lock tomado."""
+    """Carga del JSON al cache si todavia no se cargo. Asume lock tomado.
+
+    Formato nuevo (por estacion):
+        {"cinta": {"k":..,"flip_h":..,"espejo_col_salida":..},
+         "mesa":  {...}}
+    Formato viejo (plano, una sola orientacion):
+        {"k":..,"flip_h":..,"espejo_col_salida":..}
+    Si encuentra el formato viejo, lo usa como valor inicial de AMBAS
+    estaciones (migracion automatica) y reescribe en formato nuevo.
+    """
     global _ROT_LOADED
     if _ROT_LOADED:
         return
@@ -206,82 +284,107 @@ def _ensure_orientacion_loaded():
         if os.path.exists(ROT_CONFIG_PATH):
             with open(ROT_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            _ROT_CACHE["k"] = int(data.get("k", 0)) % 4
-            _ROT_CACHE["flip_h"] = bool(data.get("flip_h", False))
-            _ROT_CACHE["espejo_col_salida"] = bool(
-                data.get("espejo_col_salida", False))
+
+            if "cinta" in data or "mesa" in data:
+                # Formato nuevo
+                for est in ("cinta", "mesa"):
+                    sec = data.get(est, {})
+                    _ROT_CACHE[est]["k"] = int(sec.get("k", 0)) % 4
+                    _ROT_CACHE[est]["flip_h"] = bool(sec.get("flip_h", False))
+                    _ROT_CACHE[est]["espejo_col_salida"] = bool(
+                        sec.get("espejo_col_salida", False))
+            else:
+                # Formato viejo plano -> migrar a ambas estaciones
+                k = int(data.get("k", 0)) % 4
+                flip = bool(data.get("flip_h", False))
+                esp = bool(data.get("espejo_col_salida", False))
+                for est in ("cinta", "mesa"):
+                    _ROT_CACHE[est]["k"] = k
+                    _ROT_CACHE[est]["flip_h"] = flip
+                    _ROT_CACHE[est]["espejo_col_salida"] = esp
+                print("[ORIENT] Migrando vision_rotacion.json al formato "
+                      "por estacion (cinta/mesa independientes).")
     except Exception as e:
         print(f"[ORIENT] No se pudo leer {ROT_CONFIG_PATH}: {e}. Uso defaults.")
-        _ROT_CACHE["k"] = 0
-        _ROT_CACHE["flip_h"] = False
-        _ROT_CACHE["espejo_col_salida"] = False
+        _ROT_CACHE["cinta"] = _rot_default()
+        _ROT_CACHE["mesa"] = _rot_default()
     _ROT_LOADED = True
 
 
 def _persistir_orientacion():
-    """Escribe el cache actual al JSON. Asume lock tomado."""
+    """Escribe el cache actual al JSON (formato por estacion). Asume lock."""
     try:
         with open(ROT_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"k": _ROT_CACHE["k"],
-                       "flip_h": _ROT_CACHE["flip_h"],
-                       "espejo_col_salida": _ROT_CACHE["espejo_col_salida"]},
-                      f, indent=2)
+            json.dump({
+                "cinta": dict(_ROT_CACHE["cinta"]),
+                "mesa": dict(_ROT_CACHE["mesa"]),
+            }, f, indent=2)
     except Exception as e:
         print(f"[ORIENT] No se pudo escribir {ROT_CONFIG_PATH}: {e}")
 
 
-def cargar_rotacion():
-    """Devuelve la rotacion actual (0/1/2/3). Carga del JSON la primera vez."""
+def _est_valida_rot(estacion):
+    return estacion if estacion in ("cinta", "mesa") else "cinta"
+
+
+def cargar_rotacion(estacion="cinta"):
+    """Devuelve la rotacion (0/1/2/3) de la estacion. Carga del JSON la 1ra vez."""
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        return _ROT_CACHE["k"]
+        return _ROT_CACHE[estacion]["k"]
 
 
-def guardar_rotacion(k):
-    """Persiste la rotacion (0/1/2/3) en JSON y actualiza el cache."""
+def guardar_rotacion(k, estacion="cinta"):
+    """Persiste la rotacion (0/1/2/3) de la estacion y actualiza el cache."""
     k = int(k) % 4
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        _ROT_CACHE["k"] = k
+        _ROT_CACHE[estacion]["k"] = k
         _persistir_orientacion()
     return k
 
 
-def cargar_flip_h():
-    """Devuelve si el flip horizontal esta activo (bool)."""
+def cargar_flip_h(estacion="cinta"):
+    """Devuelve si el flip horizontal esta activo (bool) en la estacion."""
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        return _ROT_CACHE["flip_h"]
+        return _ROT_CACHE[estacion]["flip_h"]
 
 
-def guardar_flip_h(flip):
-    """Persiste el flip horizontal (bool) en JSON y actualiza el cache."""
+def guardar_flip_h(flip, estacion="cinta"):
+    """Persiste el flip horizontal (bool) de la estacion y actualiza cache."""
     flip = bool(flip)
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        _ROT_CACHE["flip_h"] = flip
+        _ROT_CACHE[estacion]["flip_h"] = flip
         _persistir_orientacion()
     return flip
 
 
-def cargar_espejo_col_salida():
+def cargar_espejo_col_salida(estacion="cinta"):
     """Devuelve si el espejo de columna en la SALIDA esta activo (bool).
 
     No toca la imagen ni la deteccion interna: solo invierte el numero de
     columna ANTES de mandarlo al robot. Util cuando la convencion fisica
     del robot (col 1 a la izq) esta espejada respecto a lo que la camara ve.
     """
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        return _ROT_CACHE["espejo_col_salida"]
+        return _ROT_CACHE[estacion]["espejo_col_salida"]
 
 
-def guardar_espejo_col_salida(espejo):
-    """Persiste el espejo de columna de salida (bool)."""
+def guardar_espejo_col_salida(espejo, estacion="cinta"):
+    """Persiste el espejo de columna de salida (bool) de la estacion."""
     espejo = bool(espejo)
+    estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
-        _ROT_CACHE["espejo_col_salida"] = espejo
+        _ROT_CACHE[estacion]["espejo_col_salida"] = espejo
         _persistir_orientacion()
     return espejo
 
@@ -294,37 +397,37 @@ _ROT_CV2 = {
 }
 
 
-def aplicar_rotacion(frame, k=None):
-    """Rota el frame segun k. Si k es None usa la rotacion persistida."""
+def aplicar_rotacion(frame, k=None, estacion="cinta"):
+    """Rota el frame segun k. Si k es None usa la rotacion persistida de la estacion."""
     if frame is None:
         return frame
     if k is None:
-        k = cargar_rotacion()
+        k = cargar_rotacion(estacion)
     k = int(k) % 4
     if k == 0:
         return frame
     return cv2.rotate(frame, _ROT_CV2[k])
 
 
-def aplicar_flip_h(frame, flip=None):
-    """Aplica espejo horizontal al frame. Si flip es None usa el persistido."""
+def aplicar_flip_h(frame, flip=None, estacion="cinta"):
+    """Aplica espejo horizontal. Si flip es None usa el persistido de la estacion."""
     if frame is None:
         return frame
     if flip is None:
-        flip = cargar_flip_h()
+        flip = cargar_flip_h(estacion)
     if not flip:
         return frame
     return cv2.flip(frame, 1)  # 1 = flip horizontal (eje Y como eje de espejo)
 
 
-def aplicar_orientacion(frame):
-    """Aplica rotacion + flip persistidos. Es el punto unico de transformacion.
+def aplicar_orientacion(frame, estacion="cinta"):
+    """Aplica rotacion + flip persistidos de la ESTACION. Punto unico de transformacion.
 
     Llamar apenas se captura el frame, antes de cualquier procesamiento.
     Orden: rotacion primero, flip despues.
     """
-    frame = aplicar_rotacion(frame)
-    frame = aplicar_flip_h(frame)
+    frame = aplicar_rotacion(frame, estacion=estacion)
+    frame = aplicar_flip_h(frame, estacion=estacion)
     return frame
 
 
@@ -444,12 +547,12 @@ def guardar_config(tipo, config, estacion="cinta"):
 #  CAPTURA (modo standalone)
 # ======================================================================
 
-def capturar_realsense(exposure=10, gain=60, saturation=50):
+def capturar_realsense(exposure=10, gain=60, saturation=50, serial=None):
     import pyrealsense2 as rs
 
-    # --- D555: contexto con DDS + espera de discovery ---
-    ctx = _crear_contexto_dds()
-    devices = _esperar_discovery(ctx)
+    # --- D555: contexto DDS COMPARTIDO + espera de discovery ---
+    ctx = obtener_contexto_dds()
+    devices = _esperar_discovery(ctx, serial=serial)
     if len(devices) == 0:
         raise RuntimeError(
             "No se descubrio ninguna camara RealSense por DDS. "
@@ -458,6 +561,8 @@ def capturar_realsense(exposure=10, gain=60, saturation=50):
 
     pipeline = rs.pipeline(ctx)
     config = rs.config()
+    if serial:
+        config.enable_device(serial)
     config.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
                          rs.format.bgr8, CAM_FPS)
     profile = pipeline.start(config)
@@ -473,7 +578,9 @@ def capturar_realsense(exposure=10, gain=60, saturation=50):
 
     print("[CAM] RealSense D555 capturando...")
     try:
-        for _ in range(60):
+        # Primer frame con timeout generoso (negociacion DDS inicial).
+        pipeline.wait_for_frames(PRIMER_FRAME_TIMEOUT_MS)
+        for _ in range(FRAMES_WARMUP):
             pipeline.wait_for_frames()
         frames = pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
@@ -509,7 +616,7 @@ def capturar(tipo=1, estacion="cinta"):
     else:
         frame = capturar_webcam()
     # Misma transformacion que el Detector: consistencia total.
-    return aplicar_orientacion(frame)
+    return aplicar_orientacion(frame, estacion=estacion)
 
 
 # ======================================================================
@@ -1201,7 +1308,7 @@ class DetectorOrientacion:
     del Tipo N + Estacion.
     """
 
-    def __init__(self, tipo_inicial=1, estacion_inicial="cinta"):
+    def __init__(self, tipo_inicial=1, estacion_inicial="cinta", serial=None):
         self._pipeline = None
         self._ctx = None          # D555: contexto DDS persistente
         self._sensor = None
@@ -1210,6 +1317,12 @@ class DetectorOrientacion:
 
         self._tipo = tipo_inicial
         self._estacion = estacion_inicial
+        # Serial de la camara fisica de este detector. Si no se pasa uno
+        # explicito, se resuelve por estacion desde SERIAL_POR_ESTACION.
+        # None => abre la primera camara que aparezca (modo 1 camara).
+        if serial is None:
+            serial = SERIAL_POR_ESTACION.get(estacion_inicial)
+        self._serial = serial
         self._config = cargar_config(tipo_inicial, estacion_inicial)
         self._referencia_blur = None
 
@@ -1224,8 +1337,23 @@ class DetectorOrientacion:
 
         with self._lock:
             self._tipo = tipo
-            if estacion is not None:
+            if estacion is not None and estacion != self._estacion:
+                # Cambio de estacion => cambia la camara fisica asociada.
+                # No se puede hacer en caliente: si la camara esta abierta
+                # habria que cerrar este pipeline y abrir el de la otra
+                # camara. En este sistema cada estacion tiene su propio
+                # detector, asi que cambiar de estacion con la camara activa
+                # es un error de uso.
+                if self._activo:
+                    raise RuntimeError(
+                        f"No se puede cambiar de estacion ({self._estacion} "
+                        f"-> {estacion}) con la camara abierta. Cada estacion "
+                        f"usa su propia camara/detector.")
                 self._estacion = estacion
+                # Reasignar serial al de la nueva estacion (salvo que este
+                # detector haya sido creado con un serial explicito que no
+                # corresponda al mapa; en ese caso respetamos el explicito).
+                self._serial = SERIAL_POR_ESTACION.get(estacion, self._serial)
             self._config = cargar_config(self._tipo, self._estacion)
 
             ref_path = path_referencia(self._tipo, self._estacion)
@@ -1287,9 +1415,12 @@ class DetectorOrientacion:
             if USAR_REALSENSE:
                 import pyrealsense2 as rs
 
-                # --- D555: contexto con DDS + espera de discovery ---
-                self._ctx = _crear_contexto_dds()
-                devices = _esperar_discovery(self._ctx)
+                # --- D555: contexto DDS COMPARTIDO + espera de discovery ---
+                # Usamos un unico contexto para todos los detectores: con
+                # varias camaras el discovery por contexto separado es
+                # fragil. Esperamos especificamente a NUESTRO serial.
+                self._ctx = obtener_contexto_dds()
+                devices = _esperar_discovery(self._ctx, serial=self._serial)
                 if len(devices) == 0:
                     self._ctx = None
                     raise RuntimeError(
@@ -1300,6 +1431,19 @@ class DetectorOrientacion:
 
                 self._pipeline = rs.pipeline(self._ctx)
                 cfg = rs.config()
+                # Seleccionar la camara FISICA por serial. Asi cada estacion
+                # abre siempre su camara y no la de la otra.
+                if self._serial:
+                    seriales = [d.get_info(rs.camera_info.serial_number)
+                                for d in devices]
+                    if self._serial not in seriales:
+                        self._pipeline = None
+                        self._ctx = None
+                        raise RuntimeError(
+                            f"No se encontro la camara con serial "
+                            f"{self._serial} (estacion {self._estacion}). "
+                            f"Camaras descubiertas: {seriales or 'ninguna'}.")
+                    cfg.enable_device(self._serial)
                 cfg.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
                                   rs.format.bgr8, CAM_FPS)
                 profile = self._pipeline.start(cfg)
@@ -1317,7 +1461,26 @@ class DetectorOrientacion:
                                    int(self._config.get("saturation", 50)))
                 self._sensor = sensor
 
-                for _ in range(60):
+                # Primer frame: timeout generoso porque la negociacion DDS
+                # inicial por red puede tardar mas que el default (5s).
+                try:
+                    self._pipeline.wait_for_frames(PRIMER_FRAME_TIMEOUT_MS)
+                except Exception as e:
+                    # Si falla el primer frame, cerrar limpio y reportar claro.
+                    try:
+                        self._pipeline.stop()
+                    except Exception:
+                        pass
+                    self._pipeline = None
+                    self._ctx = None
+                    self._sensor = None
+                    raise RuntimeError(
+                        f"La camara ({self._estacion}) no entrego el primer "
+                        f"frame a tiempo. Puede ser congestion de red o que "
+                        f"la otra camara este saturando el enlace. Detalle: {e}")
+
+                # Resto del warmup (estabilizacion de exposicion), mas corto.
+                for _ in range(FRAMES_WARMUP):
                     self._pipeline.wait_for_frames()
             else:
                 self._pipeline = cv2.VideoCapture(0)
@@ -1340,6 +1503,8 @@ class DetectorOrientacion:
             except Exception:
                 pass
             self._pipeline = None
+            # Soltamos solo la referencia local; el contexto DDS es
+            # compartido y sigue vivo para los demas detectores.
             self._ctx = None
             self._sensor = None
             self._activo = False
@@ -1363,10 +1528,10 @@ class DetectorOrientacion:
             ret, frame = self._pipeline.read()
             if not ret:
                 raise RuntimeError("No se pudo leer frame de webcam.")
-        # Orientacion global de camara (rotacion + flip horizontal) aplicada
-        # APENAS se captura, antes del ROI. Todo el pipeline downstream ve
-        # el frame ya transformado.
-        return aplicar_orientacion(frame)
+        # Orientacion de camara (rotacion + flip) POR ESTACION, aplicada
+        # APENAS se captura, antes del ROI. Cada camara (cinta/mesa) tiene
+        # su propia orientacion porque estan montadas distinto.
+        return aplicar_orientacion(frame, estacion=self._estacion)
 
     def analizar(self):
         """Captura un frame y lo analiza segun la estacion activa.
@@ -1518,34 +1683,34 @@ class DetectorOrientacion:
     # ---------- rotacion global de camara ----------
 
     def set_rotacion(self, k):
-        """Setea la rotacion global (0/1/2/3) y la persiste.
+        """Setea la rotacion (0/1/2/3) de ESTA estacion y la persiste.
 
-        No es per-tipo: es de la camara. Se guarda en vision_rotacion.json
-        (no en el config del tipo). El siguiente frame ya sale rotado.
+        Es por estacion (cinta/mesa independientes), no global. Se guarda
+        en vision_rotacion.json. El siguiente frame ya sale rotado.
         """
         with self._lock:
-            guardar_rotacion(k)
+            guardar_rotacion(k, estacion=self._estacion)
 
     @property
     def rotacion(self):
-        """Rotacion actual (0/1/2/3) leida del cache/JSON."""
-        return cargar_rotacion()
+        """Rotacion actual (0/1/2/3) de esta estacion."""
+        return cargar_rotacion(self._estacion)
 
     # ---------- flip horizontal de camara ----------
 
     def set_flip_h(self, flip):
-        """Setea el flip horizontal de camara (bool) y lo persiste.
+        """Setea el flip horizontal (bool) de ESTA estacion y lo persiste.
 
-        Se aplica DESPUES de la rotacion. Se guarda en el mismo JSON
-        que la rotacion. El siguiente frame ya sale con el flip aplicado.
+        Se aplica DESPUES de la rotacion. El siguiente frame ya sale con
+        el flip aplicado.
         """
         with self._lock:
-            guardar_flip_h(flip)
+            guardar_flip_h(flip, estacion=self._estacion)
 
     @property
     def flip_h(self):
-        """Estado actual del flip horizontal (bool)."""
-        return cargar_flip_h()
+        """Estado actual del flip horizontal (bool) de esta estacion."""
+        return cargar_flip_h(self._estacion)
 
     def recargar_referencia(self):
         with self._lock:

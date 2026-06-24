@@ -146,7 +146,20 @@ class EstadoCompartido:
 
 
 estado = EstadoCompartido()
-detector = DetectorOrientacion(tipo_inicial=1, estacion_inicial="cinta")
+
+# --- Detectores de VISION ---------------------------------------------
+# Un detector por estacion, cada uno casado con su camara fisica (serial
+# definido en vision.SERIAL_POR_ESTACION). Ambos se usan en modo AUTOMATICO
+# y pueden estar abiertos a la vez (cada uno abre su propia camara).
+detector_cinta = DetectorOrientacion(tipo_inicial=1, estacion_inicial="cinta")
+detector_mesa = DetectorOrientacion(tipo_inicial=1, estacion_inicial="mesa")
+
+# 'detector' es el detector ACTIVO para la pestania Calibrar/preview.
+# Apunta a detector_cinta o detector_mesa segun la estacion que se este
+# calibrando. Como Automatico y Calibrar NO se usan a la vez, reusar el
+# mismo objeto no genera conflicto de camara.
+detector = detector_cinta
+
 torno = TornoFanuc()  # se inicia desde la HMI con start()
 
 
@@ -319,6 +332,7 @@ def manejar_robot(conn, addr, log_callback):
 
 def consultar_vision_cinta(tipo, log_callback):
     """Devuelve ARRIBA/ABAJO/VACIO segun la camara, en estacion cinta."""
+    detector = detector_cinta  # detector casado con la camara de la cinta
     if not detector.esta_activo():
         log_callback("!!! Detector inactivo -> VACIO")
         estado.set_deteccion_cinta("VACIO", None, None, error="Detector inactivo")
@@ -365,6 +379,7 @@ def consultar_vision_cinta(tipo, log_callback):
 def consultar_vision_mesa(tipo, log_callback):
     """Devuelve (fila, columna) 1-indexed de la primera pieza en la mesa.
     (0, 0) si mesa vacia."""
+    detector = detector_mesa  # detector casado con la camara de la mesa
     if not detector.esta_activo():
         log_callback("!!! Detector inactivo -> mesa vacia")
         estado.set_deteccion_mesa(None, 0, 0, None, error="Detector inactivo")
@@ -412,6 +427,10 @@ def consultar_vision_mesa(tipo, log_callback):
 def correr_servidor(log_callback):
     log_callback(f"=== Servidor EKI iniciado en {HOST}:{PORT} ===")
 
+    host_actual = HOST
+    aviso_fallback_dado = False
+    intentos_bind_fallido = 0
+
     while not estado.shutdown:
         servidor = None
         try:
@@ -423,8 +442,33 @@ def correr_servidor(log_callback):
                 pass
 
             servidor.settimeout(1.0)
-            servidor.bind((HOST, PORT))
+            try:
+                servidor.bind((host_actual, PORT))
+            except OSError as e:
+                # WinError 10049 / EADDRNOTAVAIL: la IP configurada (HOST) no
+                # existe en esta PC (p.ej. la red del robot no esta conectada).
+                # En vez de reintentar en loop con la misma IP, caemos a
+                # 0.0.0.0 (todas las interfaces) y avisamos UNA sola vez.
+                err = getattr(e, "winerror", None) or e.errno
+                if host_actual != "0.0.0.0" and err in (10049, 99):
+                    if not aviso_fallback_dado:
+                        log_callback(
+                            f"!!! La IP {HOST} no esta disponible en esta PC "
+                            f"(la red del robot no esta conectada?). "
+                            f"Escuchando en 0.0.0.0:{PORT} (todas las "
+                            f"interfaces) hasta que aparezca.")
+                        aviso_fallback_dado = True
+                    try:
+                        servidor.close()
+                    except OSError:
+                        pass
+                    host_actual = "0.0.0.0"
+                    continue
+                raise
+
             servidor.listen(1)
+            aviso_fallback_dado = False
+            intentos_bind_fallido = 0
 
             log_callback("Esperando conexion del robot KUKA...")
 
@@ -442,7 +486,10 @@ def correr_servidor(log_callback):
                     log_callback("Esperando proxima conexion del robot...")
 
         except OSError as e:
-            log_callback(f"!!! Socket roto, reabriendo en 2s: {e}")
+            # Evitar spamear el log: solo el primer error y despues cada 30s.
+            intentos_bind_fallido += 1
+            if intentos_bind_fallido == 1 or intentos_bind_fallido % 15 == 0:
+                log_callback(f"!!! Socket roto, reabriendo en 2s: {e}")
             time.sleep(2)
         except Exception as e:
             log_callback(f"!!! Error fatal: {e}")
@@ -967,7 +1014,7 @@ class HMISpirax:
         # de las columnas para que la matriz se lea como la ve el robot
         # (col 1 a la izquierda, col 10 a la derecha). ci_canvas es la
         # posicion visual (0..9), ci_data es el indice en la matriz raw.
-        espejar = cargar_espejo_col_salida()
+        espejar = cargar_espejo_col_salida("mesa")
 
         for fi in range(GRILLA_FILAS):
             for ci_canvas in range(GRILLA_COLS):
@@ -1796,7 +1843,7 @@ class HMISpirax:
 
     def _cambiar_modo_cinta(self, auto):
         if auto:
-            if not self._asegurar_camara():
+            if not self._asegurar_camara(detector_cinta):
                 return
             estado.set_modo_auto_cinta(True)
             self.btn_auto_cinta.configure(bg='#2d8f3a', fg='white',
@@ -1815,7 +1862,7 @@ class HMISpirax:
 
     def _cambiar_modo_mesa(self, auto):
         if auto:
-            if not self._asegurar_camara():
+            if not self._asegurar_camara(detector_mesa):
                 return
             estado.set_modo_auto_mesa(True)
             self.btn_auto_mesa.configure(bg='#2d8f3a', fg='white',
@@ -1840,6 +1887,7 @@ class HMISpirax:
         tipo = est_actual["tipo"]
 
         def trabajo():
+            detector = detector_cinta  # camara de la cinta
             camara_iniciada_aqui = False
             try:
                 if not detector.esta_activo():
@@ -1870,6 +1918,7 @@ class HMISpirax:
         tipo = est_actual["tipo"]
 
         def trabajo():
+            detector = detector_mesa  # camara de la mesa
             camara_iniciada_aqui = False
             try:
                 if not detector.esta_activo():
@@ -1892,23 +1941,25 @@ class HMISpirax:
 
         threading.Thread(target=trabajo, daemon=True).start()
 
-    def _asegurar_camara(self):
-        """Si la camara no esta activa, intenta encenderla. True si quedo
-        encendida."""
-        if detector.esta_activo():
+    def _asegurar_camara(self, det=None):
+        """Si la camara del detector no esta activa, intenta encenderla.
+        True si quedo encendida. Si det es None usa el detector de calibracion."""
+        if det is None:
+            det = detector
+        if det.esta_activo():
             return True
 
-        est = estado.get_estado()
-        self._agregar_log("[VISION] Iniciando camara...")
+        est = det.estacion_activa()
+        self._agregar_log(f"[VISION] Iniciando camara ({est})...")
         self.root.update_idletasks()
         try:
-            detector.start(requiere_referencia=False)
-            self._agregar_log("[VISION] Camara lista.")
+            det.start(requiere_referencia=False)
+            self._agregar_log(f"[VISION] Camara ({est}) lista.")
             return True
         except Exception as e:
-            self._agregar_log(f"!!! Error iniciando camara: {e}")
+            self._agregar_log(f"!!! Error iniciando camara ({est}): {e}")
             messagebox.showerror("Camara",
-                                 f"No se pudo iniciar la camara:\n\n{e}")
+                                 f"No se pudo iniciar la camara ({est}):\n\n{e}")
             return False
 
     def _toggle_mesa_manual(self):
@@ -1966,11 +2017,25 @@ class HMISpirax:
     #  Handlers CALIBRAR
     # ==================================================================
     def _set_estacion_calibrar(self, estacion):
+        global detector
         venia_preview = self._preview_activo
         if venia_preview:
             self._detener_preview()
 
+        # Si veniamos calibrando otra estacion con su camara abierta,
+        # apagarla antes de pasar a la nueva (no dejar dos camaras vivas).
+        det_anterior = detector
+        det_nuevo = detector_cinta if estacion == "cinta" else detector_mesa
+        if det_anterior is not det_nuevo and det_anterior.esta_activo():
+            try:
+                det_anterior.stop()
+            except Exception as e:
+                self._agregar_log(f"!!! Error apagando camara anterior: {e}")
+
         self._estacion_calibrar = estacion
+        # El alias 'detector' (usado por toda la pestania Calibrar/preview)
+        # apunta al detector de la estacion elegida.
+        detector = det_nuevo
 
         # Refrescar boton activo
         if estacion == "cinta":
@@ -1986,6 +2051,12 @@ class HMISpirax:
 
         # Recargar tipo en la nueva estacion
         self._seleccionar_tipo_calibrar(self._tipo_calibrar)
+
+        # Refrescar los botones de orientacion para mostrar los valores
+        # de ESTA estacion (cada camara tiene su propia rotacion/flip).
+        self._actualizar_label_rotacion()
+        self._actualizar_label_flip_h()
+        self._actualizar_label_espejo_col_salida()
 
         if venia_preview:
             self._iniciar_preview()
@@ -2357,24 +2428,25 @@ class HMISpirax:
     #  Rotacion global de camara
     # ------------------------------------------------------------------
     def _ciclar_rotacion(self):
-        """Cicla la rotacion de camara 0 -> 90 -> 180 -> 270 -> 0."""
-        k_actual = cargar_rotacion()
+        """Cicla la rotacion de la camara de ESTA estacion 0->90->180->270->0."""
+        est = self._estacion_calibrar
+        k_actual = cargar_rotacion(est)
         k_nuevo = (k_actual + 1) % 4
-        guardar_rotacion(k_nuevo)
+        guardar_rotacion(k_nuevo, est)
         self._actualizar_label_rotacion()
         grados = k_nuevo * 90
-        self._agregar_log(f"[CALIBRAR] Rotacion de camara: {grados} grados")
+        self._agregar_log(f"[CALIBRAR] Rotacion camara ({est}): {grados} grados")
         self._agregar_log(
             "[CALIBRAR] >>> ATENCION: hay que RECAPTURAR REFERENCIAS y "
-            "REAJUSTAR RECORTES de cada tipo/estacion. Las viejas "
+            "REAJUSTAR RECORTES de esta estacion. Las viejas "
             "quedaron desfasadas.")
         # Si hay preview corriendo, los frames siguientes ya salen rotados:
         # no hace falta nada mas. El usuario va a ver el cambio al toque.
 
     def _actualizar_label_rotacion(self):
-        """Refresca el texto del boton segun la rotacion persistida."""
+        """Refresca el texto del boton segun la rotacion de la estacion."""
         try:
-            k = cargar_rotacion()
+            k = cargar_rotacion(self._estacion_calibrar)
             grados = k * 90
             self.btn_rotacion.configure(text=f"Rotacion: {grados}\u00b0")
         except Exception:
@@ -2384,21 +2456,22 @@ class HMISpirax:
     #  Flip horizontal de camara
     # ------------------------------------------------------------------
     def _alternar_flip_h(self):
-        """Toggle del flip horizontal de camara."""
-        nuevo = not cargar_flip_h()
-        guardar_flip_h(nuevo)
+        """Toggle del flip horizontal de la camara de ESTA estacion."""
+        est = self._estacion_calibrar
+        nuevo = not cargar_flip_h(est)
+        guardar_flip_h(nuevo, est)
         self._actualizar_label_flip_h()
         estado = "ON" if nuevo else "OFF"
-        self._agregar_log(f"[CALIBRAR] Flip H: {estado}")
+        self._agregar_log(f"[CALIBRAR] Flip H ({est}): {estado}")
         self._agregar_log(
             "[CALIBRAR] >>> ATENCION: hay que RECAPTURAR REFERENCIAS y "
-            "REAJUSTAR RECORTES de cada tipo/estacion. Las viejas "
+            "REAJUSTAR RECORTES de esta estacion. Las viejas "
             "quedaron desfasadas.")
 
     def _actualizar_label_flip_h(self):
-        """Refresca el texto del boton segun el flip persistido."""
+        """Refresca el texto del boton segun el flip de la estacion."""
         try:
-            estado = "ON" if cargar_flip_h() else "OFF"
+            estado = "ON" if cargar_flip_h(self._estacion_calibrar) else "OFF"
             self.btn_flip_h.configure(text=f"Flip H: {estado}")
         except Exception:
             pass
@@ -2409,15 +2482,15 @@ class HMISpirax:
     def _alternar_espejo_col_salida(self):
         """Toggle del espejo de columna en la salida hacia el KUKA.
 
-        NO toca la imagen ni la deteccion: solo invierte el numero de
-        columna que se manda al robot via EKI. No requiere recapturar
-        referencias ni reajustar recortes.
+        Solo aplica a la MESA (la cinta no maneja columnas). NO toca la
+        imagen ni la deteccion: solo invierte el numero de columna que se
+        manda al robot via EKI. No requiere recapturar referencias.
         """
-        nuevo = not cargar_espejo_col_salida()
-        guardar_espejo_col_salida(nuevo)
+        nuevo = not cargar_espejo_col_salida("mesa")
+        guardar_espejo_col_salida(nuevo, "mesa")
         self._actualizar_label_espejo_col_salida()
         estado = "ON" if nuevo else "OFF"
-        self._agregar_log(f"[CALIBRAR] Espejo Col -> Robot: {estado}")
+        self._agregar_log(f"[CALIBRAR] Espejo Col -> Robot (mesa): {estado}")
         if nuevo:
             self._agregar_log(
                 "[CALIBRAR] Vision sigue mostrando la celda detectada en "
@@ -2427,9 +2500,9 @@ class HMISpirax:
                 "[CALIBRAR] Vision manda al robot la misma columna que muestra.")
 
     def _actualizar_label_espejo_col_salida(self):
-        """Refresca el texto del boton segun el estado persistido."""
+        """Refresca el texto del boton segun el estado persistido (mesa)."""
         try:
-            estado = "ON" if cargar_espejo_col_salida() else "OFF"
+            estado = "ON" if cargar_espejo_col_salida("mesa") else "OFF"
             self.btn_espejo_col.configure(text=f"Espejo Col \u2192 Robot: {estado}")
         except Exception:
             pass
@@ -2509,8 +2582,36 @@ class HMISpirax:
         if tab != 'CALIBRAR' and self._preview_activo:
             self._detener_preview()
         if tab == 'CALIBRAR':
+            # Calibrar y Automatico NO conviven (usan las mismas camaras).
+            # Al entrar a Calibrar, cerramos las camaras del modo auto y
+            # pasamos ambas estaciones a MANUAL, para que el preview pueda
+            # abrir su camara sin chocar con un pipeline ya abierto.
+            self._apagar_camaras_auto()
             # Refrescar el toggle de estacion activa
             self._set_estacion_calibrar(self._estacion_calibrar)
+
+    def _apagar_camaras_auto(self):
+        """Apaga las camaras del modo automatico y pasa a MANUAL. Se usa al
+        entrar a Calibrar (auto y calibrar no pueden usar las camaras a la vez)."""
+        cambio = False
+        if estado.get_estado()["modo_auto_cinta"]:
+            self._cambiar_modo_cinta(False)
+            cambio = True
+        if estado.get_estado()["modo_auto_mesa"]:
+            self._cambiar_modo_mesa(False)
+            cambio = True
+        for det, nombre in ((detector_cinta, "cinta"), (detector_mesa, "mesa")):
+            if det.esta_activo():
+                try:
+                    det.stop()
+                    self._agregar_log(f"[VISION] Camara ({nombre}) apagada "
+                                      f"(entrando a Calibrar).")
+                except Exception as e:
+                    self._agregar_log(f"!!! Error apagando camara "
+                                      f"({nombre}): {e}")
+        if cambio:
+            self._agregar_log("[VISION] Modo AUTOMATICO desactivado "
+                              "(entraste a Calibrar).")
 
     # ==================================================================
     #  Log
@@ -2586,8 +2687,14 @@ class HMISpirax:
 
         self.lbl_consultas.configure(text=f"Consultas recibidas: {estado.consultas}")
 
-        if detector.esta_activo():
-            self.lbl_camara.configure(text="Camara: ACTIVA", fg='#7fff7f')
+        cam_c = detector_cinta.esta_activo()
+        cam_m = detector_mesa.esta_activo()
+        if cam_c and cam_m:
+            self.lbl_camara.configure(text="Camaras: CINTA+MESA", fg='#7fff7f')
+        elif cam_c:
+            self.lbl_camara.configure(text="Camara: CINTA activa", fg='#7fff7f')
+        elif cam_m:
+            self.lbl_camara.configure(text="Camara: MESA activa", fg='#7fff7f')
         else:
             self.lbl_camara.configure(text="Camara: apagada", fg='#ff6b6b')
 
@@ -2838,11 +2945,12 @@ class HMISpirax:
     def _on_close(self):
         estado.shutdown = True
         self._preview_activo = False
-        try:
-            if detector.esta_activo():
-                detector.stop()
-        except Exception:
-            pass
+        for det in (detector_cinta, detector_mesa):
+            try:
+                if det.esta_activo():
+                    det.stop()
+            except Exception:
+                pass
         try:
             torno.stop()
         except Exception:
