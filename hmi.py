@@ -63,6 +63,8 @@ class EstadoCompartido:
     def __init__(self):
         # Configuracion cinta
         self.tipo = 1
+        # Tipo de rosca (1, 2 o 3). Solo se manda al torno; el robot no la usa.
+        self.rosca = 1
         self.orientacion_manual = None  # None = manual sin seleccion
         self.modo_auto_cinta = False
 
@@ -96,6 +98,7 @@ class EstadoCompartido:
         with self.lock:
             return {
                 "tipo": self.tipo,
+                "rosca": self.rosca,
                 "orientacion_manual": self.orientacion_manual,
                 "modo_auto_cinta": self.modo_auto_cinta,
                 "modo_auto_mesa": self.modo_auto_mesa,
@@ -106,6 +109,10 @@ class EstadoCompartido:
     def set_tipo(self, tipo):
         with self.lock:
             self.tipo = tipo
+
+    def set_rosca(self, rosca):
+        with self.lock:
+            self.rosca = rosca
 
     def set_orientacion_manual(self, orientacion):
         with self.lock:
@@ -237,6 +244,8 @@ def manejar_robot(conn, addr, log_callback):
             estado.registrar_consulta()
             est = estado.get_estado()
             tipo = est["tipo"]
+            # Rosca: solo se manda al torno, el robot la ignora.
+            rosca = est["rosca"]
 
             num_estacion = _extraer_estacion(mensaje)
 
@@ -265,9 +274,9 @@ def manejar_robot(conn, addr, log_callback):
                 #   ARRIBA -> KUKA da vuelta pieza   -> torno hara op20
                 #   ABAJO  -> error, no encolar
                 if orientacion == "VACIO":
-                    torno.encolar(tipo, 10)
+                    torno.encolar(tipo, 10, rosca)
                 elif orientacion == "ARRIBA":
-                    torno.encolar(tipo, 20)
+                    torno.encolar(tipo, 20, rosca)
                 # ABAJO no encola (es error)
 
             elif num_estacion == 3:
@@ -499,6 +508,7 @@ class HMISpirax:
         # Botones (los referencio para poder pintarlos segun estado)
         self.btns_tipo_operar = []
         self.btns_tipo_calibrar = []
+        self.btns_rosca = []
         self.btns_orient = []
 
         # Estado de calibrar
@@ -551,6 +561,7 @@ class HMISpirax:
         self._construir_tab_log()
 
         self._seleccionar_tipo_operar(1)
+        self._seleccionar_rosca(1)
         # No setear orientacion: arranca en MANUAL sin seleccion
         self._refrescar_botones_orientacion()
         self._cambiar_modo_cinta(False)
@@ -590,20 +601,47 @@ class HMISpirax:
         col_der.pack(side='right', fill='y', padx=(8, 15), pady=10)
 
         # Tipo (afecta tanto cinta como mesa)
+        # 12 modelos: 1-6 = ALUMINIO, 7-12 = FUNDICION.
+        # El modelo N+6 es la version fundicion de la forma N.
         f_tipo = tk.LabelFrame(col_izq, text=" TIPO DE PIEZA (Receta) ",
                                font=("Arial", 12, "bold"),
                                bg='#2b2b2b', fg='white', padx=10, pady=10)
         f_tipo.pack(fill='x', pady=5)
 
         c_tipos = tk.Frame(f_tipo, bg='#2b2b2b')
-        c_tipos.pack()
-        for i in range(1, 7):
-            btn = tk.Button(c_tipos, text=f"Tipo {i}",
+        c_tipos.pack(fill='x')
+
+        for material, rango, color in (
+                ("ALUMINIO", range(1, 7), '#c0c0c0'),
+                ("FUNDICION", range(7, 13), '#d59a6a')):
+            row = tk.Frame(c_tipos, bg='#2b2b2b')
+            row.pack(fill='x', pady=2)
+            tk.Label(row, text=material, width=10,
+                     font=("Arial", 10, "bold"),
+                     bg='#2b2b2b', fg=color).pack(side='left', padx=(0, 6))
+            for i in rango:
+                btn = tk.Button(row, text=f"Tipo {i}",
+                                font=("Arial", 11, "bold"),
+                                width=7, height=3,
+                                command=lambda t=i: self._seleccionar_tipo_operar(t))
+                btn.pack(side='left', padx=4, pady=4)
+                self.btns_tipo_operar.append(btn)
+
+        # Tipo de rosca (1, 2 o 3). Solo se manda al torno.
+        f_rosca = tk.LabelFrame(col_izq, text=" TIPO DE ROSCA (solo torno) ",
+                                font=("Arial", 12, "bold"),
+                                bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_rosca.pack(fill='x', pady=5)
+
+        c_rosca = tk.Frame(f_rosca, bg='#2b2b2b')
+        c_rosca.pack()
+        for r in range(1, 4):
+            btn = tk.Button(c_rosca, text=f"Rosca {r}",
                             font=("Arial", 12, "bold"),
-                            width=8, height=3,
-                            command=lambda t=i: self._seleccionar_tipo_operar(t))
-            btn.grid(row=0, column=i - 1, padx=5, pady=5)
-            self.btns_tipo_operar.append(btn)
+                            width=10, height=2,
+                            command=lambda x=r: self._seleccionar_rosca(x))
+            btn.grid(row=0, column=r - 1, padx=6, pady=4)
+            self.btns_rosca.append(btn)
 
         # =========== Seccion CINTA ===========
         f_cinta = tk.LabelFrame(col_izq, text=" CINTA (Estacion 1) ",
@@ -1097,14 +1135,23 @@ class HMISpirax:
         f_sel.pack(fill='x', pady=(0, 10))
 
         c_tipos_cal = tk.Frame(f_sel, bg='#2b2b2b')
-        c_tipos_cal.pack()
-        for i in range(1, 7):
-            btn = tk.Button(c_tipos_cal, text=f"Tipo {i}",
-                            font=("Arial", 11, "bold"),
-                            width=8, height=3,
-                            command=lambda t=i: self._seleccionar_tipo_calibrar(t))
-            btn.grid(row=0, column=i - 1, padx=5, pady=3)
-            self.btns_tipo_calibrar.append(btn)
+        c_tipos_cal.pack(fill='x')
+        # 12 modelos: 1-6 aluminio, 7-12 fundicion (una fila por material)
+        for material, rango, color in (
+                ("ALUMINIO", range(1, 7), '#c0c0c0'),
+                ("FUNDICION", range(7, 13), '#d59a6a')):
+            row = tk.Frame(c_tipos_cal, bg='#2b2b2b')
+            row.pack(fill='x', pady=2)
+            tk.Label(row, text=material, width=10,
+                     font=("Arial", 10, "bold"),
+                     bg='#2b2b2b', fg=color).pack(side='left', padx=(0, 6))
+            for i in rango:
+                btn = tk.Button(row, text=f"Tipo {i}",
+                                font=("Arial", 11, "bold"),
+                                width=7, height=3,
+                                command=lambda t=i: self._seleccionar_tipo_calibrar(t))
+                btn.pack(side='left', padx=4, pady=3)
+                self.btns_tipo_calibrar.append(btn)
 
         # Cuerpo
         cuerpo = tk.Frame(cont, bg='#2b2b2b')
@@ -1482,8 +1529,9 @@ class HMISpirax:
                  bg='#2b2b2b', fg='#cfcfcf').pack(anchor='w')
 
         tk.Label(f_conn,
-                 text=f"Macros: #{torno.config['macro_tipo']}=tipo  "
+                 text=f"Macros: #{torno.config['macro_tipo']}=pieza  "
                       f"#{torno.config['macro_op']}=op  "
+                      f"#{torno.config['macro_rosca']}=rosca  "
                       f"#{torno.config['macro_fin']}=fin",
                  font=("Consolas", 9),
                  bg='#2b2b2b', fg='#a0a0a0').pack(anchor='w', pady=(2, 8))
@@ -1523,7 +1571,7 @@ class HMISpirax:
                  bg='#2b2b2b', fg='white').grid(row=0, column=0, padx=2)
         self.ent_insp_num = tk.Entry(c_insp, width=8, font=("Consolas", 10))
         self.ent_insp_num.grid(row=0, column=1, padx=2)
-        self.ent_insp_num.insert(0, "500")
+        self.ent_insp_num.insert(0, "551")
 
         tk.Button(c_insp, text="Leer",
                   command=self._leer_macro_torno,
@@ -1554,8 +1602,9 @@ class HMISpirax:
         self.lst_cola.delete(0, 'end')
         for i, item in enumerate(items):
             marca = "►" if i == 0 else " "
-            linea = (f"{marca} #{i + 1:2}  tipo={item['tipo']}  "
-                     f"op={item['op']:2}  ({item.get('ts', '?')})")
+            linea = (f"{marca} #{i + 1:2}  tipo={item['tipo']:2}  "
+                     f"op={item['op']:2}  rosca={item.get('rosca', 0)}  "
+                     f"({item.get('ts', '?')})")
             self.lst_cola.insert('end', linea)
             if i == 0:
                 self.lst_cola.itemconfig(0, fg='#FAC775')
@@ -1567,21 +1616,35 @@ class HMISpirax:
 
     def _encolar_manual_torno(self):
         from tkinter import simpledialog
-        tipo_s = simpledialog.askstring("Encolar pieza",
-                                         "Tipo (1-6):", parent=self.root)
+        tipo_s = simpledialog.askstring(
+            "Encolar pieza",
+            "Numero de pieza (1-12: 1-6 aluminio, 7-12 fundicion):",
+            parent=self.root)
         if not tipo_s:
             return
         op_s = simpledialog.askstring("Encolar pieza",
                                        "Operacion (10 o 20):", parent=self.root)
         if not op_s:
             return
+        rosca_s = simpledialog.askstring("Encolar pieza",
+                                          "Tipo de rosca (1, 2 o 3):",
+                                          parent=self.root)
+        if not rosca_s:
+            return
         try:
             tipo = int(tipo_s)
             op = int(op_s)
-            torno.encolar(tipo, op)
+            rosca = int(rosca_s)
+            if not (1 <= tipo <= 12):
+                raise ValueError("tipo fuera de rango (1-12)")
+            if op not in (10, 20):
+                raise ValueError("operacion invalida (10 o 20)")
+            if rosca not in (1, 2, 3):
+                raise ValueError("rosca invalida (1, 2 o 3)")
+            torno.encolar(tipo, op, rosca)
             self._refrescar_cola_torno()
-        except ValueError:
-            messagebox.showerror("Error", "Valores invalidos")
+        except ValueError as e:
+            messagebox.showerror("Error", f"Valores invalidos: {e}")
 
     def _quitar_seleccion_torno(self):
         seleccion = self.lst_cola.curselection()
@@ -1686,6 +1749,18 @@ class HMISpirax:
             self._refrescar_boton_tipo(btn, i + 1,
                                          seleccionado=(i + 1 == tipo),
                                          estacion="cinta")
+        self._actualizar_label_seleccion()
+
+    def _seleccionar_rosca(self, rosca):
+        """Selecciona el tipo de rosca global (1-3). Solo se manda al torno."""
+        estado.set_rosca(rosca)
+        for i, btn in enumerate(self.btns_rosca):
+            if i + 1 == rosca:
+                btn.configure(bg='#4a90e2', fg='white', relief='sunken',
+                              activebackground='#4a90e2')
+            else:
+                btn.configure(bg='SystemButtonFace', fg='black',
+                              relief='raised', activebackground='#dddddd')
         self._actualizar_label_seleccion()
 
     def _toggle_cinta_manual(self):
@@ -1980,8 +2055,10 @@ class HMISpirax:
         else:
             mesa_modo = "manual:(sin seleccion)"
 
+        material = "alu" if est["tipo"] <= 6 else "fund"
         self.lbl_seleccion.configure(
-            text=f"Tipo: {est['tipo']}   |   "
+            text=f"Tipo: {est['tipo']} ({material})   |   "
+                 f"Rosca: {est['rosca']}   |   "
                  f"Cinta ({cinta_cal}, {cinta_modo})   |   "
                  f"Mesa ({mesa_cal}, {mesa_modo})"
         )

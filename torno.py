@@ -5,17 +5,20 @@ Componentes:
 - Cola FIFO persistida en disco (cola_torno.json)
 - Cliente Focas conectado en background
 - Thread sincronizador que:
-    1. Mantiene escrito en #500/#501 el primer elemento de la cola
-    2. Pollea #503 (flag "termine"), cuando lo ve hace popleft + actualiza macros + baja #503
-    3. Si la cola esta vacia, escribe ceros en #500/#501
+    1. Mantiene escrito en #551/#550/#552 el primer elemento de la cola
+    2. Pollea #553 (flag "termine"), cuando lo ve hace popleft + actualiza macros + baja #553
+    3. Si la cola esta vacia, escribe ceros en #551/#550/#552
 
 Convencion de macros (configurable):
-  #500 = TIPO de pieza (1-6, 0 = sin pieza)
-  #501 = OPERACION (10 o 20, 0 = sin pieza)
-  #503 = FLAG fin de mecanizado (torno escribe 1, PC limpia a 0)
+  #551 = NUMERO DE PIEZA (1-12, 0 = sin pieza)   -> 1-6 aluminio, 7-12 fundicion
+  #550 = OPERACION A MECANIZAR (10 o 20, 0 = sin pieza)
+  #552 = TIPO DE ROSCA (1, 2 o 3, 0 = sin rosca)
+  #553 = FLAG fin de mecanizado (torno escribe 1, PC limpia a 0)
 
-El programa NC del torno debe usar #100/#101 como snapshot local
-de #500/#501 al pickear, y al terminar setear #503=1 y esperar a 0.
+El programa NC del torno debe tomar #551/#550/#552 como snapshot local
+al pickear, y al terminar setear #553=1 y esperar a 0.
+NOTA: la rosca y el numero de pieza (1-12) solo se usan en el torno;
+el robot sigue trabajando igual con la forma de la pieza.
 """
 
 import json
@@ -67,10 +70,11 @@ DEFAULTS = {
     "torno_port": 8193,
     "torno_timeout_focas": 10,
     "torno_dll_path": "./dlls",
-    "macro_tipo": 500,
-    "macro_op": 501,
-    "macro_fin": 503,
-    "polling_ms": 500,        # intervalo de polling de #503
+    "macro_tipo": 551,        # NUMERO DE PIEZA (1-12)
+    "macro_op": 550,          # OPERACION A MECANIZAR (10 o 20)
+    "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
+    "macro_fin": 553,         # FLAG fin de mecanizado
+    "polling_ms": 500,        # intervalo de polling de #553
     "persist_path": "cola_torno.json",
 }
 
@@ -82,7 +86,7 @@ DEFAULTS = {
 class ColaTorno:
     """Cola FIFO thread-safe persistida en disco como JSON.
 
-    Cada elemento es un dict: {"tipo": int, "op": int, "ts": str}
+    Cada elemento es un dict: {"tipo": int, "op": int, "rosca": int, "ts": str}
     El timestamp es para auditoria/HMI, no afecta logica.
     """
 
@@ -113,12 +117,13 @@ class ColaTorno:
         except Exception as e:
             print(f"[COLA] Error guardando {self._path}: {e}")
 
-    def encolar(self, tipo, op):
+    def encolar(self, tipo, op, rosca=0):
         """Agrega al final de la cola."""
         with self._lock:
             item = {
                 "tipo": int(tipo),
                 "op": int(op),
+                "rosca": int(rosca),
                 "ts": datetime.now().strftime("%H:%M:%S"),
             }
             self._cola.append(item)
@@ -211,7 +216,7 @@ class TornoFanuc:
         self._sync_thread = None
         self._shutdown = False
         # Para saber si tenemos que reescribir macros (cuando cambia cola[0])
-        self._ultimo_escrito = (None, None)  # (tipo, op)
+        self._ultimo_escrito = (None, None, None)  # (tipo, op, rosca)
         # Cola de pedidos para que TODAS las llamadas FOCAS se hagan
         # desde el thread sincronizador. La fwlib32 de FANUC exige que
         # el handle se use desde el mismo thread que lo creo, sino
@@ -260,11 +265,13 @@ class TornoFanuc:
     #  Operaciones publicas
     # ------------------------------------------------------------------
 
-    def encolar(self, tipo, op):
-        """Encola una pieza (tipo, op). Si la cola estaba vacia, el thread
-        sincronizador la escribe a las macros en el proximo ciclo."""
-        item = self.cola.encolar(tipo, op)
-        self._log(f"[TORNO] Encolado: tipo={tipo} op={op} | cola={len(self.cola)}")
+    def encolar(self, tipo, op, rosca=0):
+        """Encola una pieza (tipo, op, rosca). Si la cola estaba vacia, el
+        thread sincronizador la escribe a las macros en el proximo ciclo.
+        rosca solo se manda al torno (el robot no la usa)."""
+        item = self.cola.encolar(tipo, op, rosca)
+        self._log(f"[TORNO] Encolado: tipo={tipo} op={op} rosca={rosca} "
+                  f"| cola={len(self.cola)}")
         return item
 
     def limpiar_cola(self):
@@ -272,13 +279,13 @@ class TornoFanuc:
         self.cola.limpiar()
         self._log(f"[TORNO] Cola limpiada ({n} items removidos)")
         # Forzar reescritura de ceros
-        self._ultimo_escrito = (None, None)
+        self._ultimo_escrito = (None, None, None)
 
     def quitar_indice(self, indice):
         ok = self.cola.quitar_indice(indice)
         if ok:
             self._log(f"[TORNO] Item indice {indice} quitado")
-            self._ultimo_escrito = (None, None)
+            self._ultimo_escrito = (None, None, None)
         return ok
 
     def reconectar(self):
@@ -403,9 +410,9 @@ class TornoFanuc:
 
         - Si no esta conectado, intenta conectar.
         - Si esta conectado:
-          - Lee #503. Si == 1 -> popleft, baja a 0.
-          - Compara cola[0] con _ultimo_escrito. Si difiere, escribe #500/#501.
-          - Si cola vacia y _ultimo_escrito != (0,0), escribe ceros.
+          - Lee #553. Si == 1 -> popleft, baja a 0.
+          - Compara cola[0] con _ultimo_escrito. Si difiere, escribe #551/#550/#552.
+          - Si cola vacia y _ultimo_escrito != (0,0,0), escribe ceros.
         - Sleep polling_ms.
         """
         polling_s = self.config["polling_ms"] / 1000.0
@@ -473,7 +480,7 @@ class TornoFanuc:
                 self._client = client
             self.conectado = True
             self.ultimo_error = None
-            self._ultimo_escrito = (None, None)  # forzar reescritura
+            self._ultimo_escrito = (None, None, None)  # forzar reescritura
             self._log(f"[TORNO] Conectado a {self.config['torno_host']}:{self.config['torno_port']}")
         except Exception as e:
             self.ultimo_error = str(e)
@@ -498,9 +505,10 @@ class TornoFanuc:
         """Una iteracion del sync. Asume conectado."""
         mac_tipo = self.config["macro_tipo"]
         mac_op = self.config["macro_op"]
+        mac_rosca = self.config["macro_rosca"]
         mac_fin = self.config["macro_fin"]
 
-        # 1. Chequear flag de fin (#503)
+        # 1. Chequear flag de fin (#553)
         with self._client_lock:
             valor_fin = self._client.get_macro(mac_fin)
 
@@ -510,32 +518,38 @@ class TornoFanuc:
             if quitado is not None:
                 self.piezas_terminadas += 1
                 self._log(f"[TORNO] Pieza terminada: tipo={quitado['tipo']} "
-                          f"op={quitado['op']} | total terminadas={self.piezas_terminadas}")
+                          f"op={quitado['op']} rosca={quitado.get('rosca', 0)} "
+                          f"| total terminadas={self.piezas_terminadas}")
             else:
                 self._log("[TORNO] Torno aviso fin pero cola estaba vacia (?)")
             # Forzar reescritura del nuevo primero
-            self._ultimo_escrito = (None, None)
+            self._ultimo_escrito = (None, None, None)
             # Bajar flag
             with self._client_lock:
                 self._client.set_macro(mac_fin, 0)
 
-        # 2. Asegurarse que #500/#501 reflejan el primero de la cola
+        # 2. Asegurarse que #551/#550/#552 reflejan el primero de la cola
         primero = self.cola.primero()
         if primero is None:
-            objetivo = (0, 0)
+            objetivo = (0, 0, 0)
         else:
-            objetivo = (int(primero["tipo"]), int(primero["op"]))
+            objetivo = (int(primero["tipo"]), int(primero["op"]),
+                        int(primero.get("rosca", 0)))
 
         if objetivo != self._ultimo_escrito:
             with self._client_lock:
                 self._client.set_macro(mac_tipo, objetivo[0])
                 self._client.set_macro(mac_op, objetivo[1])
+                self._client.set_macro(mac_rosca, objetivo[2])
             self._ultimo_escrito = objetivo
-            if objetivo == (0, 0):
-                self.ultimo_evento = f"[TORNO] Cola vacia -> #{mac_tipo}=0 #{mac_op}=0"
+            if objetivo == (0, 0, 0):
+                self.ultimo_evento = (f"[TORNO] Cola vacia -> "
+                                      f"#{mac_tipo}=0 #{mac_op}=0 #{mac_rosca}=0")
             else:
                 self.ultimo_evento = (f"[TORNO] Macros actualizadas: "
-                                      f"#{mac_tipo}={objetivo[0]} #{mac_op}={objetivo[1]}")
+                                      f"#{mac_tipo}={objetivo[0]} "
+                                      f"#{mac_op}={objetivo[1]} "
+                                      f"#{mac_rosca}={objetivo[2]}")
             self._log(self.ultimo_evento)
 
     def _log(self, msg):

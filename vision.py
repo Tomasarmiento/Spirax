@@ -60,7 +60,8 @@ CAM_HEIGHT = 800
 CAM_FPS = 30
 
 MODELOS_DIR = "modelos"
-TIPOS_VALIDOS = (1, 2, 3, 4, 5, 6)
+# 12 modelos: 1-6 aluminio, 7-12 fundicion (N+6 = version fundicion de la forma N)
+TIPOS_VALIDOS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 ESTACIONES_VALIDAS = ("cinta", "mesa")
 
 # ======================================================================
@@ -1743,8 +1744,8 @@ def main():
     print("  Spirax Vision - Multi-modelo Multi-estacion")
     print("==================================================\n")
     print("Uso:")
-    print("  python vision.py referencia <1-6> [cinta|mesa]")
-    print("  python vision.py <1-6> [cinta|mesa]")
+    print("  python vision.py referencia <1-12> [cinta|mesa]")
+    print("  python vision.py <1-12> [cinta|mesa]")
     print("  Default estacion: cinta")
 
     args = sys.argv[1:]
