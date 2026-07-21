@@ -75,8 +75,8 @@ ESTACIONES_VALIDAS = ("cinta", "mesa")
 #  el discovery encuentre (comportamiento viejo, solo util con 1 camara).
 # ======================================================================
 SERIAL_POR_ESTACION = {
-    "cinta": "261422303630",
-    "mesa":  "261422303633",
+    "cinta": "261422303633",
+    "mesa":  "261422303630",
 }
 BG_DIFF_THRESH_DEFAULT = 40
 

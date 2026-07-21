@@ -7,6 +7,6 @@
   "mesa": {
     "k": 1,
     "flip_h": false,
-    "espejo_col_salida": false
+    "espejo_col_salida": true
   }
 }

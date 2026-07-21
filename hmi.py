@@ -427,10 +427,6 @@ def consultar_vision_mesa(tipo, log_callback):
 def correr_servidor(log_callback):
     log_callback(f"=== Servidor EKI iniciado en {HOST}:{PORT} ===")
 
-    host_actual = HOST
-    aviso_fallback_dado = False
-    intentos_bind_fallido = 0
-
     while not estado.shutdown:
         servidor = None
         try:
@@ -442,33 +438,8 @@ def correr_servidor(log_callback):
                 pass
 
             servidor.settimeout(1.0)
-            try:
-                servidor.bind((host_actual, PORT))
-            except OSError as e:
-                # WinError 10049 / EADDRNOTAVAIL: la IP configurada (HOST) no
-                # existe en esta PC (p.ej. la red del robot no esta conectada).
-                # En vez de reintentar en loop con la misma IP, caemos a
-                # 0.0.0.0 (todas las interfaces) y avisamos UNA sola vez.
-                err = getattr(e, "winerror", None) or e.errno
-                if host_actual != "0.0.0.0" and err in (10049, 99):
-                    if not aviso_fallback_dado:
-                        log_callback(
-                            f"!!! La IP {HOST} no esta disponible en esta PC "
-                            f"(la red del robot no esta conectada?). "
-                            f"Escuchando en 0.0.0.0:{PORT} (todas las "
-                            f"interfaces) hasta que aparezca.")
-                        aviso_fallback_dado = True
-                    try:
-                        servidor.close()
-                    except OSError:
-                        pass
-                    host_actual = "0.0.0.0"
-                    continue
-                raise
-
+            servidor.bind((HOST, PORT))
             servidor.listen(1)
-            aviso_fallback_dado = False
-            intentos_bind_fallido = 0
 
             log_callback("Esperando conexion del robot KUKA...")
 
@@ -486,10 +457,7 @@ def correr_servidor(log_callback):
                     log_callback("Esperando proxima conexion del robot...")
 
         except OSError as e:
-            # Evitar spamear el log: solo el primer error y despues cada 30s.
-            intentos_bind_fallido += 1
-            if intentos_bind_fallido == 1 or intentos_bind_fallido % 15 == 0:
-                log_callback(f"!!! Socket roto, reabriendo en 2s: {e}")
+            log_callback(f"!!! Socket roto, reabriendo en 2s: {e}")
             time.sleep(2)
         except Exception as e:
             log_callback(f"!!! Error fatal: {e}")
@@ -790,10 +758,15 @@ class HMISpirax:
                                       bg='#2b2b2b', fg='#7fffd4')
         self.lbl_seleccion.pack(anchor='w')
 
-        self.lbl_camara = tk.Label(f_estado, text="Camara: apagada",
+        self.lbl_cam_cinta = tk.Label(f_estado, text="Camara cinta: apagada",
                                     font=("Arial", 10),
                                     bg='#2b2b2b', fg='#ff6b6b')
-        self.lbl_camara.pack(anchor='w', pady=(3, 0))
+        self.lbl_cam_cinta.pack(anchor='w', pady=(3, 0))
+
+        self.lbl_cam_mesa = tk.Label(f_estado, text="Camara mesa: apagada",
+                                    font=("Arial", 10),
+                                    bg='#2b2b2b', fg='#ff6b6b')
+        self.lbl_cam_mesa.pack(anchor='w')
 
         self.lbl_robot = tk.Label(f_estado, text="Robot: desconectado",
                                   font=("Arial", 11),
@@ -1990,8 +1963,8 @@ class HMISpirax:
 
     def _actualizar_label_seleccion(self):
         est = estado.get_estado()
-        cinta_cal = "OK" if tiene_referencia(est["tipo"], "cinta") else "sin cal"
-        mesa_cal = "OK" if tiene_referencia(est["tipo"], "mesa") else "sin cal"
+        cinta_cal = "calibracion:OK" if tiene_referencia(est["tipo"], "cinta") else "calibracion:sin cal"
+        mesa_cal = "calibracion:OK" if tiene_referencia(est["tipo"], "mesa") else "calibracion:sin cal"
 
         if est["modo_auto_cinta"]:
             cinta_modo = "AUTO"
@@ -2687,16 +2660,15 @@ class HMISpirax:
 
         self.lbl_consultas.configure(text=f"Consultas recibidas: {estado.consultas}")
 
-        cam_c = detector_cinta.esta_activo()
-        cam_m = detector_mesa.esta_activo()
-        if cam_c and cam_m:
-            self.lbl_camara.configure(text="Camaras: CINTA+MESA", fg='#7fff7f')
-        elif cam_c:
-            self.lbl_camara.configure(text="Camara: CINTA activa", fg='#7fff7f')
-        elif cam_m:
-            self.lbl_camara.configure(text="Camara: MESA activa", fg='#7fff7f')
+        if detector_cinta.esta_activo():
+            self.lbl_cam_cinta.configure(text="Camara cinta: conectada", fg='#7fff7f')
         else:
-            self.lbl_camara.configure(text="Camara: apagada", fg='#ff6b6b')
+            self.lbl_cam_cinta.configure(text="Camara cinta: apagada", fg='#ff6b6b')
+
+        if detector_mesa.esta_activo():
+            self.lbl_cam_mesa.configure(text="Camara mesa: conectada", fg='#7fff7f')
+        else:
+            self.lbl_cam_mesa.configure(text="Camara mesa: apagada", fg='#ff6b6b')
 
         # Refrescar paneles
         with estado.lock:
