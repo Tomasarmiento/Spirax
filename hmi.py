@@ -274,9 +274,9 @@ def manejar_robot(conn, addr, log_callback):
                 #   ARRIBA -> KUKA da vuelta pieza   -> torno hara op20
                 #   ABAJO  -> error, no encolar
                 if orientacion == "VACIO":
-                    torno.encolar(tipo, 10, rosca)
+                    torno.encolar(tipo, 1, rosca)
                 elif orientacion == "ARRIBA":
-                    torno.encolar(tipo, 20, rosca)
+                    torno.encolar(tipo, 2, rosca)
                 # ABAJO no encola (es error)
 
             elif num_estacion == 3:
@@ -489,7 +489,15 @@ class HMISpirax:
     def __init__(self, root):
         self.root = root
         self.root.title("Spirax HMI")
-        self.root.geometry("1600x900")
+        # Ajustar al tamano de pantalla: si la pantalla es mas chica que
+        # 1600x900 usamos el tamano disponible (dejando lugar a la barra de
+        # tareas) para que la ventana entre entera. El scroll interno de cada
+        # pestania se encarga del contenido que no entra.
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = min(1600, sw)
+        h = min(900, sh - 60)
+        self.root.geometry(f"{w}x{h}")
         self.root.configure(bg='#2b2b2b')
 
         # Refs a imagenes (evitan garbage collection)
@@ -569,6 +577,63 @@ class HMISpirax:
         self._seleccionar_tipo_calibrar(1)
 
     # ==================================================================
+    #  Utilidad: envolver un contenedor en un area con scroll
+    # ==================================================================
+    def _hacer_scrollable(self, parent, bg='#2b2b2b'):
+        """Crea un canvas con scrollbars vertical y horizontal dentro de
+        `parent` y devuelve el frame INTERIOR donde hay que meter el
+        contenido. Ese frame puede crecer mas que la ventana; cuando eso
+        pasa aparecen las barras para llegar a todo. En pantallas grandes
+        el interior se estira para llenar el canvas (sin bordes vacios)."""
+        outer = tk.Frame(parent, bg=bg)
+        outer.pack(fill='both', expand=True)
+
+        canvas = tk.Canvas(outer, bg=bg, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        hsb = ttk.Scrollbar(outer, orient='horizontal', command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+        canvas.pack(side='left', fill='both', expand=True)
+
+        inner = tk.Frame(canvas, bg=bg)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_configure(_):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        inner.bind('<Configure>', _on_inner_configure)
+
+        def _on_canvas_configure(ev):
+            # El interior nunca mas chico que el canvas (para llenar en
+            # pantallas grandes) pero puede crecer para activar el scroll.
+            canvas.itemconfigure(
+                win,
+                width=max(ev.width, inner.winfo_reqwidth()),
+                height=max(ev.height, inner.winfo_reqheight()))
+        canvas.bind('<Configure>', _on_canvas_configure)
+
+        # Rueda del mouse: solo activa mientras el cursor esta sobre este
+        # canvas, asi cada pestania scrollea la suya sin pisarse.
+        def _bind_wheel(_):
+            canvas.bind_all('<MouseWheel>',
+                lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units'))
+            canvas.bind_all('<Button-4>',
+                lambda e: canvas.yview_scroll(-1, 'units'))
+            canvas.bind_all('<Button-5>',
+                lambda e: canvas.yview_scroll(1, 'units'))
+
+        def _unbind_wheel(_):
+            canvas.unbind_all('<MouseWheel>')
+            canvas.unbind_all('<Button-4>')
+            canvas.unbind_all('<Button-5>')
+
+        canvas.bind('<Enter>', _bind_wheel)
+        canvas.bind('<Leave>', _unbind_wheel)
+
+        return inner
+
+    # ==================================================================
     #  Boton de tipo (colores segun calibracion)
     # ==================================================================
     def _refrescar_boton_tipo(self, btn, tipo, seleccionado,
@@ -590,7 +655,7 @@ class HMISpirax:
     #  OPERAR
     # ------------------------------------------------------------------
     def _construir_tab_operar(self):
-        cont = tk.Frame(self.tab_operar, bg='#2b2b2b')
+        cont = tk.Frame(self._hacer_scrollable(self.tab_operar), bg='#2b2b2b')
         cont.pack(fill='both', expand=True)
 
         col_izq = tk.Frame(cont, bg='#2b2b2b')
@@ -1088,7 +1153,7 @@ class HMISpirax:
     #  CALIBRAR
     # ------------------------------------------------------------------
     def _construir_tab_calibrar(self):
-        cont = tk.Frame(self.tab_calibrar, bg='#2b2b2b')
+        cont = tk.Frame(self._hacer_scrollable(self.tab_calibrar), bg='#2b2b2b')
         cont.pack(fill='both', expand=True, padx=15, pady=10)
 
         # Banner
@@ -1163,51 +1228,12 @@ class HMISpirax:
         col_izq = tk.Frame(cuerpo, bg='#2b2b2b')
         col_izq.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
 
-        # col_der: columna derecha CON SCROLL. Crecio mucho con los
-        # botones de orientacion + sliders + estado y deja de entrar en
-        # pantallas chicas. Envolvemos en Canvas + Scrollbar.
-        col_der_outer = tk.Frame(cuerpo, bg='#2b2b2b')
-        col_der_outer.grid(row=0, column=1, sticky='ns')
-
-        col_der_canvas = tk.Canvas(col_der_outer, bg='#2b2b2b',
-                                    highlightthickness=0, width=280)
-        col_der_canvas.pack(side='left', fill='y', expand=False)
-
-        col_der_scroll = ttk.Scrollbar(col_der_outer, orient='vertical',
-                                        command=col_der_canvas.yview)
-        col_der_scroll.pack(side='right', fill='y')
-        col_der_canvas.configure(yscrollcommand=col_der_scroll.set)
-
-        # Frame interior donde van TODOS los widgets que ya tenia col_der.
-        # Mantenemos el nombre 'col_der' asi el resto del codigo no cambia.
-        col_der = tk.Frame(col_der_canvas, bg='#2b2b2b')
-        col_der_window = col_der_canvas.create_window(
-            (0, 0), window=col_der, anchor='nw', width=280)
-
-        # Actualizar scrollregion cada vez que el contenido cambia de tamano
-        def _on_col_der_configure(event):
-            col_der_canvas.configure(scrollregion=col_der_canvas.bbox('all'))
-        col_der.bind('<Configure>', _on_col_der_configure)
-
-        # Rueda del mouse: solo bindea cuando el cursor esta sobre el canvas
-        # asi no roba el wheel a otras vistas (zoom de imagen, etc).
-        def _bind_wheel_calib(_):
-            col_der_canvas.bind_all('<MouseWheel>',
-                lambda ev: col_der_canvas.yview_scroll(
-                    int(-1 * (ev.delta / 120)), 'units'))
-            # Linux usa Button-4/5 en lugar de MouseWheel
-            col_der_canvas.bind_all('<Button-4>',
-                lambda ev: col_der_canvas.yview_scroll(-1, 'units'))
-            col_der_canvas.bind_all('<Button-5>',
-                lambda ev: col_der_canvas.yview_scroll(1, 'units'))
-
-        def _unbind_wheel_calib(_):
-            col_der_canvas.unbind_all('<MouseWheel>')
-            col_der_canvas.unbind_all('<Button-4>')
-            col_der_canvas.unbind_all('<Button-5>')
-
-        col_der_canvas.bind('<Enter>', _bind_wheel_calib)
-        col_der_canvas.bind('<Leave>', _unbind_wheel_calib)
+        # col_der: columna derecha. Toda la pestania ya vive dentro de un
+        # area con scroll (ver _hacer_scrollable en _construir_tab_calibrar),
+        # asi que aca alcanza con un frame normal; el contenido que no entra
+        # se alcanza con el scroll de la pestania.
+        col_der = tk.Frame(cuerpo, bg='#2b2b2b')
+        col_der.grid(row=0, column=1, sticky='ns')
 
         # Preview + referencia
         f_visual = tk.Frame(col_izq, bg='#2b2b2b')
@@ -1422,7 +1448,7 @@ class HMISpirax:
     #  TORNO
     # ------------------------------------------------------------------
     def _construir_tab_torno(self):
-        cont = tk.Frame(self.tab_torno, bg='#2b2b2b')
+        cont = tk.Frame(self._hacer_scrollable(self.tab_torno), bg='#2b2b2b')
         cont.pack(fill='both', expand=True, padx=15, pady=10)
 
         # Header
