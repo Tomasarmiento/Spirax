@@ -74,6 +74,7 @@ DEFAULTS = {
     "macro_op": 550,          # OPERACION A MECANIZAR (10 o 20)
     "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
     "macro_fin": 553,         # FLAG fin de mecanizado
+    "macro_cola": 554,        # CANTIDAD de piezas en la cola (informativo)
     "polling_ms": 500,        # intervalo de polling de #553
     "persist_path": "cola_torno.json",
 }
@@ -174,6 +175,21 @@ class ColaTorno:
                 self._persistir()
                 return True
             return False
+
+    def recuperar_ultimo_op3(self):
+        """Cambia el op del ULTIMO item de la cola a 3 (dejar pasar sin
+        mecanizar). Se usa al retomar automatico cuando quedo un pallet
+        clampeado en el spot 2: ese pallet ya se proceso y encolo antes
+        del corte, es el ultimo de la cola, y hay que reciclarlo -> op=3.
+        Devuelve el item modificado, o None si la cola estaba vacia.
+        """
+        with self._lock:
+            if not self._cola:
+                return None
+            item = self._cola[-1]
+            item["op"] = 3
+            self._persistir()
+            return dict(item)
 
 
 # ======================================================================
@@ -507,6 +523,15 @@ class TornoFanuc:
         mac_op = self.config["macro_op"]
         mac_rosca = self.config["macro_rosca"]
         mac_fin = self.config["macro_fin"]
+        mac_cola = self.config["macro_cola"]
+
+        # Informar al torno cuantas piezas hay en la cola (#554).
+        # Solo se escribe cuando cambia, para no saturar FOCAS.
+        n_cola = len(self.cola)
+        if n_cola != getattr(self, "_ultima_cola_len", None):
+            with self._client_lock:
+                self._client.set_macro(mac_cola, n_cola)
+            self._ultima_cola_len = n_cola
 
         # 1. Chequear flag de fin (#553)
         with self._client_lock:
@@ -531,7 +556,10 @@ class TornoFanuc:
         # 2. Asegurarse que #551/#550/#552 reflejan el primero de la cola
         primero = self.cola.primero()
         if primero is None:
-            objetivo = (0, 0, 0)
+            # Cola vacia: dejar el torno en op=3 (no mecanizar, dejar pasar).
+            # Asi si la cinta sigue desfilando pallets sin evaluar (robot
+            # apagado), el torno no mecaniza nada con la macro vieja.
+            objetivo = (0, 3, 0)
         else:
             objetivo = (int(primero["tipo"]), int(primero["op"]),
                         int(primero.get("rosca", 0)))
@@ -542,9 +570,9 @@ class TornoFanuc:
                 self._client.set_macro(mac_op, objetivo[1])
                 self._client.set_macro(mac_rosca, objetivo[2])
             self._ultimo_escrito = objetivo
-            if objetivo == (0, 0, 0):
-                self.ultimo_evento = (f"[TORNO] Cola vacia -> "
-                                      f"#{mac_tipo}=0 #{mac_op}=0 #{mac_rosca}=0")
+            if objetivo == (0, 3, 0):
+                self.ultimo_evento = (f"[TORNO] Cola vacia -> op=3 (dejar pasar) "
+                                      f"#{mac_tipo}=0 #{mac_op}=3 #{mac_rosca}=0")
             else:
                 self.ultimo_evento = (f"[TORNO] Macros actualizadas: "
                                       f"#{mac_tipo}={objetivo[0]} "

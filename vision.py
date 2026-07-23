@@ -12,21 +12,24 @@ Estaciones validas:
     "cinta" -> analisis de orientacion (ARRIBA/ABAJO/VACIO)
     "mesa"  -> analisis de matriz 10x8 (ver mesa.py)
 
-Migracion: si existe modelos/tipoN/referencia.png al nivel viejo, se mueve
-automaticamente a modelos/tipoN/cinta/referencia.png al cargar.
-
 ------------------------------------------------------------------------
+SERIALIZACION DE CAMARAS (una sola a la vez):
+  Las dos D555 cuelgan del mismo switch y comparten UN solo cable a la PC.
+  Dos streams abiertos a la vez saturan ese enlace y una camara no recibe
+  frames ("Frame didn't arrive within..."). Para evitarlo:
+
+  - _CAMARA_GLOBAL_LOCK garantiza que solo UNA camara tenga el pipeline
+    abierto a la vez.
+  - En operacion (modo automatico), el metodo analizar_atomico() abre la
+    camara, captura, y la cierra en cada consulta. Como cinta y mesa nunca
+    disparan en el mismo instante, nunca compiten por el cable.
+------------------------------------------------------------------------
+
 NOTA D555 (camara por Ethernet/DDS):
   A diferencia de la D435 (USB), el D555 se descubre via DDS y NO aparece
   con el contexto por defecto de pyrealsense2. Por eso creamos el contexto
   con DDS habilitado (_crear_contexto_dds) y le damos unos segundos al
   discovery antes de arrancar el pipeline.
-
-  Ademas el orden de sensores cambia respecto a la D435:
-      D435 -> el sensor de color suele ser query_sensors()[1]
-      D555 -> sensor[0]=RGB Camera, sensor[1]=Stereo Module, sensor[2]=Motion
-  Por eso buscamos el sensor RGB por NOMBRE (_get_color_sensor), que es
-  robusto para cualquier modelo.
 
   IMPORTANTE: requiere Python 3.12 (pyrealsense2 no tiene wheel para 3.14).
 ------------------------------------------------------------------------
@@ -45,35 +48,17 @@ USAR_REALSENSE = True
 
 # ======================================================================
 #  RESOLUCION / FPS DEL STREAM DE COLOR (D555)
-# ----------------------------------------------------------------------
-#  El D555 NO soporta 640x480. Resoluciones validas (bgr8):
-#     1280x800 @ 30fps  <- maxima (16:10), la que usamos
-#     1280x720 @ 30fps
-#     896x504  @ 60fps
-#     640x360  @ 60fps  <- la mas liviana
-#  Si por la red ves frame drops o cuelgues en wait_for_frames, baja a
-#  1280x720 o 896x504. Tu recorte se guarda en %, asi que escala solo,
-#  PERO las referencia.png hay que recapturarlas si cambias resolucion.
 # ======================================================================
 CAM_WIDTH = 1280
 CAM_HEIGHT = 800
 CAM_FPS = 30
 
 MODELOS_DIR = "modelos"
-# 12 modelos: 1-6 aluminio, 7-12 fundicion (N+6 = version fundicion de la forma N)
 TIPOS_VALIDOS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 ESTACIONES_VALIDAS = ("cinta", "mesa")
 
 # ======================================================================
 #  SERIALES DE LAS CAMARAS POR ESTACION
-# ----------------------------------------------------------------------
-#  Cada D555 tiene un serial unico e inmutable (de fabrica). Lo usamos
-#  para que cada estacion abra SIEMPRE su camara fisica, sin importar
-#  orden de encendido, puerto o IP. Para obtenerlos, corre el script
-#  listar_seriales.py con las dos camaras conectadas.
-#
-#  Si dejas un serial en None, esa estacion abre la primera camara que
-#  el discovery encuentre (comportamiento viejo, solo util con 1 camara).
 # ======================================================================
 SERIAL_POR_ESTACION = {
     "cinta": "261422303633",
@@ -81,44 +66,38 @@ SERIAL_POR_ESTACION = {
 }
 BG_DIFF_THRESH_DEFAULT = 40
 
-# Grilla overlay para visualizar en modo_recorte (solo mesa)
 GRILLA_FILAS_OVERLAY = 8
 GRILLA_COLS_OVERLAY = 10
 
 # ======================================================================
 #  CONFIG DDS / DESCUBRIMIENTO DEL D555
-# ----------------------------------------------------------------------
-#  Settings JSON para habilitar DDS en el contexto de pyrealsense2.
-#  domain 0 es el default; cambialo solo si configuraste otro dominio
-#  DDS en la camara via rs-dds-config.
 # ======================================================================
 DDS_SETTINGS = '{"dds": {"enabled": true, "domain": 0}}'
-# Segundos a esperar para que el discovery DDS encuentre la camara antes
-# de arrancar el pipeline. El descubrimiento por red NO es instantaneo
-# como el USB.
 DDS_DISCOVERY_WAIT_S = 5.0
-# Reintentos de query_devices durante la espera de discovery.
 DDS_DISCOVERY_REINTENTOS = 10
 
-# Frames a descartar al arrancar el stream (estabilizacion de exposicion).
-# Antes era 60 (2s a 30fps), lo bajamos para que el arranque sea mas agil.
 FRAMES_WARMUP = 20
-# Timeout (ms) para el PRIMER frame al arrancar por red. La negociacion
-# inicial DDS del D555 puede tardar mas que el default de 5000ms, asi que
-# le damos margen para no tirar "Frame didn't arrive within 5000".
 PRIMER_FRAME_TIMEOUT_MS = 15000
 
 
 _CTX_DDS_COMPARTIDO = None
 _CTX_DDS_LOCK = threading.Lock()
 
+# ======================================================================
+#  LOCK GLOBAL DE CAMARA
+# ----------------------------------------------------------------------
+#  Con un unico cable al switch, dos pipelines abiertos a la vez saturan
+#  el enlace y una camara no recibe frames. Este lock garantiza que UNA
+#  sola camara este abierta (entre start() y stop()) a la vez.
+#
+#  Regla: start() lo ADQUIERE, stop() lo LIBERA. Como cada estacion abre
+#  y cierra su camara para cada consulta (analizar_atomico), nunca hay
+#  dos streams compitiendo por el cable.
+# ======================================================================
+_CAMARA_GLOBAL_LOCK = threading.Lock()
+
 
 def _crear_contexto_dds():
-    """Crea un rs.context con DDS habilitado (necesario para el D555).
-
-    Si la build de pyrealsense2 no soporta el constructor con settings
-    (poco probable en 2.57+), cae al contexto por defecto.
-    """
     import pyrealsense2 as rs
     try:
         return rs.context(DDS_SETTINGS)
@@ -129,14 +108,6 @@ def _crear_contexto_dds():
 
 
 def obtener_contexto_dds():
-    """Devuelve un UNICO contexto DDS compartido por todos los detectores.
-
-    Con varias camaras D555, crear un contexto DDS por detector hace que
-    el discovery sea fragil (cada contexto puede ver solo un subconjunto
-    de las camaras). Un unico contexto compartido descubre TODAS las
-    camaras de forma confiable, y cada detector abre su pipeline filtrando
-    por serial sobre ese mismo contexto.
-    """
     global _CTX_DDS_COMPARTIDO
     with _CTX_DDS_LOCK:
         if _CTX_DDS_COMPARTIDO is None:
@@ -147,15 +118,6 @@ def obtener_contexto_dds():
 def _esperar_discovery(ctx, timeout_s=DDS_DISCOVERY_WAIT_S,
                        reintentos=DDS_DISCOVERY_REINTENTOS,
                        serial=None):
-    """Espera a que el discovery DDS encuentre dispositivos.
-
-    Si 'serial' es None, espera a encontrar al menos un dispositivo.
-    Si se pasa 'serial', espera hasta que ESE serial aparezca (o timeout),
-    asi no falla por timing cuando una camara tarda mas que otra en
-    anunciarse por la red.
-
-    Devuelve la lista de devices encontrada.
-    """
     import pyrealsense2 as rs
 
     def _tiene_objetivo(devs):
@@ -182,16 +144,8 @@ def _esperar_discovery(ctx, timeout_s=DDS_DISCOVERY_WAIT_S,
 
 
 def _get_color_sensor(device):
-    """Devuelve el sensor 'RGB Camera' del device, robusto al modelo.
-
-    D435 -> color suele ser query_sensors()[1]
-    D555 -> sensor[0] = RGB Camera
-
-    Buscamos por nombre. Si no lo encontramos, caemos a [0] y luego [1].
-    """
     import pyrealsense2 as rs
     sensores = device.query_sensors()
-    # Buscar por nombre exacto
     for s in sensores:
         try:
             nombre = s.get_info(rs.camera_info.name)
@@ -199,7 +153,6 @@ def _get_color_sensor(device):
             nombre = ""
         if nombre == "RGB Camera":
             return s
-    # Fallback: cualquier sensor cuyo nombre contenga "RGB" o "Color"
     for s in sensores:
         try:
             nombre = s.get_info(rs.camera_info.name).lower()
@@ -207,18 +160,12 @@ def _get_color_sensor(device):
             nombre = ""
         if "rgb" in nombre or "color" in nombre:
             return s
-    # Ultimo recurso: indice 0
     if sensores:
         return sensores[0]
     raise RuntimeError("El dispositivo no expone sensores.")
 
 
 def _set_option_seguro(sensor, opcion, valor):
-    """set_option que no revienta si la opcion no existe en el sensor.
-
-    El D555 puede no soportar todas las opciones que tenia la D435
-    (p.ej. saturation o power_line_frequency en ciertos firmwares).
-    """
     import pyrealsense2 as rs
     try:
         if sensor.supports(opcion):
@@ -231,34 +178,11 @@ def _set_option_seguro(sensor, opcion, valor):
 
 # ======================================================================
 #  Orientacion global de camara (rotacion + flip horizontal)
-# ----------------------------------------------------------------------
-#  La camara esta montada fisicamente rotada y/o espejada respecto a
-#  la mesa. Aplicamos la transformacion APENAS se captura el frame,
-#  antes del ROI, para que todo el pipeline (display + ROI + grilla
-#  fila/columna) quede consistente.
-#
-#  Orden de operaciones: ROTACION -> FLIP HORIZONTAL.
-#
-#  k = cantidad de rotaciones 90 grados horario desde el raw.
-#     0 -> sin rotacion
-#     1 -> 90 CW
-#     2 -> 180
-#     3 -> 270 CW (= 90 CCW)
-#
-#  flip_h = espejo horizontal (left-right) aplicado DESPUES de la rotacion.
-#     False -> sin espejo
-#     True  -> invierte el eje X (mesa col 1 cae donde antes caia col N)
-#
-#  Persistencia: vision_rotacion.json en el cwd.
-#  El nombre del archivo se mantiene por compatibilidad — guarda
-#  ambos parametros: {"k": 0, "flip_h": false}.
 # ======================================================================
 
 ROT_CONFIG_PATH = "vision_rotacion.json"
 
-# Cache de orientacion POR ESTACION. Cada camara esta montada distinto, asi
-# que cinta y mesa tienen su propia rotacion/flip/espejo independientes.
-# Se inicializa lazy. Acceso protegido por _ROT_LOCK.
+
 def _rot_default():
     return {"k": 0, "flip_h": False, "espejo_col_salida": False}
 
@@ -268,16 +192,6 @@ _ROT_LOCK = threading.Lock()
 
 
 def _ensure_orientacion_loaded():
-    """Carga del JSON al cache si todavia no se cargo. Asume lock tomado.
-
-    Formato nuevo (por estacion):
-        {"cinta": {"k":..,"flip_h":..,"espejo_col_salida":..},
-         "mesa":  {...}}
-    Formato viejo (plano, una sola orientacion):
-        {"k":..,"flip_h":..,"espejo_col_salida":..}
-    Si encuentra el formato viejo, lo usa como valor inicial de AMBAS
-    estaciones (migracion automatica) y reescribe en formato nuevo.
-    """
     global _ROT_LOADED
     if _ROT_LOADED:
         return
@@ -287,7 +201,6 @@ def _ensure_orientacion_loaded():
                 data = json.load(f)
 
             if "cinta" in data or "mesa" in data:
-                # Formato nuevo
                 for est in ("cinta", "mesa"):
                     sec = data.get(est, {})
                     _ROT_CACHE[est]["k"] = int(sec.get("k", 0)) % 4
@@ -295,7 +208,6 @@ def _ensure_orientacion_loaded():
                     _ROT_CACHE[est]["espejo_col_salida"] = bool(
                         sec.get("espejo_col_salida", False))
             else:
-                # Formato viejo plano -> migrar a ambas estaciones
                 k = int(data.get("k", 0)) % 4
                 flip = bool(data.get("flip_h", False))
                 esp = bool(data.get("espejo_col_salida", False))
@@ -313,7 +225,6 @@ def _ensure_orientacion_loaded():
 
 
 def _persistir_orientacion():
-    """Escribe el cache actual al JSON (formato por estacion). Asume lock."""
     try:
         with open(ROT_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump({
@@ -329,7 +240,6 @@ def _est_valida_rot(estacion):
 
 
 def cargar_rotacion(estacion="cinta"):
-    """Devuelve la rotacion (0/1/2/3) de la estacion. Carga del JSON la 1ra vez."""
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
@@ -337,7 +247,6 @@ def cargar_rotacion(estacion="cinta"):
 
 
 def guardar_rotacion(k, estacion="cinta"):
-    """Persiste la rotacion (0/1/2/3) de la estacion y actualiza el cache."""
     k = int(k) % 4
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
@@ -348,7 +257,6 @@ def guardar_rotacion(k, estacion="cinta"):
 
 
 def cargar_flip_h(estacion="cinta"):
-    """Devuelve si el flip horizontal esta activo (bool) en la estacion."""
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
@@ -356,7 +264,6 @@ def cargar_flip_h(estacion="cinta"):
 
 
 def guardar_flip_h(flip, estacion="cinta"):
-    """Persiste el flip horizontal (bool) de la estacion y actualiza cache."""
     flip = bool(flip)
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
@@ -367,12 +274,6 @@ def guardar_flip_h(flip, estacion="cinta"):
 
 
 def cargar_espejo_col_salida(estacion="cinta"):
-    """Devuelve si el espejo de columna en la SALIDA esta activo (bool).
-
-    No toca la imagen ni la deteccion interna: solo invierte el numero de
-    columna ANTES de mandarlo al robot. Util cuando la convencion fisica
-    del robot (col 1 a la izq) esta espejada respecto a lo que la camara ve.
-    """
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
         _ensure_orientacion_loaded()
@@ -380,7 +281,6 @@ def cargar_espejo_col_salida(estacion="cinta"):
 
 
 def guardar_espejo_col_salida(espejo, estacion="cinta"):
-    """Persiste el espejo de columna de salida (bool) de la estacion."""
     espejo = bool(espejo)
     estacion = _est_valida_rot(estacion)
     with _ROT_LOCK:
@@ -390,7 +290,6 @@ def guardar_espejo_col_salida(espejo, estacion="cinta"):
     return espejo
 
 
-# Mapeo k -> codigo cv2 para rotaciones rapidas (sin remapeo bilineal).
 _ROT_CV2 = {
     1: cv2.ROTATE_90_CLOCKWISE,
     2: cv2.ROTATE_180,
@@ -399,7 +298,6 @@ _ROT_CV2 = {
 
 
 def aplicar_rotacion(frame, k=None, estacion="cinta"):
-    """Rota el frame segun k. Si k es None usa la rotacion persistida de la estacion."""
     if frame is None:
         return frame
     if k is None:
@@ -411,22 +309,16 @@ def aplicar_rotacion(frame, k=None, estacion="cinta"):
 
 
 def aplicar_flip_h(frame, flip=None, estacion="cinta"):
-    """Aplica espejo horizontal. Si flip es None usa el persistido de la estacion."""
     if frame is None:
         return frame
     if flip is None:
         flip = cargar_flip_h(estacion)
     if not flip:
         return frame
-    return cv2.flip(frame, 1)  # 1 = flip horizontal (eje Y como eje de espejo)
+    return cv2.flip(frame, 1)
 
 
 def aplicar_orientacion(frame, estacion="cinta"):
-    """Aplica rotacion + flip persistidos de la ESTACION. Punto unico de transformacion.
-
-    Llamar apenas se captura el frame, antes de cualquier procesamiento.
-    Orden: rotacion primero, flip despues.
-    """
     frame = aplicar_rotacion(frame, estacion=estacion)
     frame = aplicar_flip_h(frame, estacion=estacion)
     return frame
@@ -437,7 +329,6 @@ def aplicar_orientacion(frame, estacion="cinta"):
 # ======================================================================
 
 def carpeta_tipo(tipo):
-    """Devuelve la ruta a la carpeta base del tipo. La crea si no existe."""
     if tipo not in TIPOS_VALIDOS:
         raise ValueError(f"Tipo invalido: {tipo}. Validos: {TIPOS_VALIDOS}")
     ruta = os.path.join(MODELOS_DIR, f"tipo{tipo}")
@@ -446,25 +337,17 @@ def carpeta_tipo(tipo):
 
 
 def carpeta_estacion(tipo, estacion):
-    """Devuelve la ruta a modelos/tipoN/<estacion>/. La crea si no existe."""
     if estacion not in ESTACIONES_VALIDAS:
         raise ValueError(f"Estacion invalida: {estacion}. Validas: {ESTACIONES_VALIDAS}")
     base = carpeta_tipo(tipo)
     ruta = os.path.join(base, estacion)
     os.makedirs(ruta, exist_ok=True)
-
-    # Migracion: si hay archivos viejos al nivel base (modelos/tipoN/
-    # referencia.png o config.json), moverlos a cinta/ una sola vez
     if estacion == "cinta":
         _migrar_archivos_viejos(base, ruta)
-
     return ruta
 
 
 def _migrar_archivos_viejos(base, destino_cinta):
-    """Mueve archivos viejos modelos/tipoN/{referencia.png,config.json}
-    a modelos/tipoN/cinta/ si no existen ya en destino.
-    """
     for nombre in ("referencia.png", "config.json"):
         viejo = os.path.join(base, nombre)
         nuevo = os.path.join(destino_cinta, nombre)
@@ -493,7 +376,6 @@ def tiene_config(tipo, estacion="cinta"):
 
 
 def cargar_config(tipo, estacion="cinta"):
-    """Carga la config del tipo+estacion. Si no existe, devuelve defaults."""
     cfg_path = path_config(tipo, estacion)
     if os.path.exists(cfg_path):
         with open(cfg_path, "r") as f:
@@ -507,16 +389,10 @@ def cargar_config(tipo, estacion="cinta"):
         cfg.setdefault("saturation", 50)
         cfg.setdefault("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT)
         cfg.setdefault("umbral_ocupacion", 0.15)
-        # Grilla interna de la mesa: 9 verticales y 7 horizontales, en
-        # porcentaje (0-1) dentro del cuadrilatero del recorte. Defaults
-        # uniformes (1/10, 2/10, ... y 1/8, 2/8, ...).
         cfg.setdefault("grid_x", [i / GRILLA_COLS_OVERLAY
                                    for i in range(1, GRILLA_COLS_OVERLAY)])
         cfg.setdefault("grid_y", [i / GRILLA_FILAS_OVERLAY
                                    for i in range(1, GRILLA_FILAS_OVERLAY)])
-        # Margen interno por celda (0.0 a 0.4). 0 = se analiza la celda
-        # entera, 0.25 = se ignora el 25% de cada borde (queda el 50%
-        # central).
         cfg.setdefault("margen_celda", 0.0)
         return cfg
     return {
@@ -551,7 +427,6 @@ def guardar_config(tipo, config, estacion="cinta"):
 def capturar_realsense(exposure=10, gain=60, saturation=50, serial=None):
     import pyrealsense2 as rs
 
-    # --- D555: contexto DDS COMPARTIDO + espera de discovery ---
     ctx = obtener_contexto_dds()
     devices = _esperar_discovery(ctx, serial=serial)
     if len(devices) == 0:
@@ -568,10 +443,8 @@ def capturar_realsense(exposure=10, gain=60, saturation=50, serial=None):
                          rs.format.bgr8, CAM_FPS)
     profile = pipeline.start(config)
 
-    # D555: el sensor de color es 'RGB Camera' (NO el indice [1] como D435)
     sensor = _get_color_sensor(profile.get_device())
     _set_option_seguro(sensor, rs.option.enable_auto_exposure, 0)
-    # 50 Hz para evitar flicker (1=50Hz Arg/Europa, 2=60Hz USA)
     _set_option_seguro(sensor, rs.option.power_line_frequency, 1)
     _set_option_seguro(sensor, rs.option.exposure, exposure)
     _set_option_seguro(sensor, rs.option.gain, gain)
@@ -579,7 +452,6 @@ def capturar_realsense(exposure=10, gain=60, saturation=50, serial=None):
 
     print("[CAM] RealSense D555 capturando...")
     try:
-        # Primer frame con timeout generoso (negociacion DDS inicial).
         pipeline.wait_for_frames(PRIMER_FRAME_TIMEOUT_MS)
         for _ in range(FRAMES_WARMUP):
             pipeline.wait_for_frames()
@@ -606,7 +478,6 @@ def capturar_webcam(dispositivo=0):
 
 
 def capturar(tipo=1, estacion="cinta"):
-    """Captura una imagen usando los parametros del tipo+estacion."""
     cfg = cargar_config(tipo, estacion)
     if USAR_REALSENSE:
         frame = capturar_realsense(
@@ -616,7 +487,6 @@ def capturar(tipo=1, estacion="cinta"):
         )
     else:
         frame = capturar_webcam()
-    # Misma transformacion que el Detector: consistencia total.
     return aplicar_orientacion(frame, estacion=estacion)
 
 
@@ -625,17 +495,10 @@ def capturar(tipo=1, estacion="cinta"):
 # ======================================================================
 
 def preparar_roi(imagen, config):
-    """Aplica el recorte configurado y devuelve el ROI en gris + blur.
-
-    Si la config tiene 'esquinas' (4 puntos), hace transformacion de
-    perspectiva para convertir el cuadrilatero en rectangulo recto.
-    Si no, usa el recorte rectangular tradicional con corte_*_pct.
-    """
     h_orig, w_orig = imagen.shape[:2]
 
     esquinas_cfg = config.get("esquinas")
     if esquinas_cfg is not None:
-        # Modo nuevo: warp perspective
         sup_izq = (esquinas_cfg["sup_izq"][0] * w_orig,
                    esquinas_cfg["sup_izq"][1] * h_orig)
         sup_der = (esquinas_cfg["sup_der"][0] * w_orig,
@@ -645,7 +508,6 @@ def preparar_roi(imagen, config):
         inf_izq = (esquinas_cfg["inf_izq"][0] * w_orig,
                    esquinas_cfg["inf_izq"][1] * h_orig)
 
-        # Tamano del rectangulo destino: promedio de los lados opuestos
         ancho_sup = ((sup_der[0] - sup_izq[0]) ** 2 +
                      (sup_der[1] - sup_izq[1]) ** 2) ** 0.5
         ancho_inf = ((inf_der[0] - inf_izq[0]) ** 2 +
@@ -659,7 +521,6 @@ def preparar_roi(imagen, config):
         alto_destino = int(max(alto_izq, alto_der))
 
         if ancho_destino < 10 or alto_destino < 10:
-            # Esquinas degeneradas, caer al recorte rectangular
             return _preparar_roi_legacy(imagen, config)
 
         pts_src = np.float32([sup_izq, sup_der, inf_der, inf_izq])
@@ -675,12 +536,10 @@ def preparar_roi(imagen, config):
         blur = cv2.GaussianBlur(gris, (7, 7), 0)
         return roi_color, blur
 
-    # Modo legacy: rectangulo recto
     return _preparar_roi_legacy(imagen, config)
 
 
 def _preparar_roi_legacy(imagen, config):
-    """Recorte rectangular tradicional (compatibilidad)."""
     h_orig, w_orig = imagen.shape[:2]
     corte_y_top = int(h_orig * config.get("corte_y_top_pct", 0.0))
     corte_y_bot = int(h_orig * config.get("corte_y_pct", 1.0))
@@ -693,51 +552,30 @@ def _preparar_roi_legacy(imagen, config):
 
 
 # ======================================================================
-#  RECORTE INTERACTIVO
+#  RECORTE INTERACTIVO  (sin cambios de logica)
 # ======================================================================
 
 def modo_recorte(imagen, tipo, estacion="cinta"):
-    """Permite ajustar el recorte como cuadrilatero de 4 esquinas.
-
-    Controles:
-      - Click + drag sobre una esquina (puntos amarillos): mueve esa esquina
-      - Click + drag sobre una linea EXTERNA: mueve esa linea
-      - Click + drag sobre una linea INTERNA (solo mesa): mueve esa linea
-      - Shift + click + drag: mueve TODO el cuadrilatero
-      - Ctrl + click + drag: ROTA todo alrededor del centro
-      - Tecla R: resetea al recorte original (rectangulo lleno)
-      - Tecla G (solo mesa): toggle ver/ocultar grilla interna
-      - Tecla D (solo mesa): reset grilla interna a posiciones uniformes
-      - Tecla S: guarda
-      - Tecla Q / ESC: cancela
-
-    Compatibilidad con versiones viejas: si la config solo tiene los 4
-    porcentajes (corte_y_top_pct etc.), se construyen las 4 esquinas como
-    rectangulo recto. Cuando se guarda, se guardan AMBOS formatos.
-    """
     config = cargar_config(tipo, estacion)
     h, w = imagen.shape[:2]
 
-    # Cargar esquinas. Si no existen, construirlas desde el recorte legacy.
     esquinas_cfg = config.get("esquinas")
     if esquinas_cfg is None:
         y_top = config.get("corte_y_top_pct", 0.0) * h
         y_bot = config.get("corte_y_pct", 1.0) * h
         x_izq = config.get("corte_x_izq_pct", 0.0) * w
         x_der = config.get("corte_x_der_pct", 1.0) * w
-        # Margenes minimos
         if y_top < 5: y_top = 5
         if y_bot > h - 5: y_bot = h - 5
         if x_izq < 5: x_izq = 5
         if x_der > w - 5: x_der = w - 5
         esquinas = [
-            [x_izq, y_top],   # 0 = sup_izq
-            [x_der, y_top],   # 1 = sup_der
-            [x_der, y_bot],   # 2 = inf_der
-            [x_izq, y_bot],   # 3 = inf_izq
+            [x_izq, y_top],
+            [x_der, y_top],
+            [x_der, y_bot],
+            [x_izq, y_bot],
         ]
     else:
-        # Esquinas guardadas en porcentaje
         esquinas = [
             [esquinas_cfg["sup_izq"][0] * w, esquinas_cfg["sup_izq"][1] * h],
             [esquinas_cfg["sup_der"][0] * w, esquinas_cfg["sup_der"][1] * h],
@@ -745,11 +583,8 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
             [esquinas_cfg["inf_izq"][0] * w, esquinas_cfg["inf_izq"][1] * h],
         ]
 
-    # Snapshot original para reset
     esquinas_orig = [list(p) for p in esquinas]
 
-    # Grilla interna (solo mesa). Cargada como lista de porcentajes
-    # dentro del cuadrilatero. Los defaults son uniformes.
     es_mesa = (estacion == "mesa")
     if es_mesa:
         grid_x = list(config.get(
@@ -758,7 +593,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
         grid_y = list(config.get(
             "grid_y",
             [i / GRILLA_FILAS_OVERLAY for i in range(1, GRILLA_FILAS_OVERLAY)]))
-        # Asegurar longitudes correctas (por si la config esta corrupta)
         if len(grid_x) != GRILLA_COLS_OVERLAY - 1:
             grid_x = [i / GRILLA_COLS_OVERLAY
                       for i in range(1, GRILLA_COLS_OVERLAY)]
@@ -769,11 +603,9 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
         grid_x = []
         grid_y = []
 
-    # Estado de interaccion
     estado = {
-        "modo": None,            # 'esquina', 'linea', 'linea_int_v',
-                                 # 'linea_int_h', 'mover_todo', 'rotar'
-        "indice": None,          # indice del elemento agarrado
+        "modo": None,
+        "indice": None,
         "last_x": 0,
         "last_y": 0,
         "shift": False,
@@ -805,12 +637,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
         return cx, cy
 
     def lineas_internas_segmentos():
-        """Devuelve dos listas de segmentos para las lineas internas.
-
-        verticales: lista de ((x_top, y_top), (x_bot, y_bot)) para cada
-                    grid_x. Va de borde superior a borde inferior del cuad.
-        horizontales: idem con grid_y, va de borde izq a borde der.
-        """
         verticales = []
         for t in grid_x:
             p_top = (esquinas[0][0] + (esquinas[1][0] - esquinas[0][0]) * t,
@@ -828,10 +654,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
         return verticales, horizontales
 
     def xy_a_uv(x, y):
-        """Mapea un punto (x,y) en pixels al sistema (u,v) del cuadrilatero
-        donde u=0 es lado izq, u=1 es lado der, v=0 es lado sup, v=1 inf.
-        Robusto a rotacion y perspectiva.
-        """
         src = np.array([esquinas[0], esquinas[1],
                         esquinas[2], esquinas[3]], dtype=np.float32)
         dst = np.array([[0.0, 0.0], [1.0, 0.0],
@@ -845,7 +667,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
         return float(res[0][0][0]), float(res[0][0][1])
 
     def on_mouse(event, x, y, flags, param):
-        # Detectar Shift/Ctrl en el momento del click
         shift = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
         ctrl = bool(flags & cv2.EVENT_FLAG_CTRLKEY)
 
@@ -864,7 +685,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                 estado["indice"] = None
                 return
 
-            # Buscar esquina cercana (mayor prioridad)
             tol_esquina = 18
             mejor_i = None
             mejor_d = tol_esquina
@@ -878,7 +698,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                 estado["indice"] = mejor_i
                 return
 
-            # Buscar linea EXTERNA cercana
             tol_linea = 12
             mejor_l = None
             mejor_dl = tol_linea
@@ -890,9 +709,8 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                     mejor_dl = d
                     mejor_l = i
 
-            # Buscar linea INTERNA cercana (solo mesa con grilla visible)
             mejor_iv = None
-            mejor_div = 10  # tolerancia para internas
+            mejor_div = 10
             mejor_ih = None
             mejor_dih = 10
             if es_mesa and estado["show_grid"]:
@@ -908,7 +726,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                         mejor_dih = d
                         mejor_ih = i
 
-            # Elegir el match mas cercano entre las tres opciones
             opciones = []
             if mejor_l is not None:
                 opciones.append(("linea", mejor_l, mejor_dl))
@@ -924,7 +741,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                 estado["indice"] = idx_
                 return
 
-            # Nada agarrado
             estado["modo"] = None
             estado["indice"] = None
 
@@ -943,7 +759,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
 
             elif estado["modo"] == "linea":
                 i = estado["indice"]
-                # Mover los dos extremos de la linea
                 a_i = i
                 b_i = (i + 1) % 4
                 for idx in (a_i, b_i):
@@ -951,8 +766,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                     esquinas[idx][1] = max(0, min(h - 1, esquinas[idx][1] + dy))
 
             elif estado["modo"] == "linea_int_v":
-                # Arrastrar linea interna vertical: el nuevo grid_x es la
-                # coordenada u del puntero dentro del cuadrilatero.
                 i = estado["indice"]
                 u, _v = xy_a_uv(x, y)
                 if u is not None:
@@ -979,7 +792,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
 
             elif estado["modo"] == "rotar":
                 cx, cy = centro_actual()
-                # Calcular angulo entre punto anterior y nuevo respecto al centro
                 import math
                 ang_prev = math.atan2(estado["last_y"] - dy - cy,
                                        estado["last_x"] - dx - cx)
@@ -1008,26 +820,19 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
     while True:
         debug = imagen.copy()
 
-        # Crear mascara del cuadrilatero para oscurecer afuera
         mask_full = np.zeros((h, w), dtype=np.uint8)
         pts_int = np.array([[int(p[0]), int(p[1])] for p in esquinas],
                             dtype=np.int32)
         cv2.fillPoly(mask_full, [pts_int], 255)
 
-        # Oscurecer afuera
         overlay = debug.copy()
         overlay[mask_full == 0] = (overlay[mask_full == 0] * 0.4).astype(np.uint8)
         debug = overlay
 
-        # Dibujar contorno del cuadrilatero
         cv2.polylines(debug, [pts_int], True, (0, 255, 255), 2)
 
-        # Dibujar grilla 10x8 si es mesa y show_grid esta activo
         if es_mesa and estado["show_grid"]:
             verticales, horizontales = lineas_internas_segmentos()
-
-            # Si estoy arrastrando una linea interna, resalto esa en cian
-            # vivo y las demas en color habitual.
             modo_act = estado["modo"]
             idx_act = estado["indice"]
 
@@ -1052,8 +857,7 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                          (int(p_der[0]), int(p_der[1])),
                          color, grosor)
 
-        # Dibujar esquinas como puntitos amarillos
-        labels = ["SI", "SD", "ID", "II"]  # sup-izq, sup-der, inf-der, inf-izq
+        labels = ["SI", "SD", "ID", "II"]
         for i, p in enumerate(esquinas):
             cv2.circle(debug, (int(p[0]), int(p[1])), 8, (0, 255, 255), -1)
             cv2.circle(debug, (int(p[0]), int(p[1])), 9, (0, 0, 0), 1)
@@ -1061,7 +865,6 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                         (int(p[0]) + 12, int(p[1]) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
-        # Texto de ayuda
         if es_mesa:
             ayuda_top = (f"Tipo {tipo} (MESA) | Drag esquina/linea ext/linea int"
                          " | Shift=mover Ctrl=rotar")
@@ -1071,18 +874,15 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
             ayuda_top = (f"Tipo {tipo} (CINTA) | Drag esquina/linea"
                          " | Shift=mover Ctrl=rotar")
             ayuda_bot = "R=reset  S=guardar  Q=salir"
-        cv2.putText(debug, ayuda_top,
-                    (10, 22),
+        cv2.putText(debug, ayuda_top, (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        cv2.putText(debug, ayuda_bot,
-                    (10, h - 15),
+        cv2.putText(debug, ayuda_bot, (10, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         cv2.imshow(win, debug)
         key = cv2.waitKey(30) & 0xFF
 
         if key == ord('s'):
-            # Guardar las 4 esquinas en porcentaje
             config["esquinas"] = {
                 "sup_izq": [round(esquinas[0][0] / w, 4),
                              round(esquinas[0][1] / h, 4)],
@@ -1093,16 +893,12 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
                 "inf_izq": [round(esquinas[3][0] / w, 4),
                              round(esquinas[3][1] / h, 4)],
             }
-            # Mantener compatibilidad: tambien actualizar el bounding box
-            # rectangular como aproximacion para codigo viejo que aun lea
-            # los corte_*_pct.
             xs = [p[0] for p in esquinas]
             ys = [p[1] for p in esquinas]
             config["corte_y_top_pct"] = round(min(ys) / h, 4)
             config["corte_y_pct"] = round(max(ys) / h, 4)
             config["corte_x_izq_pct"] = round(min(xs) / w, 4)
             config["corte_x_der_pct"] = round(max(xs) / w, 4)
-            # Guardar grilla interna (solo si es mesa)
             if es_mesa:
                 config["grid_x"] = [round(v, 4) for v in grid_x]
                 config["grid_y"] = [round(v, 4) for v in grid_y]
@@ -1111,18 +907,14 @@ def modo_recorte(imagen, tipo, estacion="cinta"):
             return True
 
         elif key == ord('r'):
-            # Reset esquinas al original. La grilla interna NO se toca
-            # (usar D para eso).
             for i in range(4):
                 esquinas[i][0] = esquinas_orig[i][0]
                 esquinas[i][1] = esquinas_orig[i][1]
 
         elif key == ord('g') and es_mesa:
-            # Toggle visibilidad de la grilla interna
             estado["show_grid"] = not estado["show_grid"]
 
         elif key == ord('d') and es_mesa:
-            # Reset grilla interna a posiciones uniformes
             for i in range(GRILLA_COLS_OVERLAY - 1):
                 grid_x[i] = (i + 1) / GRILLA_COLS_OVERLAY
             for i in range(GRILLA_FILAS_OVERLAY - 1):
@@ -1236,7 +1028,6 @@ def panel_debug(roi_color, mask, contorno, bbox, ratio, decision, nombre,
                 fila_max=None, fila_min=None):
     h, w = roi_color.shape[:2]
     if mask is None:
-        # Imagen con franja arriba
         franja = np.full((45, w, 3), (60, 60, 60), dtype=np.uint8)
         cv2.putText(franja, f"{nombre}: N/A", (10, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -1269,7 +1060,6 @@ def panel_debug(roi_color, mask, contorno, bbox, ratio, decision, nombre,
                "N/A": (128, 128, 128)}
     color = colores.get(decision, (255, 255, 255))
 
-    # Franja arriba SEPARADA de la imagen (no la tapa)
     franja = np.full((45, w, 3), color, dtype=np.uint8)
     cv2.putText(franja, f"{nombre}: {decision}", (10, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
@@ -1281,8 +1071,6 @@ def panel_debug(roi_color, mask, contorno, bbox, ratio, decision, nombre,
 
 
 def analizar_imagen(imagen, referencia_blur, config, diff_thresh=None):
-    """Pipeline completo de orientacion (cinta) sobre una imagen ya
-    capturada."""
     if diff_thresh is None:
         diff_thresh = config.get("bg_diff_thresh", BG_DIFF_THRESH_DEFAULT)
     roi_color, blur = preparar_roi(imagen, config)
@@ -1298,29 +1086,33 @@ def analizar_imagen(imagen, referencia_blur, config, diff_thresh=None):
 
 
 # ======================================================================
-#  CLASE PARA USO DESDE LA HMI (camara persistente)
+#  CLASE PARA USO DESDE LA HMI
 # ======================================================================
 
 class DetectorOrientacion:
-    """Mantiene la camara abierta y permite analizar bajo demanda.
+    """Detector de una estacion. Puede usarse de dos formas:
 
-    Multi-modelo, multi-estacion: usa_tipo(N, "cinta"|"mesa") hace que
-    las siguientes capturas/analisis usen la referencia y config
-    del Tipo N + Estacion.
+    1) start() ... analizar()/capturar_frame() ... stop()  (preview)
+    2) analizar_atomico()  -> abre, captura, cierra en una sola llamada.
+
+    En OPERACION (modo automatico) SIEMPRE se usa analizar_atomico(), que
+    toma el lock global de camara, abre el pipeline, captura, lo cierra y
+    libera el lock. Asi nunca hay dos camaras abiertas peleando por el
+    unico cable al switch.
     """
 
     def __init__(self, tipo_inicial=1, estacion_inicial="cinta", serial=None):
         self._pipeline = None
-        self._ctx = None          # D555: contexto DDS persistente
+        self._ctx = None
         self._sensor = None
         self._lock = threading.Lock()
         self._activo = False
+        # True si ESTE detector tiene tomado el lock global (para soltarlo
+        # en el stop() correspondiente sin doble-release).
+        self._tengo_lock_global = False
 
         self._tipo = tipo_inicial
         self._estacion = estacion_inicial
-        # Serial de la camara fisica de este detector. Si no se pasa uno
-        # explicito, se resuelve por estacion desde SERIAL_POR_ESTACION.
-        # None => abre la primera camara que aparezca (modo 1 camara).
         if serial is None:
             serial = SERIAL_POR_ESTACION.get(estacion_inicial)
         self._serial = serial
@@ -1330,7 +1122,6 @@ class DetectorOrientacion:
     # ---------- API ----------
 
     def usa_tipo(self, tipo, estacion=None):
-        """Cambia tipo y/o estacion activa. Recarga config y referencia."""
         if tipo not in TIPOS_VALIDOS:
             raise ValueError(f"Tipo invalido: {tipo}")
         if estacion is not None and estacion not in ESTACIONES_VALIDAS:
@@ -1339,21 +1130,11 @@ class DetectorOrientacion:
         with self._lock:
             self._tipo = tipo
             if estacion is not None and estacion != self._estacion:
-                # Cambio de estacion => cambia la camara fisica asociada.
-                # No se puede hacer en caliente: si la camara esta abierta
-                # habria que cerrar este pipeline y abrir el de la otra
-                # camara. En este sistema cada estacion tiene su propio
-                # detector, asi que cambiar de estacion con la camara activa
-                # es un error de uso.
                 if self._activo:
                     raise RuntimeError(
                         f"No se puede cambiar de estacion ({self._estacion} "
-                        f"-> {estacion}) con la camara abierta. Cada estacion "
-                        f"usa su propia camara/detector.")
+                        f"-> {estacion}) con la camara abierta.")
                 self._estacion = estacion
-                # Reasignar serial al de la nueva estacion (salvo que este
-                # detector haya sido creado con un serial explicito que no
-                # corresponda al mapa; en ese caso respetamos el explicito).
                 self._serial = SERIAL_POR_ESTACION.get(estacion, self._serial)
             self._config = cargar_config(self._tipo, self._estacion)
 
@@ -1394,107 +1175,123 @@ class DetectorOrientacion:
     # ---------- start/stop ----------
 
     def start(self, requiere_referencia=True):
-        with self._lock:
-            if self._activo:
-                return
+        # Tomar el lock GLOBAL de camara: bloquea hasta que la otra camara
+        # haga stop(). Asi nunca hay dos pipelines abiertos a la vez.
+        # Solo lo tomamos si no lo teniamos ya (reentrada defensiva).
+        tome_lock_aqui = False
+        if not self._tengo_lock_global:
+            _CAMARA_GLOBAL_LOCK.acquire()
+            self._tengo_lock_global = True
+            tome_lock_aqui = True
 
-            ref_path = path_referencia(self._tipo, self._estacion)
-            if os.path.exists(ref_path):
-                ref = cv2.imread(ref_path)
-                if ref is None:
-                    raise RuntimeError(f"No se pudo leer {ref_path}")
-                _, self._referencia_blur = preparar_roi(ref, self._config)
-            else:
-                if requiere_referencia:
-                    raise FileNotFoundError(
-                        f"Falta referencia para Tipo {self._tipo} "
-                        f"({self._estacion}).\nEsperada en: {ref_path}\n"
-                        f"Capturala desde la pestania Calibrar."
-                    )
-                self._referencia_blur = None
+        try:
+            with self._lock:
+                if self._activo:
+                    return
 
-            if USAR_REALSENSE:
-                import pyrealsense2 as rs
+                ref_path = path_referencia(self._tipo, self._estacion)
+                if os.path.exists(ref_path):
+                    ref = cv2.imread(ref_path)
+                    if ref is None:
+                        raise RuntimeError(f"No se pudo leer {ref_path}")
+                    _, self._referencia_blur = preparar_roi(ref, self._config)
+                else:
+                    if requiere_referencia:
+                        raise FileNotFoundError(
+                            f"Falta referencia para Tipo {self._tipo} "
+                            f"({self._estacion}).\nEsperada en: {ref_path}\n"
+                            f"Capturala desde la pestania Calibrar."
+                        )
+                    self._referencia_blur = None
 
-                # --- D555: contexto DDS COMPARTIDO + espera de discovery ---
-                # Usamos un unico contexto para todos los detectores: con
-                # varias camaras el discovery por contexto separado es
-                # fragil. Esperamos especificamente a NUESTRO serial.
-                self._ctx = obtener_contexto_dds()
-                devices = _esperar_discovery(self._ctx, serial=self._serial)
-                if len(devices) == 0:
-                    self._ctx = None
-                    raise RuntimeError(
-                        "No se descubrio ninguna camara RealSense por DDS. "
-                        "Verifica que la PC tenga IP en 192.168.11.x, que el "
-                        "cable de red este conectado y que el realsense-viewer "
-                        "vea la camara.")
+                if USAR_REALSENSE:
+                    import pyrealsense2 as rs
 
-                self._pipeline = rs.pipeline(self._ctx)
-                cfg = rs.config()
-                # Seleccionar la camara FISICA por serial. Asi cada estacion
-                # abre siempre su camara y no la de la otra.
-                if self._serial:
-                    seriales = [d.get_info(rs.camera_info.serial_number)
-                                for d in devices]
-                    if self._serial not in seriales:
-                        self._pipeline = None
+                    self._ctx = obtener_contexto_dds()
+                    devices = _esperar_discovery(self._ctx, serial=self._serial)
+                    if len(devices) == 0:
                         self._ctx = None
                         raise RuntimeError(
-                            f"No se encontro la camara con serial "
-                            f"{self._serial} (estacion {self._estacion}). "
-                            f"Camaras descubiertas: {seriales or 'ninguna'}.")
-                    cfg.enable_device(self._serial)
-                cfg.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
-                                  rs.format.bgr8, CAM_FPS)
-                profile = self._pipeline.start(cfg)
+                            "No se descubrio ninguna camara RealSense por DDS. "
+                            "Verifica que la PC tenga IP en 192.168.11.x, que el "
+                            "cable de red este conectado y que el realsense-viewer "
+                            "vea la camara.")
 
-                # D555: sensor de color por NOMBRE (no indice [1] como D435)
-                sensor = _get_color_sensor(profile.get_device())
-                _set_option_seguro(sensor, rs.option.enable_auto_exposure, 0)
-                # 50 Hz para evitar flicker (1=50Hz Arg/Europa, 2=60Hz USA)
-                _set_option_seguro(sensor, rs.option.power_line_frequency, 1)
-                _set_option_seguro(sensor, rs.option.exposure,
-                                   int(self._config.get("exposure", 10)))
-                _set_option_seguro(sensor, rs.option.gain,
-                                   int(self._config.get("gain", 60)))
-                _set_option_seguro(sensor, rs.option.saturation,
-                                   int(self._config.get("saturation", 50)))
-                self._sensor = sensor
+                    self._pipeline = rs.pipeline(self._ctx)
+                    cfg = rs.config()
+                    if self._serial:
+                        seriales = [d.get_info(rs.camera_info.serial_number)
+                                    for d in devices]
+                        if self._serial not in seriales:
+                            self._pipeline = None
+                            self._ctx = None
+                            raise RuntimeError(
+                                f"No se encontro la camara con serial "
+                                f"{self._serial} (estacion {self._estacion}). "
+                                f"Camaras descubiertas: {seriales or 'ninguna'}.")
+                        cfg.enable_device(self._serial)
+                    cfg.enable_stream(rs.stream.color, CAM_WIDTH, CAM_HEIGHT,
+                                      rs.format.bgr8, CAM_FPS)
+                    profile = self._pipeline.start(cfg)
 
-                # Primer frame: timeout generoso porque la negociacion DDS
-                # inicial por red puede tardar mas que el default (5s).
-                try:
-                    self._pipeline.wait_for_frames(PRIMER_FRAME_TIMEOUT_MS)
-                except Exception as e:
-                    # Si falla el primer frame, cerrar limpio y reportar claro.
+                    sensor = _get_color_sensor(profile.get_device())
+                    _set_option_seguro(sensor, rs.option.enable_auto_exposure, 0)
+                    _set_option_seguro(sensor, rs.option.power_line_frequency, 1)
+                    _set_option_seguro(sensor, rs.option.exposure,
+                                       int(self._config.get("exposure", 10)))
+                    _set_option_seguro(sensor, rs.option.gain,
+                                       int(self._config.get("gain", 60)))
+                    _set_option_seguro(sensor, rs.option.saturation,
+                                       int(self._config.get("saturation", 50)))
+                    self._sensor = sensor
+
                     try:
-                        self._pipeline.stop()
-                    except Exception:
-                        pass
-                    self._pipeline = None
-                    self._ctx = None
-                    self._sensor = None
-                    raise RuntimeError(
-                        f"La camara ({self._estacion}) no entrego el primer "
-                        f"frame a tiempo. Puede ser congestion de red o que "
-                        f"la otra camara este saturando el enlace. Detalle: {e}")
+                        self._pipeline.wait_for_frames(PRIMER_FRAME_TIMEOUT_MS)
+                    except Exception as e:
+                        try:
+                            self._pipeline.stop()
+                        except Exception:
+                            pass
+                        self._pipeline = None
+                        self._ctx = None
+                        self._sensor = None
+                        raise RuntimeError(
+                            f"La camara ({self._estacion}) no entrego el primer "
+                            f"frame a tiempo. Puede ser congestion de red o que "
+                            f"la otra camara este saturando el enlace. Detalle: {e}")
 
-                # Resto del warmup (estabilizacion de exposicion), mas corto.
-                for _ in range(FRAMES_WARMUP):
-                    self._pipeline.wait_for_frames()
-            else:
-                self._pipeline = cv2.VideoCapture(0)
-                if not self._pipeline.isOpened():
-                    raise RuntimeError("No se pudo abrir webcam.")
-                for _ in range(10):
-                    self._pipeline.read()
+                    for _ in range(FRAMES_WARMUP):
+                        self._pipeline.wait_for_frames()
+                else:
+                    self._pipeline = cv2.VideoCapture(0)
+                    if not self._pipeline.isOpened():
+                        raise RuntimeError("No se pudo abrir webcam.")
+                    for _ in range(10):
+                        self._pipeline.read()
 
-            self._activo = True
+                self._activo = True
+        except Exception:
+            # Si algo fallo al abrir Y fuimos nosotros los que tomamos el
+            # lock global en esta llamada, liberarlo para no dejarlo colgado.
+            if tome_lock_aqui and self._tengo_lock_global:
+                self._tengo_lock_global = False
+                try:
+                    _CAMARA_GLOBAL_LOCK.release()
+                except RuntimeError:
+                    pass
+            raise
 
     def stop(self):
         with self._lock:
             if not self._activo:
+                # Aunque no este activo, si por algun motivo tenemos el lock
+                # global tomado, soltarlo.
+                if self._tengo_lock_global:
+                    self._tengo_lock_global = False
+                    try:
+                        _CAMARA_GLOBAL_LOCK.release()
+                    except RuntimeError:
+                        pass
                 return
             try:
                 if USAR_REALSENSE:
@@ -1504,11 +1301,17 @@ class DetectorOrientacion:
             except Exception:
                 pass
             self._pipeline = None
-            # Soltamos solo la referencia local; el contexto DDS es
-            # compartido y sigue vivo para los demas detectores.
             self._ctx = None
             self._sensor = None
             self._activo = False
+
+        # Liberar el lock global FUERA del _lock propio (para no anidar).
+        if self._tengo_lock_global:
+            self._tengo_lock_global = False
+            try:
+                _CAMARA_GLOBAL_LOCK.release()
+            except RuntimeError:
+                pass
 
     def esta_activo(self):
         return self._activo
@@ -1529,17 +1332,11 @@ class DetectorOrientacion:
             ret, frame = self._pipeline.read()
             if not ret:
                 raise RuntimeError("No se pudo leer frame de webcam.")
-        # Orientacion de camara (rotacion + flip) POR ESTACION, aplicada
-        # APENAS se captura, antes del ROI. Cada camara (cinta/mesa) tiene
-        # su propia orientacion porque estan montadas distinto.
         return aplicar_orientacion(frame, estacion=self._estacion)
 
     def analizar(self):
-        """Captura un frame y lo analiza segun la estacion activa.
-
-        Para estacion="cinta": devuelve dict {tipo, orientacion, ratio, panel}.
-        Para estacion="mesa":  devuelve dict {tipo, matriz, fila, columna, panel}.
-        """
+        """Analiza usando la camara YA ABIERTA (para preview/uso manual).
+        En operacion automatica usar analizar_atomico()."""
         with self._lock:
             if not self._activo:
                 raise RuntimeError("Detector no activo. Llamar start() primero.")
@@ -1549,8 +1346,12 @@ class DetectorOrientacion:
             tipo = self._tipo
             est = self._estacion
 
+        return self._analizar_frame(frame, ref, cfg, tipo, est)
+
+    def _analizar_frame(self, frame, ref, cfg, tipo, est):
+        """Corre el pipeline de analisis sobre un frame ya capturado.
+        No toca la camara. Separado para reusar desde analizar_atomico()."""
         if est == "mesa":
-            # Importacion local para evitar circular
             from mesa import analizar_imagen_mesa
             if ref is None:
                 roi_color, _ = preparar_roi(frame, cfg)
@@ -1569,7 +1370,6 @@ class DetectorOrientacion:
             res["tipo"] = tipo
             return res
 
-        # Estacion cinta
         if ref is None:
             roi_color, _ = preparar_roi(frame, cfg)
             panel = roi_color.copy()
@@ -1586,6 +1386,27 @@ class DetectorOrientacion:
         res = analizar_imagen(frame, ref, cfg)
         res["tipo"] = tipo
         return res
+
+    def analizar_atomico(self, requiere_referencia=True):
+        """Abre la camara, captura, analiza y CIERRA en una sola llamada.
+
+        Este es el metodo que hay que usar en operacion (modo automatico):
+        toma el lock global -> abre pipeline -> captura -> cierra -> libera.
+        Asi la otra camara nunca compite por el cable al mismo tiempo.
+
+        Devuelve el mismo dict que analizar() segun la estacion.
+        """
+        self.start(requiere_referencia=requiere_referencia)
+        try:
+            with self._lock:
+                frame = self._capturar_frame_raw(descartar_buffer=True)
+                ref = self._referencia_blur
+                cfg = self._config
+                tipo = self._tipo
+                est = self._estacion
+            return self._analizar_frame(frame, ref, cfg, tipo, est)
+        finally:
+            self.stop()
 
     def capturar_frame(self):
         with self._lock:
@@ -1637,7 +1458,6 @@ class DetectorOrientacion:
                 self._persistir()
 
     def set_umbral_ocupacion(self, valor, persist=True):
-        """valor entero 0-100 (porcentaje). Se guarda como 0.0-1.0 en config."""
         valor_pct = max(0, min(100, int(valor)))
         with self._lock:
             self._config["umbral_ocupacion"] = valor_pct / 100.0
@@ -1646,12 +1466,6 @@ class DetectorOrientacion:
                 self._persistir()
 
     def set_margen_celda(self, valor, persist=True):
-        """valor entero 0-40 (porcentaje). Se guarda como 0.0-0.4 en config.
-
-        Solo aplica a mesa. Se recorta ese porcentaje de cada borde de la
-        celda antes de contar pixels. 0 = celda entera, 25 = solo el 50%
-        central.
-        """
         valor_pct = max(0, min(40, int(valor)))
         with self._lock:
             self._config["margen_celda"] = valor_pct / 100.0
@@ -1673,44 +1487,28 @@ class DetectorOrientacion:
 
     @property
     def umbral_ocupacion(self):
-        """Devuelve el porcentaje 0-100 (no la fraccion 0.0-1.0)."""
         return int(self._config.get("umbral_ocupacion", 0.15) * 100)
 
     @property
     def margen_celda(self):
-        """Devuelve el porcentaje 0-40 (no la fraccion 0.0-0.4)."""
         return int(round(self._config.get("margen_celda", 0.0) * 100))
 
-    # ---------- rotacion global de camara ----------
+    # ---------- rotacion / flip ----------
 
     def set_rotacion(self, k):
-        """Setea la rotacion (0/1/2/3) de ESTA estacion y la persiste.
-
-        Es por estacion (cinta/mesa independientes), no global. Se guarda
-        en vision_rotacion.json. El siguiente frame ya sale rotado.
-        """
         with self._lock:
             guardar_rotacion(k, estacion=self._estacion)
 
     @property
     def rotacion(self):
-        """Rotacion actual (0/1/2/3) de esta estacion."""
         return cargar_rotacion(self._estacion)
 
-    # ---------- flip horizontal de camara ----------
-
     def set_flip_h(self, flip):
-        """Setea el flip horizontal (bool) de ESTA estacion y lo persiste.
-
-        Se aplica DESPUES de la rotacion. El siguiente frame ya sale con
-        el flip aplicado.
-        """
         with self._lock:
             guardar_flip_h(flip, estacion=self._estacion)
 
     @property
     def flip_h(self):
-        """Estado actual del flip horizontal (bool) de esta estacion."""
         return cargar_flip_h(self._estacion)
 
     def recargar_referencia(self):
@@ -1725,8 +1523,7 @@ class DetectorOrientacion:
 
 
 # ======================================================================
-#  MAIN STANDALONE (sin cambios respecto a la version anterior, salvo
-#  que ahora hay que pasarle estacion)
+#  MAIN STANDALONE
 # ======================================================================
 
 def _parse_tipo(arg):
