@@ -754,13 +754,11 @@ def manejar_robot(conn, addr, log_callback):
 
 
 
-                if fila == 0 or columna == 0:
-
-                    orientacion = "VACIO"
-
-                else:
-
-                    orientacion = "OK"
+                # La respuesta de MESA es SIEMPRE "OK" (discriminador que
+                # usa el robot para reconocer que la respuesta es de mesa).
+                # Mesa vacia real viaja como OK con fila=0/col=0 y el Master
+                # tira su error de mesa vacia.
+                orientacion = "OK"
 
 
 
