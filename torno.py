@@ -69,7 +69,9 @@ DEFAULTS = {
     "torno_host": "172.31.1.99",
     "torno_port": 8193,
     "torno_timeout_focas": 10,
-    "torno_dll_path": "./dlls",
+    # Path de las DLLs FOCAS. Se resuelve relativo a ESTE archivo (torno.py)
+    # para no depender del directorio desde donde se lanza el HMI.
+    "torno_dll_path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "dlls"),
     "macro_tipo": 551,        # NUMERO DE PIEZA (1-12)
     "macro_op": 550,          # OPERACION A MECANIZAR (10 o 20)
     "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
@@ -169,6 +171,20 @@ class ColaTorno:
             self._cola.clear()
             self._persistir()
 
+    def todos_op3(self):
+        """Cambia el op de TODAS las entradas a 3 (dejar pasar), sin borrar.
+        Los pallets fisicos que ya estan en la fila pasan sin mecanizar y la
+        cola drena al ritmo del sensor, manteniendo la correspondencia.
+        Devuelve cuantas cambio."""
+        with self._lock:
+            n = 0
+            for item in self._cola:
+                if item.get("op") != 3:
+                    item["op"] = 3
+                    n += 1
+            self._persistir()
+            return n
+
     def quitar_indice(self, indice):
         """Quita el elemento en el indice dado. Devuelve True si lo saco."""
         with self._lock:
@@ -240,6 +256,8 @@ class TornoFanuc:
         self._shutdown = False
         # Para saber si tenemos que reescribir macros (cuando cambia cola[0])
         self._ultimo_escrito = (None, None, None)  # (tipo, op, rosca)
+        # Arranque en modo SEGURO hasta confirmar (ver confirmar_arranque).
+        self._arranque_confirmado = False
         # Cola de pedidos para que TODAS las llamadas FOCAS se hagan
         # desde el thread sincronizador. La fwlib32 de FANUC exige que
         # el handle se use desde el mismo thread que lo creo, sino
@@ -303,6 +321,29 @@ class TornoFanuc:
         self._log(f"[TORNO] Cola limpiada ({n} items removidos)")
         # Forzar reescritura de ceros
         self._ultimo_escrito = (None, None, None)
+
+    def info_arranque(self):
+        """Devuelve (n_cola, receta_primero) para el dialogo de confirmacion.
+        receta_primero es un dict {tipo,op,rosca} o None si la cola esta vacia."""
+        n = len(self.cola)
+        primero = self.cola.primero()
+        return n, (dict(primero) if primero else None)
+
+    def confirmar_arranque(self):
+        """El operador confirmo que la cola coincide con los pallets fisicos.
+        A partir de aca la PC escribe recetas reales (sale del modo op=3)."""
+        self._arranque_confirmado = True
+        self._ultimo_escrito = (None, None, None)
+        self._log("[TORNO] Arranque confirmado: empiezo a mecanizar segun la cola")
+
+    def todos_op3(self):
+        """Marca todas las entradas de la cola como op=3 (dejar pasar).
+        No borra: los pallets recirculan sin mecanizar y la cola drena
+        con el sensor."""
+        n = self.cola.todos_op3()
+        self._log(f"[TORNO] {n} items pasados a op=3 (dejar pasar / recircular)")
+        self._ultimo_escrito = (None, None, None)
+        return n
 
     def quitar_indice(self, indice):
         ok = self.cola.quitar_indice(indice)
@@ -504,7 +545,18 @@ class TornoFanuc:
             self.conectado = True
             self.ultimo_error = None
             self._ultimo_escrito = (None, None, None)  # forzar reescritura
+            # Arranque en modo seguro: no mecanizar hasta que el operador
+            # confirme que la cola coincide con los pallets fisicos.
+            self._arranque_confirmado = False
+            # Dejar #553=0 (por si quedo en 1 de la sesion anterior) para
+            # que el torno pueda arrancar cuando se confirme.
+            try:
+                with self._client_lock:
+                    self._client.set_macro(self.config["macro_fin"], 0)
+            except Exception:
+                pass
             self._log(f"[TORNO] Conectado a {self.config['torno_host']}:{self.config['torno_port']}")
+            self._log("[TORNO] Modo seguro: dejando pasar (op=3) hasta confirmar arranque")
         except Exception as e:
             self.ultimo_error = str(e)
             # No spamear log con cada intento fallido
@@ -553,7 +605,8 @@ class TornoFanuc:
             self._sensor_visto_alto = True
 
         if (not estado) and prev and getattr(self, "_sensor_visto_alto", False):
-            # Flanco de bajada: el pallet SALIO -> descontar + nueva receta
+            # Flanco de bajada: el pallet SALIO.
+            # 1) DESCONTAR siempre (verdad fisica: salio un pallet).
             quitado = self.cola.desencolar()
             if quitado is not None:
                 self.piezas_terminadas += 1
@@ -565,16 +618,48 @@ class TornoFanuc:
                 self._log("[SENSOR] Pallet salio pero la cola estaba vacia "
                           "(paso uno sin encolar)")
             self._sensor_visto_alto = False
-            # Escribir la receta del nuevo primero YA (no esperar al paso 2)
-            self._escribir_receta_actual()
-            # Bajar #553 para liberar al torno (receta lista)
+
+            # 2) Escribir la receta nueva + bajar #553 SOLO si el torno YA
+            #    termino (#553==1). Asi nunca pisamos la receta que el torno
+            #    esta usando en ese momento. Si todavia no termino, dejamos
+            #    la escritura pendiente para cuando confirme el fin.
             try:
                 with self._client_lock:
-                    self._client.set_macro(self.config["macro_fin"], 0)
+                    fin = self._client.get_macro(self.config["macro_fin"])
             except Exception as e:
-                self._log(f"[SENSOR] No se pudo bajar #553: {e}")
+                self._log(f"[SENSOR] No se pudo leer #553: {e}")
+                fin = 0
+            if fin == 1:
+                self._escribir_receta_actual()
+                try:
+                    with self._client_lock:
+                        self._client.set_macro(self.config["macro_fin"], 0)
+                except Exception as e:
+                    self._log(f"[SENSOR] No se pudo bajar #553: {e}")
+                self._receta_pendiente = False
+            else:
+                # El pallet salio pero el torno aun no confirmo fin: marcar
+                # que hay que escribir la receta apenas #553 llegue a 1.
+                self._receta_pendiente = True
 
         self._sensor_prev = estado
+
+        # Si quedo una escritura pendiente (el pallet salio antes de que el
+        # torno confirmara el fin), completarla cuando #553 llegue a 1.
+        if getattr(self, "_receta_pendiente", False):
+            try:
+                with self._client_lock:
+                    fin = self._client.get_macro(self.config["macro_fin"])
+            except Exception:
+                fin = 0
+            if fin == 1:
+                self._escribir_receta_actual()
+                try:
+                    with self._client_lock:
+                        self._client.set_macro(self.config["macro_fin"], 0)
+                except Exception as e:
+                    self._log(f"[SENSOR] No se pudo bajar #553 (pend): {e}")
+                self._receta_pendiente = False
 
     def _escribir_receta_actual(self):
         """Escribe en las macros la receta del primero de la cola (o op=3 si
@@ -624,10 +709,12 @@ class TornoFanuc:
         # ============================================================
         self._procesar_sensor_salida()
 
-        # Respaldo: si por lo que sea la receta actual no esta escrita
-        # (arranque, o cola cambio por encolado/edicion manual), asegurarla.
-        # No baja #553 aca; eso es exclusivo del flanco del sensor.
-        self._escribir_receta_actual()
+        # Respaldo SOLO para el arranque: si nunca escribimos nada aun,
+        # dejar la receta del primero (o op=3) puesta. Una vez que el ciclo
+        # esta en marcha, la receta la maneja el sensor+#553 (no aca), para
+        # no pisar la receta que el torno pueda estar usando.
+        if self._ultimo_escrito == (None, None, None):
+            self._escribir_receta_actual()
 
     def _log(self, msg):
         try:

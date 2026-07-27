@@ -3173,6 +3173,17 @@ class HMISpirax:
 
                   command=self._limpiar_cola_torno).pack(side='left', padx=2)
 
+        tk.Button(c_ctrl, text="Todo op=3 (dejar pasar)",
+                  font=("Arial", 9),
+                  bg='#c8860a', fg='white',
+                  command=self._todos_op3_torno).pack(side='left', padx=2)
+
+        tk.Button(c_ctrl, text="Confirmar arranque",
+                  font=("Arial", 9, "bold"),
+                  bg='#2d8f3a', fg='white',
+                  command=self._confirmar_arranque_torno).pack(side='left', padx=2)
+
+
 
 
         # Stats
@@ -3524,6 +3535,34 @@ class HMISpirax:
 
             self._refrescar_cola_torno()
 
+
+
+    def _todos_op3_torno(self):
+        n = len(torno.cola)
+        if n == 0:
+            return
+        if messagebox.askyesno("Confirmar",
+                                f"¿Pasar las {n} piezas de la cola a op=3?\n"
+                                f"Van a recircular sin mecanizar."):
+            torno.todos_op3()
+            self._refrescar_cola_torno()
+
+    def _confirmar_arranque_torno(self):
+        n, receta = torno.info_arranque()
+        if receta is None:
+            txt = ("La cola esta vacia. No hay nada para mecanizar.\n"
+                   "¿Confirmar arranque igual? (todo pasa como op=3)")
+        else:
+            op_txt = {1: "cargar (OP10)", 2: "dar vuelta (OP20)",
+                      3: "dejar pasar"}.get(receta["op"], f"op={receta['op']}")
+            txt = (f"Cola: {n} piezas.\n\n"
+                   f"Proxima a mecanizar:\n"
+                   f"  tipo {receta['tipo']}, {op_txt}, rosca {receta.get('rosca', 0)}\n\n"
+                   f"Verifica que coincida con el pallet fisico que esta por\n"
+                   f"entrar al torno. ¿Confirmar arranque?")
+        if messagebox.askyesno("Confirmar arranque", txt):
+            torno.confirmar_arranque()
+            self._refrescar_cola_torno()
 
 
     def _reconectar_torno(self):
