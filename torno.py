@@ -75,6 +75,13 @@ DEFAULTS = {
     "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
     "macro_fin": 553,         # FLAG fin de mecanizado
     "macro_cola": 554,        # CANTIDAD de piezas en la cola (informativo)
+    # --- Sensor de salida del husillo (PMC) ---
+    # Descuenta 1 de la cola en el flanco de bajada (1->0): el pallet
+    # termino de pasar por el sensor de salida.
+    "sensor_salida_pmc_tipo": 3,   # X = 3
+    "sensor_salida_byte": 10,      # X10
+    "sensor_salida_bit": 6,        # SQX10.6
+    "usar_sensor_salida": True,    # True = descontar por sensor (no por #553)
     "polling_ms": 500,        # intervalo de polling de #553
     "persist_path": "cola_torno.json",
 }
@@ -517,53 +524,70 @@ class TornoFanuc:
         self.conectado = False
         self._cancelar_queue("Torno desconectado durante operacion")
 
-    def _tick_sincronizar(self):
-        """Una iteracion del sync. Asume conectado."""
-        mac_tipo = self.config["macro_tipo"]
-        mac_op = self.config["macro_op"]
-        mac_rosca = self.config["macro_rosca"]
-        mac_fin = self.config["macro_fin"]
-        mac_cola = self.config["macro_cola"]
-
-        # Informar al torno cuantas piezas hay en la cola (#554).
-        # Solo se escribe cuando cambia, para no saturar FOCAS.
-        n_cola = len(self.cola)
-        if n_cola != getattr(self, "_ultima_cola_len", None):
+    def _procesar_sensor_salida(self):
+        """Sensor de salida del husillo (SQX10.6). En el flanco de bajada
+        (1->0) el pallet termino de pasar, entonces:
+          1) descuenta 1 de la cola (verdad fisica: salio un pallet),
+          2) escribe la receta del NUEVO primero en las macros,
+          3) baja #553 a 0 (avisa al torno "receta lista, arranca").
+        Exige el ciclo completo 0->1->0 para no contar de mas si el sensor
+        tiembla con el pallet encima."""
+        tipo = self.config["sensor_salida_pmc_tipo"]
+        byte = self.config["sensor_salida_byte"]
+        bit = self.config["sensor_salida_bit"]
+        try:
             with self._client_lock:
-                self._client.set_macro(mac_cola, n_cola)
-            self._ultima_cola_len = n_cola
+                estado = self._client.read_pmc_bit(tipo, byte, bit)
+        except Exception as e:
+            self._log(f"[SENSOR] Error leyendo SQX{byte}.{bit}: {e}")
+            return
 
-        # 1. Chequear flag de fin (#553)
-        with self._client_lock:
-            valor_fin = self._client.get_macro(mac_fin)
+        prev = getattr(self, "_sensor_prev", None)
+        if prev is None:
+            self._sensor_prev = estado
+            self._sensor_visto_alto = estado
+            return
 
-        if valor_fin == 1:
-            # Torno termino una pieza
+        if estado and not prev:
+            # Flanco de subida: el pallet llego al sensor
+            self._sensor_visto_alto = True
+
+        if (not estado) and prev and getattr(self, "_sensor_visto_alto", False):
+            # Flanco de bajada: el pallet SALIO -> descontar + nueva receta
             quitado = self.cola.desencolar()
             if quitado is not None:
                 self.piezas_terminadas += 1
-                self._log(f"[TORNO] Pieza terminada: tipo={quitado['tipo']} "
-                          f"op={quitado['op']} rosca={quitado.get('rosca', 0)} "
-                          f"| total terminadas={self.piezas_terminadas}")
+                self._log(f"[SENSOR] Pallet salio -> desencolado: "
+                          f"tipo={quitado['tipo']} op={quitado['op']} "
+                          f"rosca={quitado.get('rosca', 0)} "
+                          f"| total salidos={self.piezas_terminadas}")
             else:
-                self._log("[TORNO] Torno aviso fin pero cola estaba vacia (?)")
-            # Forzar reescritura del nuevo primero
-            self._ultimo_escrito = (None, None, None)
-            # Bajar flag
-            with self._client_lock:
-                self._client.set_macro(mac_fin, 0)
+                self._log("[SENSOR] Pallet salio pero la cola estaba vacia "
+                          "(paso uno sin encolar)")
+            self._sensor_visto_alto = False
+            # Escribir la receta del nuevo primero YA (no esperar al paso 2)
+            self._escribir_receta_actual()
+            # Bajar #553 para liberar al torno (receta lista)
+            try:
+                with self._client_lock:
+                    self._client.set_macro(self.config["macro_fin"], 0)
+            except Exception as e:
+                self._log(f"[SENSOR] No se pudo bajar #553: {e}")
 
-        # 2. Asegurarse que #551/#550/#552 reflejan el primero de la cola
+        self._sensor_prev = estado
+
+    def _escribir_receta_actual(self):
+        """Escribe en las macros la receta del primero de la cola (o op=3 si
+        la cola esta vacia). Solo escribe si cambio respecto de lo ultimo."""
+        mac_tipo = self.config["macro_tipo"]
+        mac_op = self.config["macro_op"]
+        mac_rosca = self.config["macro_rosca"]
         primero = self.cola.primero()
         if primero is None:
-            # Cola vacia: dejar el torno en op=3 (no mecanizar, dejar pasar).
-            # Asi si la cinta sigue desfilando pallets sin evaluar (robot
-            # apagado), el torno no mecaniza nada con la macro vieja.
             objetivo = (0, 3, 0)
         else:
             objetivo = (int(primero["tipo"]), int(primero["op"]),
                         int(primero.get("rosca", 0)))
-
         if objetivo != self._ultimo_escrito:
             with self._client_lock:
                 self._client.set_macro(mac_tipo, objetivo[0])
@@ -574,11 +598,36 @@ class TornoFanuc:
                 self.ultimo_evento = (f"[TORNO] Cola vacia -> op=3 (dejar pasar) "
                                       f"#{mac_tipo}=0 #{mac_op}=3 #{mac_rosca}=0")
             else:
-                self.ultimo_evento = (f"[TORNO] Macros actualizadas: "
-                                      f"#{mac_tipo}={objetivo[0]} "
-                                      f"#{mac_op}={objetivo[1]} "
-                                      f"#{mac_rosca}={objetivo[2]}")
+                self.ultimo_evento = (f"[TORNO] Receta -> #{mac_tipo}={objetivo[0]} "
+                                      f"#{mac_op}={objetivo[1]} #{mac_rosca}={objetivo[2]}")
             self._log(self.ultimo_evento)
+
+    def _tick_sincronizar(self):
+        """Una iteracion del sync. Asume conectado."""
+        mac_cola = self.config["macro_cola"]
+
+        # Informar al torno cuantas piezas hay en la cola (#554).
+        # Solo se escribe cuando cambia, para no saturar FOCAS.
+        n_cola = len(self.cola)
+        if n_cola != getattr(self, "_ultima_cola_len", None):
+            with self._client_lock:
+                self._client.set_macro(mac_cola, n_cola)
+            self._ultima_cola_len = n_cola
+
+        # ============================================================
+        #  El SENSOR DE SALIDA es el evento maestro. En el flanco 1->0
+        #  (pallet salio) descuenta la cola, escribe la receta del nuevo
+        #  primero y baja #553 (libera al torno). Ver _procesar_sensor_salida.
+        #
+        #  #553 = handshake: el torno lo pone en 1 al terminar y espera el 0.
+        #  El 0 lo baja el sensor cuando sale el pallet (receta ya lista).
+        # ============================================================
+        self._procesar_sensor_salida()
+
+        # Respaldo: si por lo que sea la receta actual no esta escrita
+        # (arranque, o cola cambio por encolado/edicion manual), asegurarla.
+        # No baja #553 aca; eso es exclusivo del flanco del sensor.
+        self._escribir_receta_actual()
 
     def _log(self, msg):
         try:
