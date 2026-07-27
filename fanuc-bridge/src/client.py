@@ -185,6 +185,31 @@ class FanucClient:
 
     # ─── Status compuesto (todo de una pasada) ──────────────────
 
+    # ---- PMC (I/O del torno) ----
+    # Codigos de tipo de direccion PMC (confirmados en 0i-TF via escaneo):
+    #   G=0, F=1, Y=2, X=3, R=5, D=9
+    PMC_G = 0
+    PMC_F = 1
+    PMC_Y = 2
+    PMC_X = 3
+    PMC_R = 5
+    PMC_D = 9
+
+    def read_pmc_byte(self, adr_type: int, byte_num: int) -> int:
+        """Lee un byte del PMC. adr_type: X=0, Y=1, F=2, G=3, R=5, ...
+        Devuelve el valor del byte (0-255)."""
+        p, ret = self._focas.rdpmcrng_byte(self.handle, adr_type,
+                                           byte_num, byte_num)
+        if ret != 0:
+            raise FocasError(f"pmc_rdpmcrng(tipo={adr_type},byte={byte_num})", ret)
+        return p.cdata[0] & 0xFF
+
+    def read_pmc_bit(self, adr_type: int, byte_num: int, bit: int) -> bool:
+        """Lee un bit puntual del PMC. Ej: SQX10.6 -> adr_type=0 (X),
+        byte_num=10, bit=6. Devuelve True/False."""
+        val = self.read_pmc_byte(adr_type, byte_num)
+        return bool((val >> bit) & 1)
+
     def status(self) -> TornoStatus:
         """Lectura completa, robusta a errores individuales.
 
