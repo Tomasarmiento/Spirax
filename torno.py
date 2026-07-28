@@ -84,7 +84,14 @@ DEFAULTS = {
     "sensor_salida_byte": 10,      # X10
     "sensor_salida_bit": 6,        # SQX10.6
     "usar_sensor_salida": True,    # True = descontar por sensor (no por #553)
-    "polling_ms": 500,        # intervalo de polling de #553
+    # --- Heartbeat / linea de vida PC<->torno por R50.0 ---
+    # El torno (ladder) baja R50.0 a 0; la PC la vuelve a poner en 1 en cada
+    # tick. Si la PC muere, R50.0 queda en 0 y el ladder detecta "PC caida".
+    "heartbeat_pmc_tipo": 5,       # R = 5
+    "heartbeat_byte": 50,          # R50
+    "heartbeat_bit": 0,            # R50.0
+    "usar_heartbeat": True,
+    "polling_ms": 200,        # intervalo de polling (sensor + #553 + heartbeat R50)
     "persist_path": "cola_torno.json",
 }
 
@@ -687,6 +694,24 @@ class TornoFanuc:
                                       f"#{mac_op}={objetivo[1]} #{mac_rosca}={objetivo[2]}")
             self._log(self.ultimo_evento)
 
+    def _procesar_heartbeat(self):
+        """Linea de vida PC<->torno por R50.0. El ladder del torno baja
+        R50.0 a 0; la PC la vuelve a poner en 1 en cada tick. Mientras la
+        PC este viva, R50.0 vuelve a 1 rapido. Si la PC muere, R50.0 queda
+        en 0 y el ladder lo detecta (timeout de su lado)."""
+        tipo = self.config["heartbeat_pmc_tipo"]
+        byte = self.config["heartbeat_byte"]
+        bit = self.config["heartbeat_bit"]
+        try:
+            with self._client_lock:
+                b = self._client.read_pmc_byte(tipo, byte)
+                if ((b >> bit) & 1) == 0:
+                    self._client.write_pmc_byte(tipo, byte, b | (1 << bit))
+                    self._hb_pulsos = getattr(self, "_hb_pulsos", 0) + 1
+        except Exception as e:
+            # No romper el sync si falla; el ladder detectara la caida.
+            self._log(f"[HEARTBEAT] Error en R{byte}.{bit}: {e}")
+
     def _tick_sincronizar(self):
         """Una iteracion del sync. Asume conectado."""
         mac_cola = self.config["macro_cola"]
@@ -708,6 +733,11 @@ class TornoFanuc:
         #  El 0 lo baja el sensor cuando sale el pallet (receta ya lista).
         # ============================================================
         self._procesar_sensor_salida()
+
+        # Heartbeat / linea de vida PC<->torno (R50.0). Si el ladder la
+        # bajo a 0, la volvemos a 1: "PC viva". Si la PC muere, queda en 0.
+        if self.config.get("usar_heartbeat", True):
+            self._procesar_heartbeat()
 
         # Respaldo SOLO para el arranque: si nunca escribimos nada aun,
         # dejar la receta del primero (o op=3) puesta. Una vez que el ciclo
