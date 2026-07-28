@@ -210,6 +210,14 @@ class FanucClient:
         val = self.read_pmc_byte(adr_type, byte_num)
         return bool((val >> bit) & 1)
 
+    def write_pmc_byte(self, adr_type: int, byte_num: int, value: int) -> None:
+        """Escribe un byte en el PMC. Usar en areas escribibles (R=5, D=9).
+        NO usar en X (entradas fisicas)."""
+        ret = self._focas.wrpmcrng_byte(self.handle, adr_type, byte_num,
+                                        value)
+        if ret != 0:
+            raise FocasError(f"pmc_wrpmcrng(tipo={adr_type},byte={byte_num})", ret)
+
     def status(self) -> TornoStatus:
         """Lectura completa, robusta a errores individuales.
 

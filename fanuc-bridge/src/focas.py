@@ -271,6 +271,10 @@ class Focas:
                                    c_short, c_short, POINTER(IODBPMC)]
         L.pmc_rdpmcrng.restype = c_short
 
+        # pmc_wrpmcrng(handle, length, &iodbpmc)  -- MISMA estructura que rd
+        L.pmc_wrpmcrng.argtypes = [c_ushort, c_ushort, POINTER(IODBPMC)]
+        L.pmc_wrpmcrng.restype = c_short
+
         # cnc_rdparam(handle, num, axis, length, &iodbpsd)
         # Lo dejamos en raw bytes porque IODBPSD es polimórfico — para el part
         # count (param 6711) sirve con esta firma genérica.
@@ -324,6 +328,23 @@ class Focas:
             handle, c_short(adr_type), c_short(0),
             c_short(start), c_short(end), c_short(length), byref(p))
         return p, ret
+
+    def wrpmcrng_byte(self, handle: int, adr_type: int, byte_num: int,
+                      value: int, length: int = None):
+        """Escribe UN byte en el PMC (data_type=0). adr_type: R=5, D=9, ...
+        Firma FOCAS: pmc_wrpmcrng(handle, length, &IODBPMC) usando la MISMA
+        estructura que la lectura. length = 8 (header) + n_bytes de datos."""
+        n = 1
+        if length is None:
+            length = 8 + n     # header 8 + 1 byte de dato = 9
+        p = IODBPMC()
+        p.type_a = adr_type
+        p.type_d = 0                 # byte
+        p.datano_s = byte_num
+        p.datano_e = byte_num
+        p.cdata[0] = value & 0xFF
+        ret = self._lib.pmc_wrpmcrng(handle, c_ushort(length), byref(p))
+        return ret
 
     def acts(self, handle: int):
         a = ODBACT()
