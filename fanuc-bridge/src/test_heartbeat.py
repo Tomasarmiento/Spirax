@@ -43,8 +43,8 @@ HOST = sys.argv[1] if len(sys.argv)>1 else "172.31.1.99"
 PORT = int(sys.argv[2]) if len(sys.argv)>2 else 8193
 
 PMC_R = 5
-BYTE  = 50
-BIT   = 0
+BYTE  = 55
+BIT   = 3
 PERIODO_S = 0.2
 
 # Cola de comandos tecleados. El hilo de input SOLO lee del teclado y
