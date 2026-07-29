@@ -91,6 +91,12 @@ DEFAULTS = {
     "heartbeat_byte": 50,          # R50
     "heartbeat_bit": 0,            # R50.0
     "usar_heartbeat": True,
+    # --- Señal de "receta cargada" para el ladder del Fammar (R55.3) ---
+    # La PC la pone en 1 cuando bajo #553 (receta lista). El ladder ve
+    # R55.3=1, libera el pre-stopper del husillo y BAJA la R55.3 el mismo.
+    "receta_lista_pmc_tipo": 5,    # R = 5
+    "receta_lista_byte": 55,       # R55
+    "receta_lista_bit": 3,         # R55.3
     "polling_ms": 200,        # intervalo de polling (sensor + #553 + heartbeat R50)
     "persist_path": "cola_torno.json",
 }
@@ -643,6 +649,8 @@ class TornoFanuc:
                         self._client.set_macro(self.config["macro_fin"], 0)
                 except Exception as e:
                     self._log(f"[SENSOR] No se pudo bajar #553: {e}")
+                # Avisar al ladder que la receta esta cargada (R55.3=1)
+                self._avisar_receta_lista()
                 self._receta_pendiente = False
             else:
                 # El pallet salio pero el torno aun no confirmo fin: marcar
@@ -666,6 +674,8 @@ class TornoFanuc:
                         self._client.set_macro(self.config["macro_fin"], 0)
                 except Exception as e:
                     self._log(f"[SENSOR] No se pudo bajar #553 (pend): {e}")
+                # Avisar al ladder que la receta esta cargada (R55.3=1)
+                self._avisar_receta_lista()
                 self._receta_pendiente = False
 
     def _escribir_receta_actual(self):
@@ -693,6 +703,22 @@ class TornoFanuc:
                 self.ultimo_evento = (f"[TORNO] Receta -> #{mac_tipo}={objetivo[0]} "
                                       f"#{mac_op}={objetivo[1]} #{mac_rosca}={objetivo[2]}")
             self._log(self.ultimo_evento)
+
+    def _avisar_receta_lista(self):
+        """Pone R55.3 = 1 para avisar al ladder del Fammar que la receta ya
+        esta cargada (#553 ya bajo). El ladder libera el pre-stopper y baja
+        el mismo la R55.3. La PC NO la baja."""
+        tipo = self.config["receta_lista_pmc_tipo"]
+        byte = self.config["receta_lista_byte"]
+        bit = self.config["receta_lista_bit"]
+        try:
+            with self._client_lock:
+                b = self._client.read_pmc_byte(tipo, byte)
+                self._client.write_pmc_byte(tipo, byte, b | (1 << bit))
+            self._log(f"[TORNO] R{byte}.{bit}=1 (receta cargada -> "
+                      f"ladder libera pre-stopper)")
+        except Exception as e:
+            self._log(f"[TORNO] No se pudo poner R{byte}.{bit}: {e}")
 
     def _procesar_heartbeat(self):
         """Linea de vida PC<->torno por R50.0. El ladder del torno baja
