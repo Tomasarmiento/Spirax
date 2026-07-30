@@ -578,7 +578,7 @@ def manejar_robot(conn, addr, log_callback):
 
             #     (la cola solo contiene operaciones realmente hechas).
 
-            if recuperar in (1, 2):
+            if recuperar in (1, 2, 21, 22, 23):
 
                 if recuperar == 1:
 
@@ -598,24 +598,45 @@ def manejar_robot(conn, addr, log_callback):
 
                 else:
 
-                    if _op_pendiente is not None:
-
+                    # El SPS manda la ORIENTACION del pallet que el robot
+                    # acaba de terminar, codificada en Recuperar:
+                    #   21 = era VACIO  -> op=1 (OP10, cargo pieza nueva)
+                    #   22 = era ARRIBA -> op=2 (OP20, dio vuelta la pieza)
+                    #   23 = era ABAJO  -> no se encola (es error)
+                    # Asi la operacion encolada corresponde SIEMPRE al pallet
+                    # correcto, aunque el spot 1 este fotografiando el pallet
+                    # siguiente en paralelo (por eso ya no usamos
+                    # _op_pendiente, que se pisaba).
+                    _MAPA_AVISO = {21: 1, 22: 2}
+                    if recuperar in _MAPA_AVISO:
+                        op_real = _MAPA_AVISO[recuperar]
+                        torno.encolar(tipo, op_real, rosca)
+                        log_callback(f"[FIN RUTINA] Encolado: tipo={tipo} "
+                                     f"op={op_real} rosca={rosca}")
+                    elif recuperar == 23:
+                        # ABAJO (o orientacion desconocida): el robot NO lo
+                        # proceso, pero el pallet IGUAL se libera y va a salir
+                        # por el sensor del torno, donde se descuenta uno de la
+                        # cola. Si no encolaramos nada, ese descuento se comeria
+                        # la entrada de OTRO pallet y toda la cola se corre.
+                        # Por eso encolamos op=3: el torno lo deja pasar sin
+                        # mecanizar y la cola se mantiene balanceada.
+                        torno.encolar(tipo, 3, rosca)
+                        log_callback("!!! [FIN RUTINA] Pallet ABAJO/desconocido: "
+                                     "encolado op=3 (pasa sin mecanizar, "
+                                     "mantiene el balance de la cola)")
+                    elif _op_pendiente is not None:
+                        # Compatibilidad: SPS viejo que manda Recuperar=2 sin
+                        # la orientacion. Puede encolar la op equivocada si el
+                        # spot 1 fotografio en paralelo -> actualizar el SPS.
                         t, o, r = _op_pendiente
-
                         torno.encolar(t, o, r)
-
-                        log_callback(f"[FIN RUTINA] Encolado: tipo={t} "
-
-                                     f"op={o} rosca={r}")
-
-                        _op_pendiente = None
-
+                        log_callback(f"[FIN RUTINA] Encolado (modo viejo): "
+                                     f"tipo={t} op={o} rosca={r}")
                     else:
-
                         log_callback("!!! [FIN RUTINA] Aviso sin operacion "
-
-                                     "pendiente (nada que encolar)")
-
+                                     "(nada que encolar)")
+                    _op_pendiente = None
                     # El pallet en proceso termino: limpiar su panel
 
                     with estado.lock:
@@ -688,9 +709,9 @@ def manejar_robot(conn, addr, log_callback):
 
                 # ENCOLAR AL TORNO segun el resultado de la cinta:
 
-                #   VACIO  -> KUKA carga pieza nueva -> torno hara OP20 (op=2)
+                #   VACIO  -> KUKA carga pieza nueva -> torno hara OP10 (op=1)
 
-                #   ARRIBA -> KUKA da vuelta pieza   -> torno hara OP10 (op=1)
+                #   ARRIBA -> KUKA da vuelta pieza   -> torno hara OP20 (op=2)
 
                 #   ABAJO  -> error, no encolar
 
@@ -700,11 +721,11 @@ def manejar_robot(conn, addr, log_callback):
 
                 if orientacion == "VACIO":
 
-                    _op_pendiente = (tipo, 2, rosca)
+                    _op_pendiente = (tipo, 1, rosca)
 
                 elif orientacion == "ARRIBA":
 
-                    _op_pendiente = (tipo, 1, rosca)
+                    _op_pendiente = (tipo, 2, rosca)
 
                 # ABAJO no encola (es error)
 
@@ -3564,7 +3585,7 @@ class HMISpirax:
             txt = ("La cola esta vacia. No hay nada para mecanizar.\n"
                    "¿Confirmar arranque igual? (todo pasa como op=3)")
         else:
-            op_txt = {1: "dar vuelta (OP10)", 2: "cargar (OP20)",
+            op_txt = {1: "cargar (OP10)", 2: "dar vuelta (OP20)",
                       3: "dejar pasar"}.get(receta["op"], f"op={receta['op']}")
             txt = (f"Cola: {n} piezas.\n\n"
                    f"Proxima a mecanizar:\n"

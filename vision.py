@@ -77,6 +77,11 @@ DDS_DISCOVERY_WAIT_S = 5.0
 DDS_DISCOVERY_REINTENTOS = 10
 
 FRAMES_WARMUP = 20
+# Warmup EXTENDIDO para la primera apertura de cada camara despues de
+# arrancar el programa: viene "fria" y la exposicion tarda mas en
+# estabilizarse. Si el primer frame sale mal, la mascara no detecta piezas
+# y la mesa parece vacia. 150 frames ~ 5s a 30fps. Subir si hace falta.
+FRAMES_WARMUP_PRIMERA = 150
 PRIMER_FRAME_TIMEOUT_MS = 15000
 
 
@@ -1118,6 +1123,7 @@ class DetectorOrientacion:
         self._serial = serial
         self._config = cargar_config(tipo_inicial, estacion_inicial)
         self._referencia_blur = None
+        self._ya_abrio_alguna_vez = False
 
     # ---------- API ----------
 
@@ -1272,8 +1278,13 @@ class DetectorOrientacion:
                             f"frame a tiempo. Puede ser congestion de red o que "
                             f"la otra camara este saturando el enlace. Detalle: {e}")
 
-                    for _ in range(FRAMES_WARMUP):
+                    if not getattr(self, "_ya_abrio_alguna_vez", False):
+                        n_warmup = FRAMES_WARMUP_PRIMERA
+                    else:
+                        n_warmup = FRAMES_WARMUP
+                    for _ in range(n_warmup):
                         self._pipeline.wait_for_frames()
+                    self._ya_abrio_alguna_vez = True
                 else:
                     self._pipeline = cv2.VideoCapture(0)
                     if not self._pipeline.isOpened():
