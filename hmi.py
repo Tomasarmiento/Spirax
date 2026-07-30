@@ -688,9 +688,9 @@ def manejar_robot(conn, addr, log_callback):
 
                 # ENCOLAR AL TORNO segun el resultado de la cinta:
 
-                #   VACIO  -> KUKA carga pieza nueva -> torno hara op10
+                #   VACIO  -> KUKA carga pieza nueva -> torno hara OP20 (op=2)
 
-                #   ARRIBA -> KUKA da vuelta pieza   -> torno hara op20
+                #   ARRIBA -> KUKA da vuelta pieza   -> torno hara OP10 (op=1)
 
                 #   ABAJO  -> error, no encolar
 
@@ -700,11 +700,11 @@ def manejar_robot(conn, addr, log_callback):
 
                 if orientacion == "VACIO":
 
-                    _op_pendiente = (tipo, 1, rosca)
+                    _op_pendiente = (tipo, 2, rosca)
 
                 elif orientacion == "ARRIBA":
 
-                    _op_pendiente = (tipo, 2, rosca)
+                    _op_pendiente = (tipo, 1, rosca)
 
                 # ABAJO no encola (es error)
 
@@ -3183,6 +3183,17 @@ class HMISpirax:
                   bg='#2d8f3a', fg='white',
                   command=self._confirmar_arranque_torno).pack(side='left', padx=2)
 
+        # PRIMERA PIEZA / CINTA VACIA: destraba el primer pallet del
+        # pre-stopper en un arranque en frio (se destilda solo al usarse).
+        self.var_primera_pieza = tk.BooleanVar(value=False)
+        tk.Checkbutton(c_ctrl, text="PRIMERA PIEZA, CINTA VACIA",
+                       font=("Arial", 9, "bold"),
+                       variable=self.var_primera_pieza,
+                       bg='#2b2b2b', fg='#ffd24a',
+                       activebackground='#2b2b2b', activeforeground='#ffd24a',
+                       selectcolor='#2b2b2b',
+                       command=self._primera_pieza_torno).pack(side='left', padx=8)
+
 
 
 
@@ -3553,7 +3564,7 @@ class HMISpirax:
             txt = ("La cola esta vacia. No hay nada para mecanizar.\n"
                    "¿Confirmar arranque igual? (todo pasa como op=3)")
         else:
-            op_txt = {1: "cargar (OP10)", 2: "dar vuelta (OP20)",
+            op_txt = {1: "dar vuelta (OP10)", 2: "cargar (OP20)",
                       3: "dejar pasar"}.get(receta["op"], f"op={receta['op']}")
             txt = (f"Cola: {n} piezas.\n\n"
                    f"Proxima a mecanizar:\n"
@@ -3563,6 +3574,41 @@ class HMISpirax:
         if messagebox.askyesno("Confirmar arranque", txt):
             torno.confirmar_arranque()
             self._refrescar_cola_torno()
+
+
+    def _primera_pieza_torno(self):
+        """PRIMERA PIEZA / CINTA VACIA: libera el primer pallet trabado en el
+        pre-stopper (op=3 + #553=0 + R55.3=1). Se destilda solo: es una
+        accion de una sola vez."""
+        if not self.var_primera_pieza.get():
+            return   # lo destildaron a mano, no hacer nada
+
+        if not torno.conectado:
+            self.var_primera_pieza.set(False)
+            messagebox.showwarning("Primera pieza",
+                                   "El torno no esta conectado.")
+            return
+
+        n_cola = len(torno.cola)
+        ok = messagebox.askyesno(
+            "PRIMERA PIEZA, CINTA VACIA",
+            "Arranque en frio con la cinta vacia.\n\n"
+            f"Se BORRA la cola entera ({n_cola} items): con la cinta vacia\n"
+            "no corresponden a ningun pallet real.\n\n"
+            "Y se libera el primer pallet del pre-stopper:\n"
+            "  - macros en op=3 (pasa SIN mecanizar)\n"
+            "  - #553 = 0\n"
+            "  - R55.3 = 1 (el ladder suelta el pre-stopper)\n\n"
+            "La pieza recircula y la camara la vuelve a evaluar.\n"
+            "¿Continuar?")
+        if not ok:
+            self.var_primera_pieza.set(False)
+            return
+
+        torno.liberar_primera_pieza()
+        # Accion de una sola vez: se destilda
+        self.var_primera_pieza.set(False)
+        self._refrescar_cola_torno()
 
 
     def _reconectar_torno(self):

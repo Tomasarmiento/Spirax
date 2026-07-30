@@ -1169,8 +1169,20 @@ class DetectorOrientacion:
             return self._estacion
 
     def tiene_referencia_activa(self):
+        """True si hay referencia disponible para el tipo/estacion actual.
+
+        OJO: _referencia_blur solo se carga dentro de start(). Con el
+        programa recien abierto (o antes del primer start) esta en None
+        aunque el archivo de referencia EXISTA en disco. Si nos fijaramos
+        solo en memoria, la primera consulta en automatico devolveria
+        (0,0) -> el Master lo lee como "mesa vacia" con la mesa llena.
+        Por eso, si no esta en memoria, chequeamos el archivo: start() la
+        va a cargar desde ahi igual.
+        """
         with self._lock:
-            return self._referencia_blur is not None
+            if self._referencia_blur is not None:
+                return True
+            return os.path.exists(path_referencia(self._tipo, self._estacion))
 
     # ---------- start/stop ----------
 

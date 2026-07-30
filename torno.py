@@ -77,10 +77,9 @@ DEFAULTS = {
     "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
     "macro_fin": 553,         # FLAG fin de mecanizado
     "macro_cola": 554,        # CANTIDAD de piezas en la cola (informativo)
-    # --- Sensor de salida del husillo (PMC) ---
+    # --- Sensor de salida de pallet (PMC) ---
     # Descuenta 1 de la cola en el flanco de bajada (1->0): el pallet
-    # termino de pasar por el sensor de salida.
-    # Sensor de salida de pallet. El ladder ESTIRA el pulso del sensor
+    # termino de pasar. El ladder ESTIRA el pulso del sensor
     # (que fisicamente es muy corto) a ~2s en R54.0, para que el polling
     # de la PC lo agarre seguro.
     "sensor_salida_pmc_tipo": 5,   # R = 5
@@ -100,7 +99,16 @@ DEFAULTS = {
     "receta_lista_pmc_tipo": 5,    # R = 5
     "receta_lista_byte": 55,       # R55
     "receta_lista_bit": 3,         # R55.3
+    # Fallos FOCAS consecutivos antes de declarar desconectado y reconectar.
+    # Con polling de 200ms, 5 fallos ~= 1 segundo.
+    "max_fallos_focas": 5,
     "polling_ms": 200,        # intervalo de polling (sensor + #553 + heartbeat R50)
+    # Tiempo MAXIMO reintentando conectar al torno antes de rendirse.
+    # Cuenta desde el primer intento fallido; se reinicia al conectar.
+    # Cuando se agota, deja de intentar y hay que apretar "Reconectar".
+    # 0 = reintentar para siempre.
+    "reintento_conexion_max_s": 300,   # 5 minutos
+    "reintento_conexion_espera_s": 2.0,
     "persist_path": "cola_torno.json",
 }
 
@@ -274,6 +282,14 @@ class TornoFanuc:
         self._ultimo_escrito = (None, None, None)  # (tipo, op, rosca)
         # Arranque en modo SEGURO hasta confirmar (ver confirmar_arranque).
         self._arranque_confirmado = False
+        # Pedido pendiente de PRIMERA PIEZA (lo atiende el thread sync)
+        self._pedido_primera_pieza = False
+        # Control de reintentos de conexion
+        self._reintento_desde = None
+        self._reintento_agotado = False
+        # Fallos FOCAS consecutivos (para detectar torno apagado y reconectar)
+        self._fallos_focas = 0
+        self._ultimo_fallo_log = None
         # Cola de pedidos para que TODAS las llamadas FOCAS se hagan
         # desde el thread sincronizador. La fwlib32 de FANUC exige que
         # el handle se use desde el mismo thread que lo creo, sino
@@ -352,6 +368,74 @@ class TornoFanuc:
         self._ultimo_escrito = (None, None, None)
         self._log("[TORNO] Arranque confirmado: empiezo a mecanizar segun la cola")
 
+    def liberar_primera_pieza(self):
+        """PRIMERA PIEZA / CINTA VACIA.
+
+        Arranque en frio con la cinta vacia: la primera pieza queda trabada
+        en el pre-stopper del husillo porque nunca salio un pallet anterior
+        (no hay flanco del sensor de salida) ni el torno mando su "termine"
+        (#553=1). Este pedido da el empujon inicial:
+
+          1) escribe op=3 en las macros (NO mecanizar: no sabemos en que
+             estado quedo la pieza que estaba en el spot 2),
+          2) baja #553=0  -> el NC lee las macros y arranca,
+          3) sube R55.3=1 -> el ladder libera el pre-stopper.
+
+        Despues el ciclo se normaliza solo: el NC "mecaniza aire" (op=3),
+        levanta #553=1, el pallet sale, pasa por el sensor de salida y la
+        PC retoma el ciclo normal (descuenta + escribe receta + libera).
+
+        NO ejecuta las llamadas FOCAS aca: solo marca el pedido. El thread
+        sincronizador lo atiende en su proximo tick (~polling_ms), porque
+        la fwlib32 exige que todas las llamadas salgan de ese thread.
+        Si se pide varias veces antes del tick, se ejecuta UNA sola.
+        """
+        if not self.conectado:
+            self._log("[PRIMERA PIEZA] Torno no conectado")
+            return False
+        # Cinta vacia = no hay pallets en circulacion, asi que la cola no
+        # puede corresponder a nada fisico: se borra entera. Si quedara algo,
+        # el primer pallet real se mecanizaria con la receta de un fantasma.
+        n = len(self.cola)
+        if n > 0:
+            self.cola.limpiar()
+            self._log(f"[PRIMERA PIEZA] Cola borrada ({n} items): la cinta "
+                      f"esta vacia, no corresponden a pallets reales")
+        self._pedido_primera_pieza = True
+        self._log("[PRIMERA PIEZA] Pedido registrado, ejecutando...")
+        return True
+
+    def _ejecutar_primera_pieza(self):
+        """Hace el trabajo real de PRIMERA PIEZA. Corre SIEMPRE en el thread
+        sincronizador (llamado desde _tick_sincronizar)."""
+        mac_tipo = self.config["macro_tipo"]
+        mac_op = self.config["macro_op"]
+        mac_rosca = self.config["macro_rosca"]
+        try:
+            with self._client_lock:
+                # 1) op=3 explicito (no confiar en el estado previo de las
+                #    macros: si el arranque ya estaba confirmado podrian
+                #    tener una receta real y mecanizaria de verdad).
+                self._client.set_macro(mac_tipo, 0)
+                self._client.set_macro(mac_op, 3)
+                self._client.set_macro(mac_rosca, 0)
+            self._ultimo_escrito = (0, 3, 0)
+            self._log("[PRIMERA PIEZA] Macros -> op=3 (dejar pasar sin mecanizar)")
+
+            # 2) bajar #553 (el NC ya puede leer las macros)
+            with self._client_lock:
+                self._client.set_macro(self.config["macro_fin"], 0)
+            self._log("[PRIMERA PIEZA] #553=0")
+
+            # 3) subir R55.3 (el ladder libera el pre-stopper)
+            self._avisar_receta_lista()
+            self._log("[PRIMERA PIEZA] Liberada. El ciclo se normaliza al "
+                      "pasar por el sensor de salida.")
+            return True
+        except Exception as e:
+            self._log(f"[PRIMERA PIEZA] Error: {type(e).__name__}: {e}")
+            return False
+
     def todos_op3(self):
         """Marca todas las entradas de la cola como op=3 (dejar pasar).
         No borra: los pallets recirculan sin mecanizar y la cola drena
@@ -383,6 +467,10 @@ class TornoFanuc:
                     pass
                 self._client = None
         self.conectado = False
+        # Rehabilitar los reintentos: si nos habiamos rendido por timeout,
+        # este es el boton que vuelve a arrancar la cuenta desde cero.
+        self._reintento_agotado = False
+        self._reintento_desde = None
         # Borrar el cache del ultimo error logueado para que el proximo
         # intento de _intentar_conectar lo loguee de nuevo (aunque sea
         # el mismo error).
@@ -503,11 +591,36 @@ class TornoFanuc:
                 # Antes de intentar conectar, fallar pedidos colgados:
                 # vienen de la HMI esperando una respuesta que no llegara.
                 self._cancelar_queue("Torno desconectado")
-                self._intentar_conectar()
-                if not self.conectado:
-                    # Esperar mas antes del proximo intento
-                    time.sleep(2.0)
+
+                # Si ya nos rendimos, no intentar mas hasta que la HMI
+                # llame a reconectar().
+                if getattr(self, "_reintento_agotado", False):
+                    time.sleep(1.0)
                     continue
+
+                # Marcar cuando arranco esta racha de intentos fallidos
+                if getattr(self, "_reintento_desde", None) is None:
+                    self._reintento_desde = time.time()
+
+                self._intentar_conectar()
+
+                if not self.conectado:
+                    max_s = self.config.get("reintento_conexion_max_s", 300)
+                    transcurrido = time.time() - self._reintento_desde
+                    if max_s and transcurrido >= max_s:
+                        self._reintento_agotado = True
+                        self._log(f"[TORNO] Sin conexion despues de "
+                                  f"{int(transcurrido)}s ({int(max_s/60)} min): "
+                                  f"dejo de intentar. Apreta 'Reconectar' "
+                                  f"cuando el torno este disponible.")
+                        self.ultimo_error = (f"Sin conexion tras {int(max_s/60)} "
+                                             f"min de intentos")
+                        continue
+                    time.sleep(self.config.get("reintento_conexion_espera_s", 2.0))
+                    continue
+                # Conecto: limpiar el control de reintentos
+                self._reintento_desde = None
+                self._reintento_agotado = False
 
             # Procesar pedidos de la HMI (read_macro, status, etc).
             # Se hace en el mismo thread que creo el handle.
@@ -519,6 +632,11 @@ class TornoFanuc:
             # Conectado: hacer la sincronizacion
             try:
                 self._tick_sincronizar()
+            except ConnectionError as e:
+                # Torno apagado / sin red: no es un bug, es reconexion normal.
+                self._log(f"[TORNO] {e}")
+                self.ultimo_error = "Sin comunicacion con el torno"
+                self._desconectar_silencioso()
             except FocasError as e:
                 self._log(f"!!! FocasError en sync: {e}")
                 self.ultimo_error = str(e)
@@ -561,6 +679,10 @@ class TornoFanuc:
             self.conectado = True
             self.ultimo_error = None
             self._ultimo_escrito = (None, None, None)  # forzar reescritura
+            self._fallos_focas = 0
+            self._ultimo_fallo_log = None
+            self._sensor_prev = None
+            self._sensor_visto_alto = False
             # Arranque en modo seguro: no mecanizar hasta que el operador
             # confirme que la cola coincide con los pallets fisicos.
             self._arranque_confirmado = False
@@ -590,7 +712,36 @@ class TornoFanuc:
                     pass
                 self._client = None
         self.conectado = False
+        # Limpiar estado del sensor: al reconectar hay que re-sincronizar el
+        # nivel, si no un 1->0 espurio descontaria un pallet que no salio.
+        self._sensor_prev = None
+        self._sensor_visto_alto = False
+        self._receta_pendiente = False
+        self._fallos_focas = 0
+        self._ultimo_fallo_log = None
         self._cancelar_queue("Torno desconectado durante operacion")
+
+    def _registrar_fallo_focas(self, donde, e):
+        """Cuenta fallos FOCAS consecutivos. Si se pasa del umbral, lanza para
+        que _loop_sync marque desconectado y reintente conectar solo (caso
+        tipico: apagaron el torno). Loguea una sola vez por tipo de error
+        para no spamear el log cada 200ms."""
+        self._fallos_focas += 1
+        msg = f"{donde}: {e}"
+        if msg != self._ultimo_fallo_log:
+            self._log(f"[TORNO] {msg}")
+            self._ultimo_fallo_log = msg
+        if self._fallos_focas >= self.config.get("max_fallos_focas", 5):
+            raise ConnectionError(
+                f"{self._fallos_focas} fallos FOCAS seguidos ({donde}). "
+                f"Torno apagado o sin red: voy a reconectar.")
+
+    def _ok_focas(self):
+        """Una llamada FOCAS anduvo: resetear el contador de fallos."""
+        if self._fallos_focas:
+            self._log(f"[TORNO] Comunicacion recuperada")
+        self._fallos_focas = 0
+        self._ultimo_fallo_log = None
 
     def _procesar_sensor_salida(self):
         """Sensor de salida de pallet (R54.0, pulso estirado 2s por ladder).
@@ -607,8 +758,9 @@ class TornoFanuc:
         try:
             with self._client_lock:
                 estado = self._client.read_pmc_bit(tipo, byte, bit)
+            self._ok_focas()
         except Exception as e:
-            self._log(f"[SENSOR] Error leyendo SQX{byte}.{bit}: {e}")
+            self._registrar_fallo_focas(f"Error leyendo sensor R{byte}.{bit}", e)
             return
 
         prev = getattr(self, "_sensor_prev", None)
@@ -738,9 +890,9 @@ class TornoFanuc:
                 if ((b >> bit) & 1) == 0:
                     self._client.write_pmc_byte(tipo, byte, b | (1 << bit))
                     self._hb_pulsos = getattr(self, "_hb_pulsos", 0) + 1
+            self._ok_focas()
         except Exception as e:
-            # No romper el sync si falla; el ladder detectara la caida.
-            self._log(f"[HEARTBEAT] Error en R{byte}.{bit}: {e}")
+            self._registrar_fallo_focas(f"Error en heartbeat R{byte}.{bit}", e)
 
     def _tick_sincronizar(self):
         """Una iteracion del sync. Asume conectado."""
@@ -762,6 +914,12 @@ class TornoFanuc:
         #  #553 = handshake: el torno lo pone en 1 al terminar y espera el 0.
         #  El 0 lo baja el sensor cuando sale el pallet (receta ya lista).
         # ============================================================
+        # Pedido de PRIMERA PIEZA / CINTA VACIA (desde la HMI). Se atiende
+        # aca para que las llamadas FOCAS salgan de este thread.
+        if self._pedido_primera_pieza:
+            self._pedido_primera_pieza = False
+            self._ejecutar_primera_pieza()
+
         self._procesar_sensor_salida()
 
         # Heartbeat / linea de vida PC<->torno (R50.0). Si el ladder la
