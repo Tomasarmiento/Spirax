@@ -99,6 +99,30 @@ DEFAULTS = {
     "receta_lista_pmc_tipo": 5,    # R = 5
     "receta_lista_byte": 55,       # R55
     "receta_lista_bit": 3,         # R55.3
+    # --- VERIFICACION DEL PRE-STOPPER (confirma la lectura de la camara) ---
+    # Antes de mandarle la receta al torno y liberar el pre-stopper, se
+    # confirma que la pieza fisica coincide con lo que dice la cola.
+    #   - Pallet en posicion: sensor del PMC (X10.1). Sin esto no se puede
+    #     medir: los sensores del pre-stopper no son validos.
+    #   - Operacion fisica: dos sensores en el modulo DIO de la PC
+    #     (DI0=op_20, DI1=presencia_pieza). Ver dio.py.
+    # Si no coinciden -> NO se libera y salta alarma.
+    "verificar_prestopper": True,
+    "pallet_en_pos_pmc_tipo": 3,   # X = 3
+    "pallet_en_pos_byte": 10,      # X10
+    "pallet_en_pos_bit": 1,        # X10.1
+    # Si el modulo DIO no esta disponible (driver/permisos):
+    #   True  = NO liberar (seguro, pero para la linea)
+    #   False = liberar sin verificar, avisando en el log
+    "verificacion_obligatoria": True,
+    # TRADUCCION op interno -> valor que se escribe en #550.
+    # Internamente 1 = OP10 y 2 = OP20 (asi coincide con los sensores del
+    # pre-stopper: presencia sin op_20 = OP10, op_20 = OP20). Pero el
+    # programa NC del torno puede esperar otros numeros. Esta tabla traduce
+    # SOLO al escribir la macro, sin tocar la logica interna ni la
+    # verificacion.
+    #   Si el torno hace OP20 cuando le mandas OP10, invertir 1 y 2.
+    "mapa_op_macro": {1: 1, 2: 2, 3: 3},   # identidad: el NC usa 1/2/3 tal cual
     # Fallos FOCAS consecutivos antes de declarar desconectado y reconectar.
     # Con polling de 200ms, 5 fallos ~= 1 segundo.
     "max_fallos_focas": 5,
@@ -287,6 +311,19 @@ class TornoFanuc:
         # Control de reintentos de conexion
         self._reintento_desde = None
         self._reintento_agotado = False
+        # Verificacion del pre-stopper
+        self.verificacion_fallida = False
+        self.ultimo_pallet_en_pos = None
+        self._receta_esperada = None
+        self._verif_bloqueada = False
+        self.ultimo_sensor_salida = None
+        # True desde que se usa PRIMERA PIEZA hasta que se libera el
+        # siguiente pallet por el ciclo normal. La HMI lo usa para dejar el
+        # checkbox tildado y bloqueado mientras dura.
+        self.modo_primera_pieza = False
+        self._verif_fallida_msg = None
+        self._avisado_esperando_pallet = False
+        self._avisado_dio_falla = False
         # Fallos FOCAS consecutivos (para detectar torno apagado y reconectar)
         self._fallos_focas = 0
         self._ultimo_fallo_log = None
@@ -351,8 +388,6 @@ class TornoFanuc:
         n = len(self.cola)
         self.cola.limpiar()
         self._log(f"[TORNO] Cola limpiada ({n} items removidos)")
-        # Forzar reescritura de ceros
-        self._ultimo_escrito = (None, None, None)
 
     def info_arranque(self):
         """Devuelve (n_cola, receta_primero) para el dialogo de confirmacion.
@@ -365,8 +400,8 @@ class TornoFanuc:
         """El operador confirmo que la cola coincide con los pallets fisicos.
         A partir de aca la PC escribe recetas reales (sale del modo op=3)."""
         self._arranque_confirmado = True
-        self._ultimo_escrito = (None, None, None)
-        self._log("[TORNO] Arranque confirmado: empiezo a mecanizar segun la cola")
+        self._log("[TORNO] Arranque confirmado: las liberaciones verificadas "
+                  "escriben receta real")
 
     def liberar_primera_pieza(self):
         """PRIMERA PIEZA / CINTA VACIA.
@@ -401,7 +436,15 @@ class TornoFanuc:
             self.cola.limpiar()
             self._log(f"[PRIMERA PIEZA] Cola borrada ({n} items): la cinta "
                       f"esta vacia, no corresponden a pallets reales")
+        # El pallet que vamos a liberar necesita SU entrada en la cola:
+        # cuando salga por el sensor va a descontar una (descuenta siempre).
+        # Sin esta entrada, consumiria la del pallet SIGUIENTE y toda la
+        # cola quedaria corrida en uno para siempre.
+        self.cola.encolar(0, 3, 0)
+        self._log("[PRIMERA PIEZA] Encolada entrada op=3 para el pallet "
+                  "que se libera (mantiene la cola alineada)")
         self._pedido_primera_pieza = True
+        self.modo_primera_pieza = True
         self._log("[PRIMERA PIEZA] Pedido registrado, ejecutando...")
         return True
 
@@ -417,7 +460,7 @@ class TornoFanuc:
                 #    macros: si el arranque ya estaba confirmado podrian
                 #    tener una receta real y mecanizaria de verdad).
                 self._client.set_macro(mac_tipo, 0)
-                self._client.set_macro(mac_op, 3)
+                self._client.set_macro(mac_op, self._op_a_macro(3))
                 self._client.set_macro(mac_rosca, 0)
             self._ultimo_escrito = (0, 3, 0)
             self._log("[PRIMERA PIEZA] Macros -> op=3 (dejar pasar sin mecanizar)")
@@ -429,6 +472,18 @@ class TornoFanuc:
 
             # 3) subir R55.3 (el ladder libera el pre-stopper)
             self._avisar_receta_lista()
+
+            # Esta liberacion manual REEMPLAZA cualquier liberacion que
+            # hubiera quedado pendiente (apuntaba a un estado anterior y a
+            # una cola que acabamos de borrar). Si no se limpia, cuando este
+            # pallet salga por el sensor salta la anomalia de "salio con la
+            # liberacion todavia pendiente" y la cola queda corrida.
+            self._receta_pendiente = False
+            self.verificacion_fallida = False
+            self._verif_fallida_msg = None
+            self._ctx_verif_log = None
+            self._ultimo_desencolado = None
+
             self._log("[PRIMERA PIEZA] Liberada. El ciclo se normaliza al "
                       "pasar por el sensor de salida.")
             return True
@@ -442,14 +497,12 @@ class TornoFanuc:
         con el sensor."""
         n = self.cola.todos_op3()
         self._log(f"[TORNO] {n} items pasados a op=3 (dejar pasar / recircular)")
-        self._ultimo_escrito = (None, None, None)
         return n
 
     def quitar_indice(self, indice):
         ok = self.cola.quitar_indice(indice)
         if ok:
             self._log(f"[TORNO] Item indice {indice} quitado")
-            self._ultimo_escrito = (None, None, None)
         return ok
 
     def reconectar(self):
@@ -540,6 +593,50 @@ class TornoFanuc:
         """Escribe una macro arbitraria."""
         self._run_in_focas_thread(
             lambda: self._client.set_macro(int(num), float(valor), int(decimals)))
+
+    # ---- PMC (senales del ladder: X, Y, R, D, ...) ----
+    # Codigos de area: G=0, F=1, Y=2, X=3, A=4, R=5, T=6, K=7, C=8, D=9
+    AREAS_PMC = {"G": 0, "F": 1, "Y": 2, "X": 3, "A": 4,
+                 "R": 5, "T": 6, "K": 7, "C": 8, "D": 9}
+
+    def read_pmc_byte(self, area, byte_num):
+        """Lee un byte del PMC. area puede ser letra ('R') o codigo (5)."""
+        code = self.AREAS_PMC.get(str(area).upper(), area) \
+            if not isinstance(area, int) else area
+        return self._run_in_focas_thread(
+            lambda: self._client.read_pmc_byte(int(code), int(byte_num)))
+
+    def read_pmc_bit(self, area, byte_num, bit):
+        """Lee un bit puntual del PMC (ej: R54.0 -> 'R', 54, 0)."""
+        code = self.AREAS_PMC.get(str(area).upper(), area) \
+            if not isinstance(area, int) else area
+        return self._run_in_focas_thread(
+            lambda: self._client.read_pmc_bit(int(code), int(byte_num), int(bit)))
+
+    def write_pmc_byte(self, area, byte_num, valor):
+        """Escribe un byte COMPLETO del PMC. Cuidado: pisa los 8 bits."""
+        code = self.AREAS_PMC.get(str(area).upper(), area) \
+            if not isinstance(area, int) else area
+        self._run_in_focas_thread(
+            lambda: self._client.write_pmc_byte(int(code), int(byte_num),
+                                                int(valor) & 0xFF))
+
+    def write_pmc_bit(self, area, byte_num, bit, valor):
+        """Escribe UN bit del PMC respetando los otros 7 del byte."""
+        code = self.AREAS_PMC.get(str(area).upper(), area) \
+            if not isinstance(area, int) else area
+        b_num = int(byte_num)
+        b = int(bit)
+        estado = bool(valor)
+
+        def _trabajo():
+            actual = self._client.read_pmc_byte(int(code), b_num)
+            mask = 1 << b
+            nuevo = (actual | mask) if estado else (actual & ~mask)
+            self._client.write_pmc_byte(int(code), b_num, nuevo & 0xFF)
+            return nuevo
+
+        return self._run_in_focas_thread(_trabajo)
 
     def status(self):
         """Devuelve el TornoStatus del cliente Fanuc, o None si no conectado."""
@@ -745,11 +842,15 @@ class TornoFanuc:
 
     def _procesar_sensor_salida(self):
         """Sensor de salida de pallet (R54.0, pulso estirado 2s por ladder).
-        En el flanco de bajada
-        (1->0) el pallet termino de pasar, entonces:
-          1) descuenta 1 de la cola (verdad fisica: salio un pallet),
-          2) escribe la receta del NUEVO primero en las macros,
-          3) baja #553 a 0 (avisa al torno "receta lista, arranca").
+
+        En el flanco de bajada (1->0) el pallet termino de pasar: DESCUENTA
+        uno de la cola (verdad fisica: salio un pallet) y marca que hay que
+        liberar el siguiente.
+
+        La liberacion NO se hace aca: la maneja _procesar_liberacion(), que
+        antes verifica #553, el pallet en posicion y que la pieza fisica
+        coincida con la cola.
+
         Exige el ciclo completo 0->1->0 para no contar de mas si el sensor
         tiembla con el pallet encima."""
         tipo = self.config["sensor_salida_pmc_tipo"]
@@ -759,6 +860,8 @@ class TornoFanuc:
             with self._client_lock:
                 estado = self._client.read_pmc_bit(tipo, byte, bit)
             self._ok_focas()
+            # Publicar para la HMI (pestaña I/O)
+            self.ultimo_sensor_salida = estado
         except Exception as e:
             self._registrar_fallo_focas(f"Error leyendo sensor R{byte}.{bit}", e)
             return
@@ -776,63 +879,314 @@ class TornoFanuc:
         if (not estado) and prev and getattr(self, "_sensor_visto_alto", False):
             # Flanco de bajada: el pallet SALIO.
             # 1) DESCONTAR siempre (verdad fisica: salio un pallet).
+            # ANOMALIA: si todavia habia una liberacion pendiente, significa
+            # que salio un pallet SIN que hayamos liberado el del pre-stopper.
+            # Eso no deberia poder pasar (el pre-stopper lo retiene) y deja la
+            # cola corrida en uno.
+            if getattr(self, "_receta_pendiente", False):
+                self._log("!!! [SENSOR] Salio un pallet con la liberacion "
+                          "TODAVIA PENDIENTE: el pre-stopper solto sin "
+                          "nuestra señal (revisar si R55.3 quedo en 1). "
+                          "Descarto la liberacion vieja y reevaluo desde el "
+                          "estado actual para no arrastrar el desfase.")
+                # La liberacion pendiente apuntaba a un pallet que ya se fue:
+                # queda obsoleta. Limpiar el estado para que la ventana nueva
+                # (la del descuento de abajo) se evalue limpia, en vez de
+                # seguir comparando contra una foto vieja.
+                self._receta_pendiente = False
+                self.verificacion_fallida = False
+                self._verif_fallida_msg = None
+                self._ctx_verif_log = None
+                self._receta_esperada = None
+
             quitado = self.cola.desencolar()
             if quitado is not None:
                 self.piezas_terminadas += 1
+                self._ultimo_desencolado = dict(quitado)
                 self._log(f"[SENSOR] Pallet salio -> desencolado: "
                           f"tipo={quitado['tipo']} op={quitado['op']} "
                           f"rosca={quitado.get('rosca', 0)} "
                           f"| total salidos={self.piezas_terminadas}")
             else:
+                self._ultimo_desencolado = None
                 self._log("[SENSOR] Pallet salio pero la cola estaba vacia "
                           "(paso uno sin encolar)")
+
+            # CAPTURA EN EL INSTANTE DEL DESCUENTO.
+            # Posiciones fisicas en este momento (el mecanizado ya salio):
+            #   STOPPER      = cola #1  -> proximo a mecanizar: A EL va la
+            #                             receta y el #553=0.
+            #   PRE-STOPPER  = cola #2  -> el que LEEN los sensores fisicos
+            #                             (op_20 / presencia): contra el se
+            #                             verifica la alineacion de la cola.
+            snap = self.cola.snapshot()
+
+            def _receta(item):
+                if item is None:
+                    return (0, 3, 0)
+                return (int(item["tipo"]), int(item["op"]),
+                        int(item.get("rosca", 0)))
+
+            self._receta_esperada = _receta(snap[0] if len(snap) >= 1 else None)
+            op_pre = snap[1]["op"] if len(snap) >= 2 else None
+            self._log(f"[VERIF] Tras el descuento: mandar op="
+                      f"{self._receta_esperada[1]} (stopper, cola #1) | "
+                      f"verificar op={op_pre if op_pre is not None else '?'} "
+                      f"(pre-stopper, cola #2) | {len(snap)} en cola")
+
             self._sensor_visto_alto = False
 
-            # 2) Escribir la receta nueva + bajar #553 SOLO si el torno YA
-            #    termino (#553==1). Asi nunca pisamos la receta que el torno
-            #    esta usando en ese momento. Si todavia no termino, dejamos
-            #    la escritura pendiente para cuando confirme el fin.
-            try:
-                with self._client_lock:
-                    fin = self._client.get_macro(self.config["macro_fin"])
-            except Exception as e:
-                self._log(f"[SENSOR] No se pudo leer #553: {e}")
-                fin = 0
-            if fin == 1:
-                self._escribir_receta_actual()
-                try:
-                    with self._client_lock:
-                        self._client.set_macro(self.config["macro_fin"], 0)
-                except Exception as e:
-                    self._log(f"[SENSOR] No se pudo bajar #553: {e}")
-                # Avisar al ladder que la receta esta cargada (R55.3=1)
-                self._avisar_receta_lista()
-                self._receta_pendiente = False
-            else:
-                # El pallet salio pero el torno aun no confirmo fin: marcar
-                # que hay que escribir la receta apenas #553 llegue a 1.
-                self._receta_pendiente = True
+            # Queda pendiente liberar el siguiente. NO se libera aca:
+            # primero hay que esperar que el torno confirme fin (#553==1),
+            # que el pallet siguiente este EN POSICION en el pre-stopper
+            # (X10.1) y que la pieza fisica COINCIDA con la cola.
+            # Lo maneja _procesar_liberacion().
+            # Ventana NUEVA: la captura recien se tomo, se puede comparar.
+            self._verif_bloqueada = False
+            self._receta_pendiente = True
 
         self._sensor_prev = estado
 
-        # Si quedo una escritura pendiente (el pallet salio antes de que el
-        # torno confirmara el fin), completarla cuando #553 llegue a 1.
+        # Intentar liberar el siguiente (si hay algo pendiente).
         if getattr(self, "_receta_pendiente", False):
-            try:
-                with self._client_lock:
-                    fin = self._client.get_macro(self.config["macro_fin"])
-            except Exception:
-                fin = 0
-            if fin == 1:
-                self._escribir_receta_actual()
-                try:
-                    with self._client_lock:
-                        self._client.set_macro(self.config["macro_fin"], 0)
-                except Exception as e:
-                    self._log(f"[SENSOR] No se pudo bajar #553 (pend): {e}")
-                # Avisar al ladder que la receta esta cargada (R55.3=1)
-                self._avisar_receta_lista()
-                self._receta_pendiente = False
+            self._procesar_liberacion()
+
+    def reintentar_verificacion(self):
+        """Desbloquea la verificacion y recaptura desde el estado ACTUAL de
+        la cola: receta = cola #1 (stopper), verificacion contra cola #2
+        (pre-stopper). Usar despues de corregir un 'NO COINCIDE'."""
+        snap = self.cola.snapshot()
+        if len(snap) >= 1:
+            it = snap[0]
+            self._receta_esperada = (int(it["tipo"]), int(it["op"]),
+                                     int(it.get("rosca", 0)))
+        else:
+            self._receta_esperada = (0, 3, 0)
+        op_pre = snap[1]["op"] if len(snap) >= 2 else None
+        self._verif_bloqueada = False
+        self.verificacion_fallida = False
+        self._verif_fallida_msg = None
+        self._ctx_verif_log = None
+        self._receta_pendiente = True
+        self._log(f"[VERIF] Reintento manual: mandar op="
+                  f"{self._receta_esperada[1]} (cola #1) | verificar op="
+                  f"{op_pre if op_pre is not None else '?'} (cola #2) | "
+                  f"{len(snap)} en cola")
+        return True
+
+    def _leer_pallet_en_posicion(self):
+        """Sensor del PMC que dice si el pallet esta clampeado en el
+        pre-stopper (X10.1). Sin esto los sensores del pre-stopper no son
+        validos todavia. Devuelve True/False, o None si fallo la lectura."""
+        try:
+            with self._client_lock:
+                v = self._client.read_pmc_bit(
+                    self.config["pallet_en_pos_pmc_tipo"],
+                    self.config["pallet_en_pos_byte"],
+                    self.config["pallet_en_pos_bit"])
+            # Publicar para la HMI (que no debe llamar a FOCAS desde la UI)
+            self.ultimo_pallet_en_pos = v
+            return v
+        except Exception as e:
+            self._log(f"[VERIF] Error leyendo pallet en posicion "
+                      f"(X{self.config['pallet_en_pos_byte']}."
+                      f"{self.config['pallet_en_pos_bit']}): {e}")
+            return None
+
+    def _procesar_liberacion(self):
+        """Libera el pre-stopper para el pallet SIGUIENTE, pero solo despues
+        de verificar que todo cierra. Corre en el thread sincronizador.
+
+        Secuencia de condiciones (si alguna no se cumple, no libera y vuelve
+        a intentar en el proximo tick):
+
+          1) #553 == 1        -> el torno confirmo que termino el anterior.
+          2) X10.1 == 1       -> el pallet siguiente esta EN POSICION en el
+                                 pre-stopper (recien ahi los sensores valen).
+          3) op fisica == op de la cola  -> la pieza real coincide con lo que
+                                 leyo la camara. Es la confirmacion cruzada.
+
+        Con las tres OK: escribe la receta, baja #553 y sube R55.3.
+        Si la 3 falla -> ALARMA y NO libera (el pallet queda frenado).
+        """
+        if getattr(self, "_verif_bloqueada", False):
+            return   # bloqueada por un NO COINCIDE: espera accion del operador
+
+        # --- 1) el torno tiene que haber terminado ---
+        try:
+            with self._client_lock:
+                fin = self._client.get_macro(self.config["macro_fin"])
+        except Exception as e:
+            self._log(f"[VERIF] No se pudo leer #553: {e}")
+            return
+        if fin != 1:
+            return   # todavia mecanizando: esperar
+
+        # Si la verificacion esta apagada, liberar como antes.
+        if not self.config.get("verificar_prestopper", True):
+            self._liberar_ahora()
+            return
+
+        # --- 2) el pallet tiene que estar en posicion ---
+        en_pos = self._leer_pallet_en_posicion()
+        if en_pos is None:
+            return          # error de lectura: reintentar
+        if not en_pos:
+            # Todavia no llego / no clampeo. Log una sola vez para no spamear.
+            if not getattr(self, "_avisado_esperando_pallet", False):
+                self._log("[VERIF] Esperando que el pallet clampee en el "
+                          "pre-stopper para poder medir...")
+                self._avisado_esperando_pallet = True
+            return
+        self._avisado_esperando_pallet = False
+
+        # --- 3) comparar la pieza fisica con la cola ---
+        # La receta a mandar es la capturada en el descuento (cola #1 =
+        # pallet del STOPPER, proximo a mecanizar).
+        receta = getattr(self, "_receta_esperada", None)
+        if receta is None:
+            self._log("!!! [VERIF] Liberacion pendiente sin captura del "
+                      "descuento: no escribo nada. Reviso en el proximo "
+                      "descuento.")
+            self._receta_pendiente = False
+            return
+
+        # op=3 (dejar pasar) no se mecaniza: liberar directo.
+        if receta[1] == 3:
+            self._log("[VERIF] Receta op=3 (dejar pasar): libero sin verificar")
+            self._liberar_ahora()
+            return
+
+        # A verificar: el pallet del PRE-STOPPER, que corresponde a cola #2
+        # (cola[1]). Se lee en vivo: el robot puede haberlo encolado despues
+        # del descuento. cola[0] NO se toca (es la receta ya capturada).
+        snap = self.cola.snapshot()
+        op_cola = int(snap[1]["op"]) if len(snap) >= 2 else None
+
+        try:
+            from dio import dio, nombre_op, OP_NINGUNA
+            op_fisica = dio.op_fisica()
+        except Exception as e:
+            # El modulo DIO no esta (driver, permisos, WinRing0 mal ubicado).
+            if self.config.get("verificacion_obligatoria", True):
+                if not getattr(self, "_avisado_dio_falla", False):
+                    self._log(f"!!! [VERIF] DIO no disponible ({e}). NO libero "
+                              f"(verificacion_obligatoria=True). Revisar "
+                              f"permisos de administrador y WinRing0x64.sys.")
+                    self._avisado_dio_falla = True
+                self.ultimo_error = "DIO no disponible: verificacion bloqueada"
+                return
+            self._log(f"!!! [VERIF] DIO no disponible ({e}). Libero SIN "
+                      f"verificar (verificacion_obligatoria=False)")
+            self._liberar_ahora()
+            return
+        self._avisado_dio_falla = False
+
+        ctx = (f"[VERIF] comparando pre-stopper: cola#2="
+               f"{'op' + str(op_cola) if op_cola is not None else 'SIN ENTRADA'}"
+               f" vs sensor={nombre_op(op_fisica)} | receta a mandar (cola#1)="
+               f"op{receta[1]} | {len(snap)} en cola")
+        if getattr(self, "_ctx_verif_log", None) != ctx:
+            self._log(ctx)
+            self._ctx_verif_log = ctx
+
+        if op_cola is None:
+            # Hay pallet fisico en el pre-stopper (X10.1 en 1) pero la cola
+            # no tiene segunda entrada -> desalineacion: bloquear.
+            op_cola = -1
+
+        if op_fisica == op_cola:
+            self._log(f"[VERIF] OK: pre-stopper coincide (cola#2 op={op_cola} "
+                      f"= sensor {nombre_op(op_fisica)}). Escribo receta "
+                      f"op={receta[1]} y libero.")
+            self._liberar_ahora()
+            return
+
+        # --- NO COINCIDE: alarma y no liberar ---
+        if op_fisica == OP_NINGUNA:
+            detalle = ("los sensores no ven pieza en el pallet")
+        else:
+            detalle = (f"el sensor dice {nombre_op(op_fisica)} "
+                       f"(op={op_fisica})")
+        esperado_txt = ("sin entrada en cola#2" if op_cola == -1
+                        else f"cola#2 dice op={op_cola}")
+        msg = (f"!!! [VERIF] NO COINCIDE en el pre-stopper: {esperado_txt} "
+               f"pero {detalle}. NO libero.")
+        if getattr(self, "_verif_fallida_msg", None) != msg:
+            self._log(msg)
+            self._log("!!! [VERIF] Verificacion BLOQUEADA: no vuelvo a "
+                      "comparar con esta foto (seria contra un pallet que "
+                      "puede haber cambiado). Corregir y apretar 'Reintentar "
+                      "verificacion', o esperar el proximo descuento.")
+            self._verif_fallida_msg = msg
+        # BLOQUEAR: cerrar la ventana para no seguir comparando la captura
+        # vieja contra el pallet que este ahora en el pre-stopper.
+        self._verif_bloqueada = True
+        self._receta_pendiente = False
+        self.ultimo_error = (f"Verificacion fallida: cola op={op_cola} vs "
+                             f"sensor {nombre_op(op_fisica)}")
+        self.verificacion_fallida = True
+
+    def _liberar_ahora(self):
+        """Escribe la receta, baja #553 y sube R55.3 (el ladder suelta el
+        pre-stopper). Solo se llama con las verificaciones ya pasadas."""
+        # Escribir EXACTAMENTE la receta que se verifico (no releer la cola:
+        # cola[0] a esta altura es el SIGUIENTE, escribirlo seria mandar la
+        # receta corrida en uno).
+        r = getattr(self, "_receta_esperada", None)
+        if r is None:
+            self._log("!!! [VERIF] _liberar_ahora sin receta capturada: NO "
+                      "escribo (evito mandar la receta de otro pallet)")
+            self._receta_pendiente = False
+            return
+        self._escribir_receta(r)
+        try:
+            with self._client_lock:
+                self._client.set_macro(self.config["macro_fin"], 0)
+        except Exception as e:
+            self._log(f"[VERIF] No se pudo bajar #553: {e}")
+        self._avisar_receta_lista()
+        self._receta_pendiente = False
+        self._verif_fallida_msg = None
+        self._ctx_verif_log = None
+        self._receta_esperada = None
+        self.verificacion_fallida = False
+        # Se libero el SIGUIENTE por el ciclo normal: sale el modo primera
+        # pieza (la HMI destilda y desbloquea el checkbox).
+        if self.modo_primera_pieza:
+            self.modo_primera_pieza = False
+            self._log("[PRIMERA PIEZA] Ciclo normal retomado (se libero el "
+                      "siguiente): modo primera pieza desactivado")
+
+    def _op_a_macro(self, op_interno):
+        """Traduce el op interno (1=OP10, 2=OP20, 3=dejar pasar) al valor que
+        espera el programa NC en #550. Ver config mapa_op_macro."""
+        mapa = self.config.get("mapa_op_macro") or {}
+        try:
+            return int(mapa.get(int(op_interno), int(op_interno)))
+        except Exception:
+            return int(op_interno)
+
+    def _escribir_receta(self, objetivo):
+        """Escribe una receta explicita (tipo, op, rosca) en las macros.
+        Se usa para que lo escrito sea EXACTAMENTE lo verificado."""
+        mac_tipo = self.config["macro_tipo"]
+        mac_op = self.config["macro_op"]
+        mac_rosca = self.config["macro_rosca"]
+        objetivo = (int(objetivo[0]), int(objetivo[1]), int(objetivo[2]))
+        if objetivo != self._ultimo_escrito:
+            op_macro = self._op_a_macro(objetivo[1])
+            with self._client_lock:
+                self._client.set_macro(mac_tipo, objetivo[0])
+                self._client.set_macro(mac_op, op_macro)
+                self._client.set_macro(mac_rosca, objetivo[2])
+            self._ultimo_escrito = objetivo
+            extra = ("" if op_macro == objetivo[1]
+                     else f"  (op interno {objetivo[1]} -> macro {op_macro})")
+            self.ultimo_evento = (f"[TORNO] Receta -> #{mac_tipo}={objetivo[0]} "
+                                  f"#{mac_op}={op_macro} "
+                                  f"#{mac_rosca}={objetivo[2]}{extra}")
+            self._log(self.ultimo_evento)
 
     def _escribir_receta_actual(self):
         """Escribe en las macros la receta del primero de la cola (o op=3 si
@@ -847,9 +1201,10 @@ class TornoFanuc:
             objetivo = (int(primero["tipo"]), int(primero["op"]),
                         int(primero.get("rosca", 0)))
         if objetivo != self._ultimo_escrito:
+            op_macro = self._op_a_macro(objetivo[1])
             with self._client_lock:
                 self._client.set_macro(mac_tipo, objetivo[0])
-                self._client.set_macro(mac_op, objetivo[1])
+                self._client.set_macro(mac_op, op_macro)
                 self._client.set_macro(mac_rosca, objetivo[2])
             self._ultimo_escrito = objetivo
             if objetivo == (0, 3, 0):
@@ -922,17 +1277,21 @@ class TornoFanuc:
 
         self._procesar_sensor_salida()
 
+        # Refrescar el sensor de "pallet en posicion" para la pestaña I/O
+        # (el metodo publica en self.ultimo_pallet_en_pos).
+        self._leer_pallet_en_posicion()
+
         # Heartbeat / linea de vida PC<->torno (R50.0). Si el ladder la
         # bajo a 0, la volvemos a 1: "PC viva". Si la PC muere, queda en 0.
         if self.config.get("usar_heartbeat", True):
             self._procesar_heartbeat()
 
-        # Respaldo SOLO para el arranque: si nunca escribimos nada aun,
-        # dejar la receta del primero (o op=3) puesta. Una vez que el ciclo
-        # esta en marcha, la receta la maneja el sensor+#553 (no aca), para
-        # no pisar la receta que el torno pueda estar usando.
+        # Respaldo SOLO para el arranque: dejar op=3 (dejar pasar) puesto.
+        # NUNCA escribir cola[0] aca: una receta real solo puede salir de
+        # una liberacion VERIFICADA (_liberar_ahora), si no se manda la
+        # receta de un pallet que nadie confirmo (y corrida en uno).
         if self._ultimo_escrito == (None, None, None):
-            self._escribir_receta_actual()
+            self._escribir_receta((0, 3, 0))
 
     def _log(self, msg):
         try:

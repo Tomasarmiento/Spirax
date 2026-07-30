@@ -20,6 +20,7 @@ Cambios vs version anterior:
 
 
 
+import json
 import os
 
 import socket
@@ -1244,6 +1245,7 @@ class HMISpirax:
         self.tab_calibrar = tk.Frame(self.nb, bg='#2b2b2b')
 
         self.tab_torno = tk.Frame(self.nb, bg='#2b2b2b')
+        self.tab_io = tk.Frame(self.nb, bg='#2b2b2b')
 
         self.tab_log = tk.Frame(self.nb, bg='#2b2b2b')
 
@@ -1254,6 +1256,7 @@ class HMISpirax:
         self.nb.add(self.tab_calibrar, text='  CALIBRAR  ')
 
         self.nb.add(self.tab_torno, text='  TORNO  ')
+        self.nb.add(self.tab_io, text='  I/O  ')
 
         self.nb.add(self.tab_log, text='  LOG  ')
 
@@ -1268,6 +1271,7 @@ class HMISpirax:
         self._construir_tab_calibrar()
 
         self._construir_tab_torno()
+        self._construir_tab_io()
 
         self._construir_tab_log()
 
@@ -3060,6 +3064,30 @@ class HMISpirax:
 
         cont.pack(fill='both', expand=True, padx=15, pady=10)
 
+        # ---------- PRIMERA PIEZA / CINTA VACIA (arriba, bien visible) ----------
+        # Queda TILDADO y BLOQUEADO desde que se usa hasta que se libera el
+        # pallet siguiente por el ciclo normal (torno.modo_primera_pieza).
+        self.f_primera = tk.Frame(cont, bg='#4a3a10', highlightthickness=2,
+                                  highlightbackground='#ffd24a')
+        self.f_primera.pack(fill='x', pady=(0, 12))
+        self.var_primera_pieza = tk.BooleanVar(value=False)
+        self.chk_primera = tk.Checkbutton(
+            self.f_primera,
+            text="  PRIMERA PIEZA  /  CINTA VACIA  ",
+            font=("Arial", 16, "bold"),
+            variable=self.var_primera_pieza,
+            bg='#4a3a10', fg='#ffd24a',
+            activebackground='#4a3a10', activeforeground='#ffd24a',
+            selectcolor='#2b2b2b',
+            padx=10, pady=10,
+            command=self._primera_pieza_torno)
+        self.chk_primera.pack(side='left')
+        self.lbl_primera_estado = tk.Label(
+            self.f_primera, text="", font=("Arial", 11),
+            bg='#4a3a10', fg='#ffd24a')
+        self.lbl_primera_estado.pack(side='left', padx=(10, 0))
+
+
 
 
         # Header
@@ -3204,19 +3232,29 @@ class HMISpirax:
                   bg='#2d8f3a', fg='white',
                   command=self._confirmar_arranque_torno).pack(side='left', padx=2)
 
-        # PRIMERA PIEZA / CINTA VACIA: destraba el primer pallet del
-        # pre-stopper en un arranque en frio (se destilda solo al usarse).
-        self.var_primera_pieza = tk.BooleanVar(value=False)
-        tk.Checkbutton(c_ctrl, text="PRIMERA PIEZA, CINTA VACIA",
-                       font=("Arial", 9, "bold"),
-                       variable=self.var_primera_pieza,
-                       bg='#2b2b2b', fg='#ffd24a',
-                       activebackground='#2b2b2b', activeforeground='#ffd24a',
-                       selectcolor='#2b2b2b',
-                       command=self._primera_pieza_torno).pack(side='left', padx=8)
 
 
 
+
+        # Verificacion del pre-stopper (sensores fisicos vs cola)
+        f_verif = tk.LabelFrame(col_izq, text=" VERIFICACION PRE-STOPPER ",
+                                font=("Arial", 11, "bold"),
+                                bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_verif.pack(fill='x', pady=(10, 0))
+        self.lbl_pallet_pos = tk.Label(f_verif, text="Pallet en posicion: --",
+                                       font=("Arial", 10),
+                                       bg='#2b2b2b', fg='#cccccc')
+        self.lbl_pallet_pos.pack(anchor='w')
+        self.lbl_sensores_dio = tk.Label(f_verif,
+                                         text="Sensores: op_20=--  presencia=--",
+                                         font=("Arial", 10),
+                                         bg='#2b2b2b', fg='#cccccc')
+        self.lbl_sensores_dio.pack(anchor='w')
+        self.lbl_verif_estado = tk.Label(f_verif, text="Estado: --",
+                                         font=("Arial", 10, "bold"),
+                                         bg='#2b2b2b', fg='#cccccc',
+                                         wraplength=380, justify='left')
+        self.lbl_verif_estado.pack(anchor='w', pady=(4, 0))
 
         # Stats
 
@@ -3419,6 +3457,106 @@ class HMISpirax:
 
         self.lbl_insp_resultado.pack(anchor='w', pady=(8, 0))
 
+        # ---------- Inspeccion de senales del PMC (X, Y, R, D...) ----------
+        f_pmc = tk.LabelFrame(col_der, text=" SENALES DEL PMC (LADDER) ",
+                              font=("Arial", 11, "bold"),
+                              bg='#2b2b2b', fg='white', padx=10, pady=10)
+        f_pmc.pack(fill='x', pady=(10, 0))
+
+        c_pmc = tk.Frame(f_pmc, bg='#2b2b2b')
+        c_pmc.pack(fill='x')
+
+        tk.Label(c_pmc, text="Area:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=0, padx=2)
+        self.cmb_pmc_area = ttk.Combobox(
+            c_pmc, width=4, font=("Consolas", 10), state='readonly',
+            values=["X", "Y", "R", "D", "G", "F", "K", "A", "T", "C"])
+        self.cmb_pmc_area.grid(row=0, column=1, padx=2)
+        self.cmb_pmc_area.set("R")
+
+        tk.Label(c_pmc, text="Byte:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=2, padx=2)
+        self.ent_pmc_byte = tk.Entry(c_pmc, width=6, font=("Consolas", 10))
+        self.ent_pmc_byte.grid(row=0, column=3, padx=2)
+        self.ent_pmc_byte.insert(0, "54")
+
+        tk.Label(c_pmc, text="Bit:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=4, padx=2)
+        self.cmb_pmc_bit = ttk.Combobox(
+            c_pmc, width=6, font=("Consolas", 10), state='readonly',
+            values=["byte", "0", "1", "2", "3", "4", "5", "6", "7"])
+        self.cmb_pmc_bit.grid(row=0, column=5, padx=2)
+        self.cmb_pmc_bit.set("0")
+
+        tk.Button(c_pmc, text="Leer", command=self._leer_pmc_torno,
+                  font=("Arial", 9)).grid(row=0, column=6, padx=(8, 2))
+
+        tk.Label(c_pmc, text="Valor:", font=("Arial", 10),
+                 bg='#2b2b2b', fg='white').grid(row=0, column=7, padx=2)
+        self.ent_pmc_val = tk.Entry(c_pmc, width=8, font=("Consolas", 10))
+        self.ent_pmc_val.grid(row=0, column=8, padx=2)
+
+        tk.Button(c_pmc, text="Escribir", command=self._escribir_pmc_torno,
+                  font=("Arial", 9),
+                  bg='#cc7a00', fg='white').grid(row=0, column=9, padx=2)
+
+        self.lbl_pmc_resultado = tk.Label(
+            f_pmc, text="(sin lectura)", font=("Consolas", 10),
+            bg='#2b2b2b', fg='#cfcfcf', justify='left')
+        self.lbl_pmc_resultado.pack(anchor='w', pady=(8, 0))
+
+        tk.Label(f_pmc,
+                 text=("Bit='byte' lee/escribe los 8 bits juntos (0-255). "
+                       "Con un bit elegido, escribir respeta los otros 7.\n"
+                       "OJO: escribir senales que usa el ladder puede "
+                       "descolocar la maquina. Areas escribibles confirmadas: "
+                       "R (10,50,300-500), D, K (10,50), E, A."),
+                 font=("Arial", 8), bg='#2b2b2b', fg='#999999',
+                 justify='left', wraplength=560).pack(anchor='w', pady=(4, 0))
+
+
+
+
+    def _refrescar_verificacion_torno(self):
+        """Muestra el estado de la verificacion del pre-stopper: pallet en
+        posicion (PMC) y los dos sensores del modulo DIO."""
+        # 1) Pallet en posicion (lo lee el thread del torno; aca solo el
+        #    ultimo valor cacheado para no meter llamadas FOCAS desde la UI)
+        en_pos = getattr(torno, "ultimo_pallet_en_pos", None)
+        if en_pos is None:
+            self.lbl_pallet_pos.configure(text="Pallet en posicion: --",
+                                          fg='#cccccc')
+        elif en_pos:
+            self.lbl_pallet_pos.configure(text="Pallet en posicion: SI",
+                                          fg='#7ddc7d')
+        else:
+            self.lbl_pallet_pos.configure(text="Pallet en posicion: no",
+                                          fg='#cccccc')
+
+        # 2) Sensores del DIO
+        try:
+            from dio import dio, nombre_op
+            op20, pres = dio.leer_sensores()
+            op_fis = dio.op_fisica()
+            self.lbl_sensores_dio.configure(
+                text=(f"Sensores: op_20={int(op20)}  presencia={int(pres)}"
+                      f"   -> {nombre_op(op_fis)}"),
+                fg='#7ddc7d' if (op20 or pres) else '#cccccc')
+        except Exception as e:
+            self.lbl_sensores_dio.configure(
+                text=f"Sensores: DIO no disponible ({type(e).__name__})",
+                fg='#ff6b6b')
+
+        # 3) Estado de la verificacion
+        if getattr(torno, "verificacion_fallida", False):
+            self.lbl_verif_estado.configure(
+                text=f"Estado: {torno.ultimo_error or 'NO COINCIDE'}",
+                fg='#ff6b6b')
+        elif not torno.config.get("verificar_prestopper", True):
+            self.lbl_verif_estado.configure(text="Estado: verificacion APAGADA",
+                                            fg='#c8860a')
+        else:
+            self.lbl_verif_estado.configure(text="Estado: OK", fg='#7ddc7d')
 
 
     def _refrescar_cola_torno(self):
@@ -3598,11 +3736,17 @@ class HMISpirax:
 
 
     def _primera_pieza_torno(self):
-        """PRIMERA PIEZA / CINTA VACIA: libera el primer pallet trabado en el
-        pre-stopper (op=3 + #553=0 + R55.3=1). Se destilda solo: es una
-        accion de una sola vez."""
+        """PRIMERA PIEZA / CINTA VACIA.
+
+        Borra la cola entera y libera el primer pallet del pre-stopper
+        (op=3 + #553=0 + R55.3=1). Queda TILDADO Y BLOQUEADO hasta que se
+        libere el pallet siguiente por el ciclo normal; ahi el refresco
+        periodico lo destilda y lo desbloquea solo.
+        """
         if not self.var_primera_pieza.get():
-            return   # lo destildaron a mano, no hacer nada
+            # Mientras el modo esta activo el checkbox esta disabled, asi que
+            # esto solo pasa si lo destildan antes de confirmar.
+            return
 
         if not torno.conectado:
             self.var_primera_pieza.set(False)
@@ -3621,15 +3765,35 @@ class HMISpirax:
             "  - #553 = 0\n"
             "  - R55.3 = 1 (el ladder suelta el pre-stopper)\n\n"
             "La pieza recircula y la camara la vuelve a evaluar.\n"
+            "El modo queda activo hasta que se libere la SEGUNDA pieza.\n\n"
             "¿Continuar?")
         if not ok:
             self.var_primera_pieza.set(False)
             return
 
         torno.liberar_primera_pieza()
-        # Accion de una sola vez: se destilda
-        self.var_primera_pieza.set(False)
+        # Queda tildado y bloqueado: lo libera el refresco cuando
+        # torno.modo_primera_pieza vuelva a False.
+        self.var_primera_pieza.set(True)
+        self.chk_primera.configure(state='disabled')
         self._refrescar_cola_torno()
+
+    def _refrescar_primera_pieza(self):
+        """Sincroniza el checkbox con torno.modo_primera_pieza: tildado y
+        bloqueado mientras el modo esta activo; libre cuando se libero la
+        siguiente pieza por el ciclo normal."""
+        activo = getattr(torno, "modo_primera_pieza", False)
+        if activo:
+            if not self.var_primera_pieza.get():
+                self.var_primera_pieza.set(True)
+            self.chk_primera.configure(state='disabled')
+            self.lbl_primera_estado.configure(
+                text="ACTIVO - esperando liberar la segunda pieza")
+        else:
+            if self.var_primera_pieza.get():
+                self.var_primera_pieza.set(False)
+            self.chk_primera.configure(state='normal')
+            self.lbl_primera_estado.configure(text="")
 
 
     def _reconectar_torno(self):
@@ -3746,11 +3910,282 @@ class HMISpirax:
 
 
 
+    def _leer_pmc_torno(self):
+        """Lee una senal del PMC (area + byte, o area + byte + bit)."""
+        try:
+            area = self.cmb_pmc_area.get().strip().upper()
+            byte_num = int(self.ent_pmc_byte.get())
+            bit_txt = self.cmb_pmc_bit.get().strip()
+
+            valor_byte = torno.read_pmc_byte(area, byte_num)
+            if bit_txt == "byte":
+                self.lbl_pmc_resultado.configure(
+                    text=(f"{area}{byte_num} = {valor_byte}  "
+                          f"(0x{valor_byte:02X}  {valor_byte:08b})"),
+                    fg='#7fff7f')
+                self.ent_pmc_val.delete(0, 'end')
+                self.ent_pmc_val.insert(0, str(valor_byte))
+            else:
+                bit = int(bit_txt)
+                v = (valor_byte >> bit) & 1
+                self.lbl_pmc_resultado.configure(
+                    text=(f"{area}{byte_num}.{bit} = {v}     "
+                          f"[byte {area}{byte_num} = {valor_byte} "
+                          f"({valor_byte:08b})]"),
+                    fg='#7fff7f')
+                self.ent_pmc_val.delete(0, 'end')
+                self.ent_pmc_val.insert(0, str(v))
+        except Exception as e:
+            self.lbl_pmc_resultado.configure(
+                text=f"Error: {e}", fg='#ff6b6b')
+
+    def _escribir_pmc_torno(self):
+        """Escribe una senal del PMC. Con bit elegido respeta los otros 7."""
+        try:
+            area = self.cmb_pmc_area.get().strip().upper()
+            byte_num = int(self.ent_pmc_byte.get())
+            bit_txt = self.cmb_pmc_bit.get().strip()
+            v = int(self.ent_pmc_val.get())
+
+            if bit_txt == "byte":
+                if not (0 <= v <= 255):
+                    raise ValueError("un byte va de 0 a 255")
+                destino = f"{area}{byte_num}"
+                aviso = (f"¿Escribir {destino} = {v} "
+                         f"(0x{v:02X}  {v:08b})?\n\n"
+                         f"Esto pisa los 8 bits del byte.\n\n")
+            else:
+                if v not in (0, 1):
+                    raise ValueError("un bit es 0 o 1")
+                destino = f"{area}{byte_num}.{bit_txt}"
+                aviso = (f"¿Escribir {destino} = {v}?\n\n"
+                         f"Se respetan los otros 7 bits del byte.\n\n")
+
+            if not messagebox.askyesno(
+                    "Confirmar escritura en el PMC",
+                    aviso +
+                    "OJO: escribir senales que usa el ladder puede\n"
+                    "DESCOLOCAR LA MAQUINA. Si pasa, apagar y prender el\n"
+                    "control (las areas R/A/E se regeneran solas)."):
+                return
+
+            if bit_txt == "byte":
+                torno.write_pmc_byte(area, byte_num, v)
+            else:
+                torno.write_pmc_bit(area, byte_num, int(bit_txt), bool(v))
+
+            self.lbl_pmc_resultado.configure(
+                text=f"{destino} <- {v} OK", fg='#FAC775')
+            self._agregar_log(f"[TORNO] Escrito manual en PMC: {destino} = {v}")
+        except Exception as e:
+            self.lbl_pmc_resultado.configure(
+                text=f"Error: {e}", fg='#ff6b6b')
+
+
     # ------------------------------------------------------------------
 
     #  LOG
 
     # ------------------------------------------------------------------
+
+    # ==================================================================
+    #  PESTAÑA I/O
+    # ==================================================================
+
+    NOMBRES_IO_PATH = "io_nombres.json"
+
+    # Nombres por defecto. DI0 y DI1 son los sensores del pre-stopper que
+    # usa la verificacion (ver dio.py).
+    NOMBRES_DI_DEF = ["op_20 (pre-stopper)", "presencia_pieza (pre-stopper)",
+                      "DI2", "DI3", "DI4", "DI5", "DI6", "DI7"]
+    NOMBRES_DO_DEF = ["DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7"]
+
+    def _cargar_nombres_io(self):
+        """Lee los nombres editables de disco (o usa los por defecto)."""
+        self.nombres_di = list(self.NOMBRES_DI_DEF)
+        self.nombres_do = list(self.NOMBRES_DO_DEF)
+        try:
+            if os.path.exists(self.NOMBRES_IO_PATH):
+                with open(self.NOMBRES_IO_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for i, n in enumerate(data.get("di", [])[:8]):
+                    if n:
+                        self.nombres_di[i] = n
+                for i, n in enumerate(data.get("do", [])[:8]):
+                    if n:
+                        self.nombres_do[i] = n
+        except Exception as e:
+            self._log_thread_safe(f"!!! No se pudieron cargar los nombres de I/O: {e}")
+
+    def _guardar_nombres_io(self):
+        """Persiste los nombres que el usuario escribio en los Entry."""
+        try:
+            di = [e.get().strip() or self.NOMBRES_DI_DEF[i]
+                  for i, e in enumerate(self.ent_nombre_di)]
+            do = [e.get().strip() or self.NOMBRES_DO_DEF[i]
+                  for i, e in enumerate(self.ent_nombre_do)]
+            with open(self.NOMBRES_IO_PATH, "w", encoding="utf-8") as f:
+                json.dump({"di": di, "do": do}, f, indent=2, ensure_ascii=False)
+            self.nombres_di, self.nombres_do = di, do
+            self._log_thread_safe("[I/O] Nombres guardados")
+            messagebox.showinfo("I/O", "Nombres guardados.")
+        except Exception as e:
+            self._log_thread_safe(f"!!! Error guardando nombres de I/O: {e}")
+            messagebox.showerror("I/O", f"No se pudieron guardar:\n{e}")
+
+    def _construir_tab_io(self):
+        self._cargar_nombres_io()
+        cont = tk.Frame(self._hacer_scrollable(self.tab_io), bg='#2b2b2b')
+        cont.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(cont, text="ENTRADAS / SALIDAS",
+                 font=("Arial", 15, "bold"),
+                 bg='#2b2b2b', fg='white').pack(anchor='w')
+
+        # ---------- Sensores del Fanuc (por FOCAS/PMC) ----------
+        f_fanuc = tk.LabelFrame(cont, text=" SENSORES DEL FAMMAR (PMC) ",
+                                font=("Arial", 11, "bold"),
+                                bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_fanuc.pack(fill='x', pady=(12, 0))
+
+        self.lbl_io_sensor_salida = tk.Label(
+            f_fanuc, text="Paso de pallet (R54.0): --",
+            font=("Consolas", 12), bg='#2b2b2b', fg='#cccccc')
+        self.lbl_io_sensor_salida.pack(anchor='w')
+
+        self.lbl_io_pallet_pos = tk.Label(
+            f_fanuc, text="Pallet en posicion (X10.1): --",
+            font=("Consolas", 12), bg='#2b2b2b', fg='#cccccc')
+        self.lbl_io_pallet_pos.pack(anchor='w')
+
+        # ---------- Entradas del panel Nodka ----------
+        f_di = tk.LabelFrame(cont, text=" ENTRADAS DIGITALES (panel Nodka) ",
+                             font=("Arial", 11, "bold"),
+                             bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_di.pack(fill='x', pady=(12, 0))
+
+        self.lbl_estado_dio = tk.Label(f_di, text="DIO: --",
+                                       font=("Arial", 10),
+                                       bg='#2b2b2b', fg='#cccccc')
+        self.lbl_estado_dio.grid(row=0, column=0, columnspan=3,
+                                 sticky='w', pady=(0, 6))
+
+        self.ent_nombre_di = []
+        self.lbl_val_di = []
+        for ch in range(8):
+            tk.Label(f_di, text=f"DI{ch}", font=("Consolas", 11, "bold"),
+                     bg='#2b2b2b', fg='#8ab4f8', width=5,
+                     anchor='w').grid(row=ch + 1, column=0, sticky='w')
+            e = tk.Entry(f_di, font=("Arial", 10), width=34,
+                         bg='#1e1e1e', fg='white', insertbackground='white')
+            e.insert(0, self.nombres_di[ch])
+            e.grid(row=ch + 1, column=1, sticky='w', padx=(4, 10), pady=1)
+            self.ent_nombre_di.append(e)
+            lv = tk.Label(f_di, text="--", font=("Consolas", 12, "bold"),
+                          bg='#2b2b2b', fg='#cccccc', width=6, anchor='w')
+            lv.grid(row=ch + 1, column=2, sticky='w')
+            self.lbl_val_di.append(lv)
+
+        # ---------- Salidas del panel Nodka ----------
+        f_do = tk.LabelFrame(cont, text=" SALIDAS DIGITALES (panel Nodka) ",
+                             font=("Arial", 11, "bold"),
+                             bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_do.pack(fill='x', pady=(12, 0))
+
+        self.ent_nombre_do = []
+        self.lbl_val_do = []
+        for ch in range(8):
+            tk.Label(f_do, text=f"DO{ch}", font=("Consolas", 11, "bold"),
+                     bg='#2b2b2b', fg='#f8b48a', width=5,
+                     anchor='w').grid(row=ch, column=0, sticky='w')
+            e = tk.Entry(f_do, font=("Arial", 10), width=34,
+                         bg='#1e1e1e', fg='white', insertbackground='white')
+            e.insert(0, self.nombres_do[ch])
+            e.grid(row=ch, column=1, sticky='w', padx=(4, 10), pady=1)
+            self.ent_nombre_do.append(e)
+            lv = tk.Label(f_do, text="--", font=("Consolas", 12, "bold"),
+                          bg='#2b2b2b', fg='#cccccc', width=6, anchor='w')
+            lv.grid(row=ch, column=2, sticky='w')
+            self.lbl_val_do.append(lv)
+
+        # ---------- Botones ----------
+        f_btn = tk.Frame(cont, bg='#2b2b2b')
+        f_btn.pack(fill='x', pady=(12, 0))
+        tk.Button(f_btn, text="Guardar nombres", font=("Arial", 10, "bold"),
+                  bg='#2d8f3a', fg='white',
+                  command=self._guardar_nombres_io).pack(side='left', padx=2)
+        tk.Button(f_btn, text="Reintentar conexion DIO", font=("Arial", 10),
+                  bg='#3a6ea5', fg='white',
+                  command=self._reintentar_dio).pack(side='left', padx=2)
+
+    def _reintentar_dio(self):
+        try:
+            from dio import dio
+            dio.detener_monitor()
+            dio.reintentar()
+            dio.iniciar_monitor()
+            self._log_thread_safe("[I/O] Reintentando conexion con el modulo DIO...")
+        except Exception as e:
+            self._log_thread_safe(f"!!! Error reintentando DIO: {e}")
+
+    def _refrescar_tab_io(self):
+        """Refresca la pestaña I/O. Lee del CACHE del monitor de dio.py, no
+        del bus (el handoff avisa de no hacer polling I2C desde la UI)."""
+        # Sensores del Fammar
+        s = getattr(torno, "ultimo_sensor_salida", None)
+        if s is None:
+            self.lbl_io_sensor_salida.configure(
+                text="Paso de pallet (R54.0): --", fg='#cccccc')
+        else:
+            self.lbl_io_sensor_salida.configure(
+                text=f"Paso de pallet (R54.0): {'1  PASANDO' if s else '0'}",
+                fg='#7ddc7d' if s else '#cccccc')
+
+        p = getattr(torno, "ultimo_pallet_en_pos", None)
+        if p is None:
+            self.lbl_io_pallet_pos.configure(
+                text="Pallet en posicion (X10.1): --", fg='#cccccc')
+        else:
+            self.lbl_io_pallet_pos.configure(
+                text=(f"Pallet en posicion (X10.1): "
+                      f"{'1  EN POSICION' if p else '0'}"),
+                fg='#7ddc7d' if p else '#cccccc')
+
+        # Panel Nodka
+        try:
+            from dio import dio
+        except Exception as e:
+            self.lbl_estado_dio.configure(text=f"DIO: modulo no importable ({e})",
+                                          fg='#ff6b6b')
+            return
+
+        err = dio.error_monitor()
+        di = dio.ultimas_entradas()
+        do = dio.ultimas_salidas()
+
+        if di is None:
+            self.lbl_estado_dio.configure(
+                text=f"DIO: sin lectura  ({err or 'monitor no iniciado'})",
+                fg='#ff6b6b')
+        else:
+            self.lbl_estado_dio.configure(text="DIO: conectado", fg='#7ddc7d')
+
+        for ch in range(8):
+            if di is None:
+                self.lbl_val_di[ch].configure(text="--", fg='#cccccc')
+            else:
+                v = di[ch]
+                self.lbl_val_di[ch].configure(
+                    text="1  ON" if v else "0",
+                    fg='#7ddc7d' if v else '#777777')
+            if do is None:
+                self.lbl_val_do[ch].configure(text="--", fg='#cccccc')
+            else:
+                v = do[ch]
+                self.lbl_val_do[ch].configure(
+                    text="1  ON" if v else "0",
+                    fg='#f8b48a' if v else '#777777')
+
 
     def _construir_tab_log(self):
 
@@ -5929,6 +6364,12 @@ class HMISpirax:
                 text=f"Ultimo evento: {torno.ultimo_evento or '---'}")
 
             self._refrescar_cola_torno()
+            self._refrescar_verificacion_torno()
+            self._refrescar_primera_pieza()
+            try:
+                self._refrescar_tab_io()
+            except AttributeError:
+                pass
 
         except AttributeError:
 
@@ -6323,14 +6764,26 @@ class HMISpirax:
 
 
 def main():
+    # Monitor del modulo DIO (hilo de fondo). Si el driver no esta, no rompe
+    # nada: la pestaña I/O lo muestra como no disponible y la verificacion
+    # del pre-stopper avisa segun verificacion_obligatoria.
+    try:
+        from dio import dio
+        dio.iniciar_monitor(periodo=0.1)
+    except Exception as e:
+        print(f"[DIO] No se pudo iniciar el monitor: {e}")
 
     root = tk.Tk()
-
     HMISpirax(root)
-
-    root.mainloop()
-
-
+    try:
+        root.mainloop()
+    finally:
+        try:
+            from dio import dio
+            dio.detener_monitor()
+            dio.cerrar()
+        except Exception:
+            pass
 
 
 

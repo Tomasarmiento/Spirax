@@ -26,7 +26,7 @@ except ImportError:
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "172.31.1.99"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8193
-PMC_X, BYTE, BIT = 3, 10, 6
+PMC_X, BYTE, BIT = 3, 10, 1
 
 def main():
     if hasattr(os, "add_dll_directory") and os.path.isdir(_PARENT):
