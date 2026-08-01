@@ -1247,6 +1247,7 @@ class HMISpirax:
         self.tab_torno = tk.Frame(self.nb, bg='#2b2b2b')
         self.tab_io = tk.Frame(self.nb, bg='#2b2b2b')
 
+        self.tab_debug = tk.Frame(self.nb, bg='#2b2b2b')
         self.tab_log = tk.Frame(self.nb, bg='#2b2b2b')
 
 
@@ -1257,6 +1258,8 @@ class HMISpirax:
 
         self.nb.add(self.tab_torno, text='  TORNO  ')
         self.nb.add(self.tab_io, text='  I/O  ')
+
+        self.nb.add(self.tab_debug, text='  DEBUG  ')
 
         self.nb.add(self.tab_log, text='  LOG  ')
 
@@ -1272,6 +1275,8 @@ class HMISpirax:
 
         self._construir_tab_torno()
         self._construir_tab_io()
+
+        self._construir_tab_debug()
 
         self._construir_tab_log()
 
@@ -3227,11 +3232,6 @@ class HMISpirax:
                   bg='#c8860a', fg='white',
                   command=self._todos_op3_torno).pack(side='left', padx=2)
 
-        tk.Button(c_ctrl, text="Confirmar arranque",
-                  font=("Arial", 9, "bold"),
-                  bg='#2d8f3a', fg='white',
-                  command=self._confirmar_arranque_torno).pack(side='left', padx=2)
-
 
 
 
@@ -3717,24 +3717,6 @@ class HMISpirax:
             torno.todos_op3()
             self._refrescar_cola_torno()
 
-    def _confirmar_arranque_torno(self):
-        n, receta = torno.info_arranque()
-        if receta is None:
-            txt = ("La cola esta vacia. No hay nada para mecanizar.\n"
-                   "¿Confirmar arranque igual? (todo pasa como op=3)")
-        else:
-            op_txt = {1: "cargar (OP10)", 2: "dar vuelta (OP20)",
-                      3: "dejar pasar"}.get(receta["op"], f"op={receta['op']}")
-            txt = (f"Cola: {n} piezas.\n\n"
-                   f"Proxima a mecanizar:\n"
-                   f"  tipo {receta['tipo']}, {op_txt}, rosca {receta.get('rosca', 0)}\n\n"
-                   f"Verifica que coincida con el pallet fisico que esta por\n"
-                   f"entrar al torno. ¿Confirmar arranque?")
-        if messagebox.askyesno("Confirmar arranque", txt):
-            torno.confirmar_arranque()
-            self._refrescar_cola_torno()
-
-
     def _primera_pieza_torno(self):
         """PRIMERA PIEZA / CINTA VACIA.
 
@@ -3744,8 +3726,11 @@ class HMISpirax:
         periodico lo destilda y lo desbloquea solo.
         """
         if not self.var_primera_pieza.get():
-            # Mientras el modo esta activo el checkbox esta disabled, asi que
-            # esto solo pasa si lo destildan antes de confirmar.
+            # Destildar CANCELA el modo. Sirve de salida de emergencia si por
+            # cualquier motivo no se libera un pallet siguiente y el modo
+            # quedaria activo para siempre.
+            if getattr(torno, "modo_primera_pieza", False):
+                torno.cancelar_primera_pieza()
             return
 
         if not torno.conectado:
@@ -3775,7 +3760,6 @@ class HMISpirax:
         # Queda tildado y bloqueado: lo libera el refresco cuando
         # torno.modo_primera_pieza vuelva a False.
         self.var_primera_pieza.set(True)
-        self.chk_primera.configure(state='disabled')
         self._refrescar_cola_torno()
 
     def _refrescar_primera_pieza(self):
@@ -3786,9 +3770,10 @@ class HMISpirax:
         if activo:
             if not self.var_primera_pieza.get():
                 self.var_primera_pieza.set(True)
-            self.chk_primera.configure(state='disabled')
+            self.chk_primera.configure(state='normal')
             self.lbl_primera_estado.configure(
-                text="ACTIVO - esperando liberar la segunda pieza")
+                text="ACTIVO - esperando liberar la segunda pieza "
+                     "(destildar para cancelar)")
         else:
             if self.var_primera_pieza.get():
                 self.var_primera_pieza.set(False)
@@ -4186,6 +4171,167 @@ class HMISpirax:
                     text="1  ON" if v else "0",
                     fg='#f8b48a' if v else '#777777')
 
+
+    # ==================================================================
+    #  PESTAÑA DEBUG
+    # ==================================================================
+    #  Todo en tiempo real, refrescado cada 500ms. Los valores del torno
+    #  vienen del snapshot que cachea el thread sincronizador
+    #  (torno.estado_debug()): la UI NUNCA hace llamadas FOCAS.
+    # ==================================================================
+    _DEBUG_FILAS = [
+        ("--- HANDSHAKE CON EL TORNO ---", None),
+        ("#553  termine (1=torno termino, espera el 0)", "macro_fin"),
+        ("R55.3 receta lista (la sube la PC, la baja el ladder)", "receta_lista"),
+        ("R54.0 sensor de salida", "sensor_salida"),
+        ("      vio el alto (arma el descuento)", "sensor_visto_alto"),
+        ("X10.1 pallet clampeado en pre-stopper", "pallet_en_pos"),
+        ("--- MACROS ESCRITAS ---", None),
+        ("receta en el torno", "macro_receta"),
+        ("#554 cantidad en cola", "macro_cola"),
+        ("--- SENSORES DEL PRE-STOPPER (DIO) ---", None),
+        ("lectura", "dio"),
+        ("op que se compara", "op_comparado"),
+        ("--- COLA ---", None),
+        ("largo", "cola_len"),
+        ("primeros", "cola_head"),
+        ("ultimo desencolado", "ultimo_desencolado"),
+        ("piezas terminadas", "piezas_terminadas"),
+        ("--- COMPARACION ---", None),
+        ("indice receta / indice verif", None),
+        ("op esperado (de la cola)", "op_esperado"),
+        ("receta que va a mandar", "receta_a_mandar"),
+        ("--- ESTADO INTERNO ---", None),
+        ("liberacion pendiente", "receta_pendiente"),
+        ("verificacion bloqueada", "verif_bloqueada"),
+        ("seg desde el descuento", "seg_desde_descuento"),
+    ]
+
+    def _construir_tab_debug(self):
+        cont = tk.Frame(self.tab_debug, bg='#2b2b2b')
+        cont.pack(fill='both', expand=True, padx=12, pady=8)
+
+        tk.Label(cont, text="DEBUG EN TIEMPO REAL",
+                 font=("Consolas", 12, "bold"),
+                 bg='#2b2b2b', fg='#dddddd').pack(anchor='w', pady=(0, 2))
+        tk.Label(cont, text="Refresco 500ms. Los valores del torno los cachea "
+                            "el thread de sync, la UI no llama a FOCAS.",
+                 font=("Consolas", 8), bg='#2b2b2b',
+                 fg='#888888').pack(anchor='w', pady=(0, 8))
+
+        grid = tk.Frame(cont, bg='#1e1e1e', bd=1, relief='solid')
+        grid.pack(fill='both', expand=True)
+        grid.columnconfigure(1, weight=1)
+
+        self._dbg_lbls = {}
+        fila = 0
+        for texto, clave in self._DEBUG_FILAS:
+            if clave is None and texto.startswith("---"):
+                tk.Label(grid, text=texto, font=("Consolas", 9, "bold"),
+                         bg='#1e1e1e', fg='#5fa8d3', anchor='w').grid(
+                    row=fila, column=0, columnspan=2, sticky='we',
+                    padx=6, pady=(8, 2))
+                fila += 1
+                continue
+            tk.Label(grid, text=texto, font=("Consolas", 9),
+                     bg='#1e1e1e', fg='#aaaaaa', anchor='w').grid(
+                row=fila, column=0, sticky='w', padx=(14, 10), pady=1)
+            v = tk.Label(grid, text="--", font=("Consolas", 9, "bold"),
+                         bg='#1e1e1e', fg='#dddddd', anchor='w')
+            v.grid(row=fila, column=1, sticky='w', pady=1)
+            if clave is not None:
+                self._dbg_lbls[clave] = v
+            else:
+                self._dbg_lbls["_indices"] = v
+            fila += 1
+
+        self.lbl_dbg_alerta = tk.Label(cont, text="", font=("Consolas", 10, "bold"),
+                                       bg='#2b2b2b', fg='#ff6b6b',
+                                       anchor='w', justify='left', wraplength=900)
+        self.lbl_dbg_alerta.pack(fill='x', pady=(8, 0))
+
+    def _refrescar_tab_debug(self):
+        d = torno.estado_debug()
+        if not d:
+            for v in self._dbg_lbls.values():
+                v.configure(text="-- (sin datos: torno desconectado)",
+                            fg='#888888')
+            self.lbl_dbg_alerta.configure(text="")
+            return
+        if d.get("error"):
+            self.lbl_dbg_alerta.configure(text=f"ERROR FOCAS: {d['error']}")
+            return
+
+        def pinta(clave, texto, color='#dddddd'):
+            lbl = self._dbg_lbls.get(clave)
+            if lbl is not None:
+                lbl.configure(text=texto, fg=color)
+
+        def booleano(clave, verdadero_ok=True):
+            v = d.get(clave)
+            if v is None:
+                pinta(clave, "--", '#888888')
+                return
+            col = '#7ddc7d' if v == verdadero_ok else '#c8860a'
+            pinta(clave, "1  SI" if v else "0  no", col)
+
+        # handshake
+        mf = d.get("macro_fin")
+        pinta("macro_fin", f"{mf}", '#7ddc7d' if mf == 1 else '#aaaaaa')
+        rl = d.get("receta_lista")
+        pinta("receta_lista",
+              ("1  <-- NO deberia quedarse en 1" if rl else "0  ok"),
+              '#ff6b6b' if rl else '#7ddc7d')
+        booleano("sensor_salida", verdadero_ok=False)
+        booleano("sensor_visto_alto")
+        booleano("pallet_en_pos")
+
+        pinta("macro_receta", str(d.get("macro_receta")))
+        pinta("macro_cola", str(d.get("macro_cola")))
+        pinta("dio", str(d.get("dio")))
+
+        # comparacion
+        opc = d.get("op_comparado")
+        ope = d.get("op_esperado")
+        nom = {1: "OP10", 2: "OP20", 0: "SIN PIEZA", 3: "PASA"}
+        pinta("op_comparado",
+              f"{opc}  ({nom.get(opc, '?')})" if opc is not None else "--")
+        if opc is not None and ope is not None:
+            ok = (opc == ope)
+            pinta("op_esperado", f"{ope}  ({nom.get(ope, '?')})"
+                  + ("   ==  COINCIDE" if ok else "   !=  NO COINCIDE"),
+                  '#7ddc7d' if ok else '#ff6b6b')
+        else:
+            pinta("op_esperado", f"{ope}" if ope is not None else "--",
+                  '#888888')
+        pinta("receta_a_mandar", str(d.get("receta_a_mandar")))
+        pinta("_indices",
+              f"receta=cola[{d.get('indice_receta')}]   "
+              f"verif=cola[{d.get('indice_verif')}]")
+
+        pinta("cola_len", str(d.get("cola_len")))
+        pinta("cola_head", "  ".join(d.get("cola_head") or []) or "(vacia)")
+        ud = d.get("ultimo_desencolado")
+        pinta("ultimo_desencolado",
+              (f"tipo={ud['tipo']} op={ud['op']} rosca={ud.get('rosca', 0)}"
+               if ud else "--"))
+        pinta("piezas_terminadas", str(d.get("piezas_terminadas")))
+
+        booleano("receta_pendiente")
+        booleano("verif_bloqueada", verdadero_ok=False)
+        sd = d.get("seg_desde_descuento")
+        pinta("seg_desde_descuento", f"{sd} s" if sd is not None else "--")
+
+        # alerta grande arriba de todo
+        alertas = []
+        if rl:
+            alertas.append("R55.3 EN 1: el ladder no la bajo. El pre-stopper "
+                           "esta liberado y los pallets pasan sin nuestra "
+                           "orden.")
+        if d.get("verif_bloqueada"):
+            alertas.append("Verificacion BLOQUEADA: apretar 'Reintentar "
+                           "verificacion'.")
+        self.lbl_dbg_alerta.configure(text="\n".join(alertas))
 
     def _construir_tab_log(self):
 
@@ -6368,6 +6514,10 @@ class HMISpirax:
             self._refrescar_primera_pieza()
             try:
                 self._refrescar_tab_io()
+            except AttributeError:
+                pass
+            try:
+                self._refrescar_tab_debug()
             except AttributeError:
                 pass
 

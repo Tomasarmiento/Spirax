@@ -6,7 +6,7 @@
   "exposure": 70,
   "gain": 0,
   "saturation": 50,
-  "bg_diff_thresh": 65,
+  "bg_diff_thresh": 78,
   "umbral_ocupacion": 0.07,
   "esquinas": {
     "sup_izq": [
