@@ -603,29 +603,28 @@ def manejar_robot(conn, addr, log_callback):
                     # acaba de terminar, codificada en Recuperar:
                     #   21 = era VACIO  -> op=1 (OP10, cargo pieza nueva)
                     #   22 = era ARRIBA -> op=2 (OP20, dio vuelta la pieza)
-                    #   23 = era ABAJO  -> no se encola (es error)
+                    #   23 = era ABAJO  -> op=2 (OP20): la pieza ya esta
+                    #        apoyada en posicion de OP20, el robot no la toco.
                     # Asi la operacion encolada corresponde SIEMPRE al pallet
                     # correcto, aunque el spot 1 este fotografiando el pallet
                     # siguiente en paralelo (por eso ya no usamos
                     # _op_pendiente, que se pisaba).
-                    _MAPA_AVISO = {21: 1, 22: 2}
+                    _MAPA_AVISO = {21: 1, 22: 2, 23: 2}
                     if recuperar in _MAPA_AVISO:
                         op_real = _MAPA_AVISO[recuperar]
                         torno.encolar(tipo, op_real, rosca)
-                        log_callback(f"[FIN RUTINA] Encolado: tipo={tipo} "
-                                     f"op={op_real} rosca={rosca}")
-                    elif recuperar == 23:
-                        # ABAJO (o orientacion desconocida): el robot NO lo
-                        # proceso, pero el pallet IGUAL se libera y va a salir
-                        # por el sensor del torno, donde se descuenta uno de la
-                        # cola. Si no encolaramos nada, ese descuento se comeria
-                        # la entrada de OTRO pallet y toda la cola se corre.
-                        # Por eso encolamos op=3: el torno lo deja pasar sin
-                        # mecanizar y la cola se mantiene balanceada.
-                        torno.encolar(tipo, 3, rosca)
-                        log_callback("!!! [FIN RUTINA] Pallet ABAJO/desconocido: "
-                                     "encolado op=3 (pasa sin mecanizar, "
-                                     "mantiene el balance de la cola)")
+                        if recuperar == 23:
+                            # Queda constancia: el robot no la toco, va
+                            # derecho al torno para OP20. Si ya tenia la OP20
+                            # hecha, se le vuelve a hacer.
+                            log_callback(f"[FIN RUTINA] Pallet ABAJO: llego una "
+                                         f"OP20 sin pasar por el robot. "
+                                         f"Encolado tipo={tipo} op=2 "
+                                         f"rosca={rosca}")
+                        else:
+                            log_callback(f"[FIN RUTINA] Encolado: tipo={tipo} "
+                                         f"op={op_real} rosca={rosca}")
+
                     elif _op_pendiente is not None:
                         # Compatibilidad: SPS viejo que manda Recuperar=2 sin
                         # la orientacion. Puede encolar la op equivocada si el
@@ -3256,6 +3255,30 @@ class HMISpirax:
                                          wraplength=380, justify='left')
         self.lbl_verif_estado.pack(anchor='w', pady=(4, 0))
 
+        # --- CARTEL de pieza que no coincide -------------------------------
+        # Aparece solo cuando la verificacion frena. Da la salida al operador:
+        # el pallet queda trabado y sin esto no hay forma de sacar la pieza.
+        self.f_verif_alarma = tk.Frame(f_verif, bg='#5c1a1a', bd=2,
+                                       relief='raised')
+        self.lbl_alarma_titulo = tk.Label(
+            self.f_verif_alarma,
+            text="LA PIEZA NO COINCIDE CON LA COLA",
+            font=("Arial", 12, "bold"), bg='#5c1a1a', fg='#ffdddd')
+        self.lbl_alarma_titulo.pack(anchor='w', padx=8, pady=(6, 0))
+        self.lbl_alarma_detalle = tk.Label(
+            self.f_verif_alarma, text="", font=("Arial", 9),
+            bg='#5c1a1a', fg='#ffdddd', wraplength=380, justify='left')
+        self.lbl_alarma_detalle.pack(anchor='w', padx=8, pady=(2, 4))
+        f_btn_al = tk.Frame(self.f_verif_alarma, bg='#5c1a1a')
+        f_btn_al.pack(anchor='w', padx=8, pady=(0, 8))
+        tk.Button(f_btn_al, text="DEJAR PASAR (op=3) y sacar la pieza",
+                  font=("Arial", 10, "bold"), bg='#c8860a', fg='white',
+                  command=self._dejar_pasar_frenado).pack(side='left')
+        tk.Button(f_btn_al, text="Reintentar verificacion",
+                  font=("Arial", 10), bg='#3a6ea5', fg='white',
+                  command=self._reintentar_verificacion_torno).pack(
+            side='left', padx=(6, 0))
+
         # Stats
 
         f_stats = tk.LabelFrame(col_izq, text=" ESTADISTICAS ",
@@ -3547,6 +3570,26 @@ class HMISpirax:
                 text=f"Sensores: DIO no disponible ({type(e).__name__})",
                 fg='#ff6b6b')
 
+        # 2b) Cartel de alarma: solo cuando la verificacion frena
+        frenado = (getattr(torno, "verificacion_fallida", False) or
+                   getattr(torno, "_verif_bloqueada", False))
+        if frenado:
+            det = (getattr(torno, "_verif_fallida_msg", None)
+                   or getattr(torno, "ultimo_error", None) or "")
+            self.lbl_alarma_detalle.configure(
+                text=(f"{det}\n\nEl pallet quedo frenado en el pre-stopper y el "
+                      f"torno esta esperando.\n\n"
+                      f"\u2022 Si corregiste la pieza a mano: "
+                      f"'Reintentar verificacion'.\n"
+                      f"\u2022 Si la queres sacar de la celda: 'DEJAR PASAR', "
+                      f"que escribe op=3 y libera. El torno NO la mecaniza y "
+                      f"el pallet sigue de largo."))
+            if not self.f_verif_alarma.winfo_ismapped():
+                self.f_verif_alarma.pack(fill='x', pady=(8, 0))
+        else:
+            if self.f_verif_alarma.winfo_ismapped():
+                self.f_verif_alarma.pack_forget()
+
         # 3) Estado de la verificacion
         if getattr(torno, "verificacion_fallida", False):
             self.lbl_verif_estado.configure(
@@ -3716,6 +3759,37 @@ class HMISpirax:
                                 f"Van a recircular sin mecanizar."):
             torno.todos_op3()
             self._refrescar_cola_torno()
+
+    def _dejar_pasar_frenado(self):
+        """Cartel de confirmacion y, si aceptan, escribe op=3 y libera el
+        pre-stopper para que el pallet salga y se pueda sacar la pieza."""
+        det = (getattr(torno, "_verif_fallida_msg", None)
+               or getattr(torno, "ultimo_error", None) or "")
+        txt = (f"{det}\n\n"
+               f"Se va a escribir op=3 (DEJAR PASAR) en el torno y liberar el "
+               f"pre-stopper.\n\n"
+               f"El torno NO va a mecanizar esta pieza: el pallet sale de "
+               f"largo y podes sacarla.\n\n"
+               f"La entrada de la cola se descuenta sola cuando el pallet "
+               f"cruce el sensor de salida.\n\n"
+               f"Confirmas?")
+        if not messagebox.askyesno("Pieza que no coincide - dejar pasar", txt):
+            return
+        if not torno.dejar_pasar_frenado():
+            messagebox.showinfo("Dejar pasar",
+                                "No hay ningun pallet frenado por la "
+                                "verificacion.")
+            return
+        self._refrescar_verificacion_torno()
+
+    def _reintentar_verificacion_torno(self):
+        """Vuelve a comparar contra la cola en vivo, despues de corregir el
+        pallet a mano."""
+        if not torno.reintentar_verificacion():
+            messagebox.showinfo("Reintentar verificacion",
+                                "No hay nada para reintentar.")
+            return
+        self._refrescar_verificacion_torno()
 
     def _primera_pieza_torno(self):
         """PRIMERA PIEZA / CINTA VACIA.
