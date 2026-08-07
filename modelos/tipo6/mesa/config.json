@@ -1,13 +1,13 @@
 {
-  "corte_y_top_pct": 0.0,
-  "corte_y_pct": 0.7715,
-  "corte_x_izq_pct": 0.0,
-  "corte_x_der_pct": 0.9812,
-  "exposure": 72,
-  "gain": 0,
+  "corte_y_top_pct": 0.25,
+  "corte_y_pct": 0.7184,
+  "corte_x_izq_pct": 0.15,
+  "corte_x_der_pct": 0.8971,
+  "exposure": 11,
+  "gain": 113,
   "saturation": 50,
-  "bg_diff_thresh": 50,
-  "umbral_ocupacion": 0.01,
+  "bg_diff_thresh": 58,
+  "umbral_ocupacion": 0.07,
   "grid_x": [
     0.1,
     0.2,
@@ -16,35 +16,35 @@
     0.5,
     0.6,
     0.7,
-    0.8,
-    0.9
+    0.7961,
+    0.8967
   ],
   "grid_y": [
-    0.125,
-    0.2646,
-    0.4006,
-    0.5303,
-    0.6559,
-    0.7817,
-    0.9078
+    0.1184,
+    0.2433,
+    0.3764,
+    0.4994,
+    0.6247,
+    0.7501,
+    0.875
   ],
-  "margen_celda": 0.0,
+  "margen_celda": 0.17,
   "esquinas": {
     "sup_izq": [
-      0.9646,
-      0.0
+      0.8971,
+      0.25
     ],
     "sup_der": [
-      0.9812,
-      0.769
+      0.8937,
+      0.7174
     ],
     "inf_der": [
-      0.0,
-      0.7715
+      0.1537,
+      0.7184
     ],
     "inf_izq": [
-      0.0,
-      0.05
+      0.15,
+      0.2555
     ]
   }
 }
