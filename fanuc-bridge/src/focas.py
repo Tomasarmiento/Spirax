@@ -18,7 +18,7 @@ import sys
 import ctypes
 from ctypes import (
     Structure, POINTER, byref,
-    c_char, c_short, c_ushort, c_long, c_ulong, c_int,
+    c_char, c_byte, c_short, c_ushort, c_long, c_ulong, c_int,
 )
 
 # Constantes del control 0i-F
@@ -114,6 +114,21 @@ class ODBM(Structure):
         ("dummy",   c_short),
         ("mcr_val", c_long),   # valor entero * 10^dec_val
         ("dec_val", c_short),  # cantidad de decimales
+    ]
+
+
+class IODBPMC(Structure):
+    """pmc_rdpmcrng — lee un rango de la memoria PMC.
+    Layout para lectura de bytes: type_a (addr_t), type_d (data_t),
+    datano_s, datano_e, y el buffer de datos. Usamos un buffer de 8 bytes
+    (suficiente para leer 1-8 bytes contiguos, p.ej. X10)."""
+    _pack_ = 4
+    _fields_ = [
+        ("type_a",   c_short),        # tipo de direccion PMC (X=0, Y=1, ...)
+        ("type_d",   c_short),        # tipo de dato (0 = byte)
+        ("datano_s", c_short),        # numero de byte inicial
+        ("datano_e", c_short),        # numero de byte final
+        ("cdata",    c_byte * 8),     # buffer de datos (bytes leidos)
     ]
 
 
@@ -251,6 +266,15 @@ class Focas:
         L.cnc_alarm2.argtypes = [c_ushort, POINTER(c_long)]
         L.cnc_alarm2.restype = c_short
 
+        # pmc_rdpmcrng(handle, adr_type, data_type, start, end, length, &iodbpmc)
+        L.pmc_rdpmcrng.argtypes = [c_ushort, c_short, c_short, c_short,
+                                   c_short, c_short, POINTER(IODBPMC)]
+        L.pmc_rdpmcrng.restype = c_short
+
+        # pmc_wrpmcrng(handle, length, &iodbpmc)  -- MISMA estructura que rd
+        L.pmc_wrpmcrng.argtypes = [c_ushort, c_ushort, POINTER(IODBPMC)]
+        L.pmc_wrpmcrng.restype = c_short
+
         # cnc_rdparam(handle, num, axis, length, &iodbpsd)
         # Lo dejamos en raw bytes porque IODBPSD es polimórfico — para el part
         # count (param 6711) sirve con esta firma genérica.
@@ -293,6 +317,34 @@ class Focas:
         m = ODBM()
         ret = self._lib.cnc_rdmacro(handle, num, ctypes.sizeof(ODBM), byref(m))
         return m, ret
+
+    def rdpmcrng_byte(self, handle: int, adr_type: int, start: int, end: int):
+        """Lee bytes contiguos del PMC (data_type=0). adr_type: X=0,Y=1,R=5,...
+        Devuelve (IODBPMC, ret). Los bytes quedan en .cdata[0..(end-start)]."""
+        p = IODBPMC()
+        n = (end - start) + 1              # cantidad de bytes
+        length = 8 + n                     # header (8) + datos
+        ret = self._lib.pmc_rdpmcrng(
+            handle, c_short(adr_type), c_short(0),
+            c_short(start), c_short(end), c_short(length), byref(p))
+        return p, ret
+
+    def wrpmcrng_byte(self, handle: int, adr_type: int, byte_num: int,
+                      value: int, length: int = None):
+        """Escribe UN byte en el PMC (data_type=0). adr_type: R=5, D=9, ...
+        Firma FOCAS: pmc_wrpmcrng(handle, length, &IODBPMC) usando la MISMA
+        estructura que la lectura. length = 8 (header) + n_bytes de datos."""
+        n = 1
+        if length is None:
+            length = 8 + n     # header 8 + 1 byte de dato = 9
+        p = IODBPMC()
+        p.type_a = adr_type
+        p.type_d = 0                 # byte
+        p.datano_s = byte_num
+        p.datano_e = byte_num
+        p.cdata[0] = value & 0xFF
+        ret = self._lib.pmc_wrpmcrng(handle, c_ushort(length), byref(p))
+        return ret
 
     def acts(self, handle: int):
         a = ODBACT()

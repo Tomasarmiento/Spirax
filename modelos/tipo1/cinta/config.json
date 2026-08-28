@@ -1,10 +1,50 @@
 {
-  "corte_y_top_pct": 0.1604,
-  "corte_y_pct": 0.9896,
-  "corte_x_izq_pct": 0.1656,
-  "corte_x_der_pct": 0.8531,
+  "corte_y_top_pct": 0.0804,
+  "corte_y_pct": 0.6733,
+  "corte_x_izq_pct": 0.2827,
+  "corte_x_der_pct": 0.6781,
   "exposure": 1,
-  "gain": 60,
+  "gain": 21,
   "saturation": 50,
-  "bg_diff_thresh": 30
+  "bg_diff_thresh": 77,
+  "umbral_ocupacion": 0.15,
+  "grid_x": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9
+  ],
+  "grid_y": [
+    0.125,
+    0.25,
+    0.375,
+    0.5,
+    0.625,
+    0.75,
+    0.875
+  ],
+  "margen_celda": 0.0,
+  "esquinas": {
+    "sup_izq": [
+      0.2827,
+      0.0878
+    ],
+    "sup_der": [
+      0.6719,
+      0.0804
+    ],
+    "inf_der": [
+      0.6781,
+      0.6733
+    ],
+    "inf_izq": [
+      0.2843,
+      0.6659
+    ]
+  }
 }

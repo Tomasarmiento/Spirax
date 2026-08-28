@@ -5,17 +5,20 @@ Componentes:
 - Cola FIFO persistida en disco (cola_torno.json)
 - Cliente Focas conectado en background
 - Thread sincronizador que:
-    1. Mantiene escrito en #500/#501 el primer elemento de la cola
-    2. Pollea #503 (flag "termine"), cuando lo ve hace popleft + actualiza macros + baja #503
-    3. Si la cola esta vacia, escribe ceros en #500/#501
+    1. Mantiene escrito en #551/#550/#552 el primer elemento de la cola
+    2. Pollea #553 (flag "termine"), cuando lo ve hace popleft + actualiza macros + baja #553
+    3. Si la cola esta vacia, escribe ceros en #551/#550/#552
 
 Convencion de macros (configurable):
-  #500 = TIPO de pieza (1-6, 0 = sin pieza)
-  #501 = OPERACION (10 o 20, 0 = sin pieza)
-  #503 = FLAG fin de mecanizado (torno escribe 1, PC limpia a 0)
+  #551 = NUMERO DE PIEZA (1-12, 0 = sin pieza)   -> 1-6 aluminio, 7-12 fundicion
+  #550 = OPERACION A MECANIZAR (10 o 20, 0 = sin pieza)
+  #552 = TIPO DE ROSCA (1, 2 o 3, 0 = sin rosca)
+  #553 = FLAG fin de mecanizado (torno escribe 1, PC limpia a 0)
 
-El programa NC del torno debe usar #100/#101 como snapshot local
-de #500/#501 al pickear, y al terminar setear #503=1 y esperar a 0.
+El programa NC del torno debe tomar #551/#550/#552 como snapshot local
+al pickear, y al terminar setear #553=1 y esperar a 0.
+NOTA: la rosca y el numero de pieza (1-12) solo se usan en el torno;
+el robot sigue trabajando igual con la forma de la pieza.
 """
 
 import json
@@ -66,11 +69,35 @@ DEFAULTS = {
     "torno_host": "192.168.1.10",
     "torno_port": 8193,
     "torno_timeout_focas": 10,
-    "torno_dll_path": "./dlls",
-    "macro_tipo": 500,
-    "macro_op": 501,
-    "macro_fin": 503,
-    "polling_ms": 500,        # intervalo de polling de #503
+    # Path de las DLLs FOCAS. Se resuelve relativo a ESTE archivo (torno.py)
+    # para no depender del directorio desde donde se lanza el HMI.
+    "torno_dll_path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "dlls"),
+    "macro_tipo": 551,        # NUMERO DE PIEZA (1-12)
+    "macro_op": 550,          # OPERACION A MECANIZAR (10 o 20)
+    "macro_rosca": 552,       # TIPO DE ROSCA (1, 2 o 3)
+    "macro_fin": 553,         # FLAG fin de mecanizado
+    "macro_cola": 554,        # CANTIDAD de piezas en la cola (informativo)
+    # --- Sensor de salida del husillo (PMC) ---
+    # Descuenta 1 de la cola en el flanco de bajada (1->0): el pallet
+    # termino de pasar por el sensor de salida.
+    "sensor_salida_pmc_tipo": 3,   # X = 3
+    "sensor_salida_byte": 10,      # X10
+    "sensor_salida_bit": 6,        # SQX10.6
+    "usar_sensor_salida": True,    # True = descontar por sensor (no por #553)
+    # --- Heartbeat / linea de vida PC<->torno por R50.0 ---
+    # El torno (ladder) baja R50.0 a 0; la PC la vuelve a poner en 1 en cada
+    # tick. Si la PC muere, R50.0 queda en 0 y el ladder detecta "PC caida".
+    "heartbeat_pmc_tipo": 5,       # R = 5
+    "heartbeat_byte": 50,          # R50
+    "heartbeat_bit": 0,            # R50.0
+    "usar_heartbeat": True,
+    # --- Señal de "receta cargada" para el ladder del Fammar (R55.3) ---
+    # La PC la pone en 1 cuando bajo #553 (receta lista). El ladder ve
+    # R55.3=1, libera el pre-stopper del husillo y BAJA la R55.3 el mismo.
+    "receta_lista_pmc_tipo": 5,    # R = 5
+    "receta_lista_byte": 55,       # R55
+    "receta_lista_bit": 3,         # R55.3
+    "polling_ms": 200,        # intervalo de polling (sensor + #553 + heartbeat R50)
     "persist_path": "cola_torno.json",
 }
 
@@ -82,7 +109,7 @@ DEFAULTS = {
 class ColaTorno:
     """Cola FIFO thread-safe persistida en disco como JSON.
 
-    Cada elemento es un dict: {"tipo": int, "op": int, "ts": str}
+    Cada elemento es un dict: {"tipo": int, "op": int, "rosca": int, "ts": str}
     El timestamp es para auditoria/HMI, no afecta logica.
     """
 
@@ -113,12 +140,13 @@ class ColaTorno:
         except Exception as e:
             print(f"[COLA] Error guardando {self._path}: {e}")
 
-    def encolar(self, tipo, op):
+    def encolar(self, tipo, op, rosca=0):
         """Agrega al final de la cola."""
         with self._lock:
             item = {
                 "tipo": int(tipo),
                 "op": int(op),
+                "rosca": int(rosca),
                 "ts": datetime.now().strftime("%H:%M:%S"),
             }
             self._cola.append(item)
@@ -156,6 +184,20 @@ class ColaTorno:
             self._cola.clear()
             self._persistir()
 
+    def todos_op3(self):
+        """Cambia el op de TODAS las entradas a 3 (dejar pasar), sin borrar.
+        Los pallets fisicos que ya estan en la fila pasan sin mecanizar y la
+        cola drena al ritmo del sensor, manteniendo la correspondencia.
+        Devuelve cuantas cambio."""
+        with self._lock:
+            n = 0
+            for item in self._cola:
+                if item.get("op") != 3:
+                    item["op"] = 3
+                    n += 1
+            self._persistir()
+            return n
+
     def quitar_indice(self, indice):
         """Quita el elemento en el indice dado. Devuelve True si lo saco."""
         with self._lock:
@@ -169,6 +211,21 @@ class ColaTorno:
                 self._persistir()
                 return True
             return False
+
+    def recuperar_ultimo_op3(self):
+        """Cambia el op del ULTIMO item de la cola a 3 (dejar pasar sin
+        mecanizar). Se usa al retomar automatico cuando quedo un pallet
+        clampeado en el spot 2: ese pallet ya se proceso y encolo antes
+        del corte, es el ultimo de la cola, y hay que reciclarlo -> op=3.
+        Devuelve el item modificado, o None si la cola estaba vacia.
+        """
+        with self._lock:
+            if not self._cola:
+                return None
+            item = self._cola[-1]
+            item["op"] = 3
+            self._persistir()
+            return dict(item)
 
 
 # ======================================================================
@@ -211,7 +268,9 @@ class TornoFanuc:
         self._sync_thread = None
         self._shutdown = False
         # Para saber si tenemos que reescribir macros (cuando cambia cola[0])
-        self._ultimo_escrito = (None, None)  # (tipo, op)
+        self._ultimo_escrito = (None, None, None)  # (tipo, op, rosca)
+        # Arranque en modo SEGURO hasta confirmar (ver confirmar_arranque).
+        self._arranque_confirmado = False
         # Cola de pedidos para que TODAS las llamadas FOCAS se hagan
         # desde el thread sincronizador. La fwlib32 de FANUC exige que
         # el handle se use desde el mismo thread que lo creo, sino
@@ -260,11 +319,13 @@ class TornoFanuc:
     #  Operaciones publicas
     # ------------------------------------------------------------------
 
-    def encolar(self, tipo, op):
-        """Encola una pieza (tipo, op). Si la cola estaba vacia, el thread
-        sincronizador la escribe a las macros en el proximo ciclo."""
-        item = self.cola.encolar(tipo, op)
-        self._log(f"[TORNO] Encolado: tipo={tipo} op={op} | cola={len(self.cola)}")
+    def encolar(self, tipo, op, rosca=0):
+        """Encola una pieza (tipo, op, rosca). Si la cola estaba vacia, el
+        thread sincronizador la escribe a las macros en el proximo ciclo.
+        rosca solo se manda al torno (el robot no la usa)."""
+        item = self.cola.encolar(tipo, op, rosca)
+        self._log(f"[TORNO] Encolado: tipo={tipo} op={op} rosca={rosca} "
+                  f"| cola={len(self.cola)}")
         return item
 
     def limpiar_cola(self):
@@ -272,13 +333,36 @@ class TornoFanuc:
         self.cola.limpiar()
         self._log(f"[TORNO] Cola limpiada ({n} items removidos)")
         # Forzar reescritura de ceros
-        self._ultimo_escrito = (None, None)
+        self._ultimo_escrito = (None, None, None)
+
+    def info_arranque(self):
+        """Devuelve (n_cola, receta_primero) para el dialogo de confirmacion.
+        receta_primero es un dict {tipo,op,rosca} o None si la cola esta vacia."""
+        n = len(self.cola)
+        primero = self.cola.primero()
+        return n, (dict(primero) if primero else None)
+
+    def confirmar_arranque(self):
+        """El operador confirmo que la cola coincide con los pallets fisicos.
+        A partir de aca la PC escribe recetas reales (sale del modo op=3)."""
+        self._arranque_confirmado = True
+        self._ultimo_escrito = (None, None, None)
+        self._log("[TORNO] Arranque confirmado: empiezo a mecanizar segun la cola")
+
+    def todos_op3(self):
+        """Marca todas las entradas de la cola como op=3 (dejar pasar).
+        No borra: los pallets recirculan sin mecanizar y la cola drena
+        con el sensor."""
+        n = self.cola.todos_op3()
+        self._log(f"[TORNO] {n} items pasados a op=3 (dejar pasar / recircular)")
+        self._ultimo_escrito = (None, None, None)
+        return n
 
     def quitar_indice(self, indice):
         ok = self.cola.quitar_indice(indice)
         if ok:
             self._log(f"[TORNO] Item indice {indice} quitado")
-            self._ultimo_escrito = (None, None)
+            self._ultimo_escrito = (None, None, None)
         return ok
 
     def reconectar(self):
@@ -403,9 +487,9 @@ class TornoFanuc:
 
         - Si no esta conectado, intenta conectar.
         - Si esta conectado:
-          - Lee #503. Si == 1 -> popleft, baja a 0.
-          - Compara cola[0] con _ultimo_escrito. Si difiere, escribe #500/#501.
-          - Si cola vacia y _ultimo_escrito != (0,0), escribe ceros.
+          - Lee #553. Si == 1 -> popleft, baja a 0.
+          - Compara cola[0] con _ultimo_escrito. Si difiere, escribe #551/#550/#552.
+          - Si cola vacia y _ultimo_escrito != (0,0,0), escribe ceros.
         - Sleep polling_ms.
         """
         polling_s = self.config["polling_ms"] / 1000.0
@@ -473,8 +557,19 @@ class TornoFanuc:
                 self._client = client
             self.conectado = True
             self.ultimo_error = None
-            self._ultimo_escrito = (None, None)  # forzar reescritura
+            self._ultimo_escrito = (None, None, None)  # forzar reescritura
+            # Arranque en modo seguro: no mecanizar hasta que el operador
+            # confirme que la cola coincide con los pallets fisicos.
+            self._arranque_confirmado = False
+            # Dejar #553=0 (por si quedo en 1 de la sesion anterior) para
+            # que el torno pueda arrancar cuando se confirme.
+            try:
+                with self._client_lock:
+                    self._client.set_macro(self.config["macro_fin"], 0)
+            except Exception:
+                pass
             self._log(f"[TORNO] Conectado a {self.config['torno_host']}:{self.config['torno_port']}")
+            self._log("[TORNO] Modo seguro: dejando pasar (op=3) hasta confirmar arranque")
         except Exception as e:
             self.ultimo_error = str(e)
             # No spamear log con cada intento fallido
@@ -494,49 +589,188 @@ class TornoFanuc:
         self.conectado = False
         self._cancelar_queue("Torno desconectado durante operacion")
 
-    def _tick_sincronizar(self):
-        """Una iteracion del sync. Asume conectado."""
-        mac_tipo = self.config["macro_tipo"]
-        mac_op = self.config["macro_op"]
-        mac_fin = self.config["macro_fin"]
+    def _procesar_sensor_salida(self):
+        """Sensor de salida del husillo (SQX10.6). En el flanco de bajada
+        (1->0) el pallet termino de pasar, entonces:
+          1) descuenta 1 de la cola (verdad fisica: salio un pallet),
+          2) escribe la receta del NUEVO primero en las macros,
+          3) baja #553 a 0 (avisa al torno "receta lista, arranca").
+        Exige el ciclo completo 0->1->0 para no contar de mas si el sensor
+        tiembla con el pallet encima."""
+        tipo = self.config["sensor_salida_pmc_tipo"]
+        byte = self.config["sensor_salida_byte"]
+        bit = self.config["sensor_salida_bit"]
+        try:
+            with self._client_lock:
+                estado = self._client.read_pmc_bit(tipo, byte, bit)
+        except Exception as e:
+            self._log(f"[SENSOR] Error leyendo SQX{byte}.{bit}: {e}")
+            return
 
-        # 1. Chequear flag de fin (#503)
-        with self._client_lock:
-            valor_fin = self._client.get_macro(mac_fin)
+        prev = getattr(self, "_sensor_prev", None)
+        if prev is None:
+            self._sensor_prev = estado
+            self._sensor_visto_alto = estado
+            return
 
-        if valor_fin == 1:
-            # Torno termino una pieza
+        if estado and not prev:
+            # Flanco de subida: el pallet llego al sensor
+            self._sensor_visto_alto = True
+
+        if (not estado) and prev and getattr(self, "_sensor_visto_alto", False):
+            # Flanco de bajada: el pallet SALIO.
+            # 1) DESCONTAR siempre (verdad fisica: salio un pallet).
             quitado = self.cola.desencolar()
             if quitado is not None:
                 self.piezas_terminadas += 1
-                self._log(f"[TORNO] Pieza terminada: tipo={quitado['tipo']} "
-                          f"op={quitado['op']} | total terminadas={self.piezas_terminadas}")
+                self._log(f"[SENSOR] Pallet salio -> desencolado: "
+                          f"tipo={quitado['tipo']} op={quitado['op']} "
+                          f"rosca={quitado.get('rosca', 0)} "
+                          f"| total salidos={self.piezas_terminadas}")
             else:
-                self._log("[TORNO] Torno aviso fin pero cola estaba vacia (?)")
-            # Forzar reescritura del nuevo primero
-            self._ultimo_escrito = (None, None)
-            # Bajar flag
-            with self._client_lock:
-                self._client.set_macro(mac_fin, 0)
+                self._log("[SENSOR] Pallet salio pero la cola estaba vacia "
+                          "(paso uno sin encolar)")
+            self._sensor_visto_alto = False
 
-        # 2. Asegurarse que #500/#501 reflejan el primero de la cola
+            # 2) Escribir la receta nueva + bajar #553 SOLO si el torno YA
+            #    termino (#553==1). Asi nunca pisamos la receta que el torno
+            #    esta usando en ese momento. Si todavia no termino, dejamos
+            #    la escritura pendiente para cuando confirme el fin.
+            try:
+                with self._client_lock:
+                    fin = self._client.get_macro(self.config["macro_fin"])
+            except Exception as e:
+                self._log(f"[SENSOR] No se pudo leer #553: {e}")
+                fin = 0
+            if fin == 1:
+                self._escribir_receta_actual()
+                try:
+                    with self._client_lock:
+                        self._client.set_macro(self.config["macro_fin"], 0)
+                except Exception as e:
+                    self._log(f"[SENSOR] No se pudo bajar #553: {e}")
+                # Avisar al ladder que la receta esta cargada (R55.3=1)
+                self._avisar_receta_lista()
+                self._receta_pendiente = False
+            else:
+                # El pallet salio pero el torno aun no confirmo fin: marcar
+                # que hay que escribir la receta apenas #553 llegue a 1.
+                self._receta_pendiente = True
+
+        self._sensor_prev = estado
+
+        # Si quedo una escritura pendiente (el pallet salio antes de que el
+        # torno confirmara el fin), completarla cuando #553 llegue a 1.
+        if getattr(self, "_receta_pendiente", False):
+            try:
+                with self._client_lock:
+                    fin = self._client.get_macro(self.config["macro_fin"])
+            except Exception:
+                fin = 0
+            if fin == 1:
+                self._escribir_receta_actual()
+                try:
+                    with self._client_lock:
+                        self._client.set_macro(self.config["macro_fin"], 0)
+                except Exception as e:
+                    self._log(f"[SENSOR] No se pudo bajar #553 (pend): {e}")
+                # Avisar al ladder que la receta esta cargada (R55.3=1)
+                self._avisar_receta_lista()
+                self._receta_pendiente = False
+
+    def _escribir_receta_actual(self):
+        """Escribe en las macros la receta del primero de la cola (o op=3 si
+        la cola esta vacia). Solo escribe si cambio respecto de lo ultimo."""
+        mac_tipo = self.config["macro_tipo"]
+        mac_op = self.config["macro_op"]
+        mac_rosca = self.config["macro_rosca"]
         primero = self.cola.primero()
         if primero is None:
-            objetivo = (0, 0)
+            objetivo = (0, 3, 0)
         else:
-            objetivo = (int(primero["tipo"]), int(primero["op"]))
-
+            objetivo = (int(primero["tipo"]), int(primero["op"]),
+                        int(primero.get("rosca", 0)))
         if objetivo != self._ultimo_escrito:
             with self._client_lock:
                 self._client.set_macro(mac_tipo, objetivo[0])
                 self._client.set_macro(mac_op, objetivo[1])
+                self._client.set_macro(mac_rosca, objetivo[2])
             self._ultimo_escrito = objetivo
-            if objetivo == (0, 0):
-                self.ultimo_evento = f"[TORNO] Cola vacia -> #{mac_tipo}=0 #{mac_op}=0"
+            if objetivo == (0, 3, 0):
+                self.ultimo_evento = (f"[TORNO] Cola vacia -> op=3 (dejar pasar) "
+                                      f"#{mac_tipo}=0 #{mac_op}=3 #{mac_rosca}=0")
             else:
-                self.ultimo_evento = (f"[TORNO] Macros actualizadas: "
-                                      f"#{mac_tipo}={objetivo[0]} #{mac_op}={objetivo[1]}")
+                self.ultimo_evento = (f"[TORNO] Receta -> #{mac_tipo}={objetivo[0]} "
+                                      f"#{mac_op}={objetivo[1]} #{mac_rosca}={objetivo[2]}")
             self._log(self.ultimo_evento)
+
+    def _avisar_receta_lista(self):
+        """Pone R55.3 = 1 para avisar al ladder del Fammar que la receta ya
+        esta cargada (#553 ya bajo). El ladder libera el pre-stopper y baja
+        el mismo la R55.3. La PC NO la baja."""
+        tipo = self.config["receta_lista_pmc_tipo"]
+        byte = self.config["receta_lista_byte"]
+        bit = self.config["receta_lista_bit"]
+        try:
+            with self._client_lock:
+                b = self._client.read_pmc_byte(tipo, byte)
+                self._client.write_pmc_byte(tipo, byte, b | (1 << bit))
+            self._log(f"[TORNO] R{byte}.{bit}=1 (receta cargada -> "
+                      f"ladder libera pre-stopper)")
+        except Exception as e:
+            self._log(f"[TORNO] No se pudo poner R{byte}.{bit}: {e}")
+
+    def _procesar_heartbeat(self):
+        """Linea de vida PC<->torno por R50.0. El ladder del torno baja
+        R50.0 a 0; la PC la vuelve a poner en 1 en cada tick. Mientras la
+        PC este viva, R50.0 vuelve a 1 rapido. Si la PC muere, R50.0 queda
+        en 0 y el ladder lo detecta (timeout de su lado)."""
+        tipo = self.config["heartbeat_pmc_tipo"]
+        byte = self.config["heartbeat_byte"]
+        bit = self.config["heartbeat_bit"]
+        try:
+            with self._client_lock:
+                b = self._client.read_pmc_byte(tipo, byte)
+                if ((b >> bit) & 1) == 0:
+                    self._client.write_pmc_byte(tipo, byte, b | (1 << bit))
+                    self._hb_pulsos = getattr(self, "_hb_pulsos", 0) + 1
+        except Exception as e:
+            # No romper el sync si falla; el ladder detectara la caida.
+            self._log(f"[HEARTBEAT] Error en R{byte}.{bit}: {e}")
+
+    def _tick_sincronizar(self):
+        """Una iteracion del sync. Asume conectado."""
+        mac_cola = self.config["macro_cola"]
+
+        # Informar al torno cuantas piezas hay en la cola (#554).
+        # Solo se escribe cuando cambia, para no saturar FOCAS.
+        n_cola = len(self.cola)
+        if n_cola != getattr(self, "_ultima_cola_len", None):
+            with self._client_lock:
+                self._client.set_macro(mac_cola, n_cola)
+            self._ultima_cola_len = n_cola
+
+        # ============================================================
+        #  El SENSOR DE SALIDA es el evento maestro. En el flanco 1->0
+        #  (pallet salio) descuenta la cola, escribe la receta del nuevo
+        #  primero y baja #553 (libera al torno). Ver _procesar_sensor_salida.
+        #
+        #  #553 = handshake: el torno lo pone en 1 al terminar y espera el 0.
+        #  El 0 lo baja el sensor cuando sale el pallet (receta ya lista).
+        # ============================================================
+        self._procesar_sensor_salida()
+
+        # Heartbeat / linea de vida PC<->torno (R50.0). Si el ladder la
+        # bajo a 0, la volvemos a 1: "PC viva". Si la PC muere, queda en 0.
+        if self.config.get("usar_heartbeat", True):
+            self._procesar_heartbeat()
+
+        # Respaldo SOLO para el arranque: si nunca escribimos nada aun,
+        # dejar la receta del primero (o op=3) puesta. Una vez que el ciclo
+        # esta en marcha, la receta la maneja el sensor+#553 (no aca), para
+        # no pisar la receta que el torno pueda estar usando.
+        if self._ultimo_escrito == (None, None, None):
+            self._escribir_receta_actual()
 
     def _log(self, msg):
         try:
