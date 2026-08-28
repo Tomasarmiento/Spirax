@@ -579,7 +579,7 @@ def manejar_robot(conn, addr, log_callback):
 
             #     (la cola solo contiene operaciones realmente hechas).
 
-            if recuperar in (1, 2, 21, 22, 23):
+            if recuperar in (1, 2, 21, 22, 23, 24):
 
                 if recuperar == 1:
 
@@ -609,7 +609,7 @@ def manejar_robot(conn, addr, log_callback):
                     # correcto, aunque el spot 1 este fotografiando el pallet
                     # siguiente en paralelo (por eso ya no usamos
                     # _op_pendiente, que se pisaba).
-                    _MAPA_AVISO = {21: 1, 22: 2, 23: 2}
+                    _MAPA_AVISO = {21: 1, 22: 2, 23: 2, 24: 3}
                     if recuperar in _MAPA_AVISO:
                         op_real = _MAPA_AVISO[recuperar]
                         torno.encolar(tipo, op_real, rosca)
@@ -621,6 +621,15 @@ def manejar_robot(conn, addr, log_callback):
                                          f"OP20 sin pasar por el robot. "
                                          f"Encolado tipo={tipo} op=2 "
                                          f"rosca={rosca}")
+                        elif recuperar == 24:
+                            # MESA VACIA: el robot no cargo nada, el pallet
+                            # sigue vacio. Va como op=3 para que el torno lo
+                            # deje pasar sin alarma. El Master cuenta estos
+                            # (VACIOS_SEGUIDOS) y frena al llegar al limite.
+                            log_callback(f"[FIN RUTINA] MESA VACIA: el robot no "
+                                         f"cargo nada, el pallet sigue vacio. "
+                                         f"Encolado tipo={tipo} op=3 (el torno "
+                                         f"lo deja pasar)")
                         else:
                             log_callback(f"[FIN RUTINA] Encolado: tipo={tipo} "
                                          f"op={op_real} rosca={rosca}")
@@ -1123,15 +1132,10 @@ class HMISpirax:
 
         # pestania se encarga del contenido que no entra.
 
-        sw = self.root.winfo_screenwidth()
-
-        sh = self.root.winfo_screenheight()
-
-        w = min(1600, sw)
-
-        h = min(900, sh - 60)
-
-        self.root.geometry(f"{w}x{h}")
+        self.root.attributes("-fullscreen", True)
+        # F11 sale/entra de pantalla completa (para comisionamiento).
+        # Sacar este binding cuando quede en manos del operario.
+        self.root.bind("<F11>", self._toggle_fullscreen)
 
         self.root.configure(bg='#2b2b2b')
 
@@ -6983,6 +6987,9 @@ class HMISpirax:
 
         self.root.destroy()
 
+    def _toggle_fullscreen(self, _evt=None):
+        actual = bool(self.root.attributes("-fullscreen"))
+        self.root.attributes("-fullscreen", not actual)
 
 
 

@@ -57,6 +57,7 @@ CLI
 
 import ctypes
 import os
+import shutil
 import sys
 import time
 
@@ -105,6 +106,26 @@ CONFIG_SEARCH = [
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ===========================================================================
+# WINRING0  -  el driver de kernel que NKIOLIB usa para el SMBus
+# ===========================================================================
+#
+# WinRing0 instala su driver de kernel en tiempo de ejecucion, y arma la ruta
+# del .sys con GetModuleFileName del PROCESO, no del DLL. O sea: lo busca en
+# la carpeta del python.exe en uso, no en C:\NODKA\. Si el archivo no esta
+# ahi, NKDIO_LibraryInit falla con codigo 3 (error de bus SMBus), que es un
+# mensaje enganoso: no hay ningun problema de bus, falta el driver.
+#
+# Al cerrar, WinRing0 desinstala el servicio y borra el .sys, asi que el
+# archivo hay que reponerlo. Preinstalar el servicio a mano con sc.exe no
+# sirve: la DLL lo recrea igual apuntando a su propia ruta.
+#
+# Por eso lo copiamos nosotros antes de cargar la DLL. Requiere permisos de
+# escritura en la carpeta de Python, que ya tenes por correr como Admin.
+WINRING0_SRC = r"C:\NODKA\NKDIOLC_SDK\Bin"
+WINRING0_FILES = ("WinRing0x64.sys", "WinRing0x64.dll")
+# ===========================================================================
+
+# ===========================================================================
 # POLARIDAD  -  VERIFICAR CON TESTER ANTES DE CONECTAR CARGAS
 # ===========================================================================
 #
@@ -149,8 +170,43 @@ def _find(name, extra_dirs):
     return None
 
 
+def _asegurar_winring0(verbose=False):
+    """Copia WinRing0 junto al python.exe en uso, si falta.
+
+    Devuelve la lista de archivos que efectivamente copio. No falla si no
+    puede copiar: solo avisa, y despues NKDIO_LibraryInit dara el error real.
+    """
+    if os.name != "nt":
+        return []
+
+    destino = os.path.dirname(sys.executable)
+    copiados = []
+    for nombre in WINRING0_FILES:
+        src = os.path.join(WINRING0_SRC, nombre)
+        dst = os.path.join(destino, nombre)
+        if os.path.exists(dst):
+            continue
+        if not os.path.isfile(src):
+            if verbose:
+                print(f"[nkio] no encontre {src}")
+            continue
+        try:
+            shutil.copy2(src, dst)
+            copiados.append(nombre)
+            if verbose:
+                print(f"[nkio] copie {nombre} -> {destino}")
+        except OSError as exc:
+            print(
+                f"[nkio] no pude copiar {nombre} a {destino}: {exc}\n"
+                "       Corre el programa como Administrador."
+            )
+    return copiados
+
+
 def _load_dll():
     """Busca y carga la DLL de NKIOLIB, probando los nombres conocidos."""
+    _asegurar_winring0()
+
     found = []
     for name in DLL_NAMES:
         path = _find(name, DLL_SEARCH)
@@ -249,8 +305,10 @@ class NodkaIO:
             if rc in (1, 2, 3, 4):
                 extra = (
                     "\n  Error de bus SMBus. Verificá que corras como "
-                    "Administrador\n  y que no haya otro proceso usando el DIO "
-                    "(la utilidad de test de Nodka, por ejemplo)."
+                    "Administrador,\n  que no haya otro proceso usando el DIO "
+                    "(la utilidad de test de\n  Nodka, o un python.exe "
+                    "colgado de una corrida anterior), y que\n  WinRing0x64.sys "
+                    f"exista en {os.path.dirname(sys.executable)}"
                 )
             elif rc == 5:
                 extra = (
@@ -426,6 +484,22 @@ def _info():
         print("el pin 2 (DOGND), no continuidad.")
 
 
+def _winring():
+    """Diagnostico del driver WinRing0."""
+    destino = os.path.dirname(sys.executable)
+    print(f"python.exe en uso: {sys.executable}")
+    print(f"origen:            {WINRING0_SRC}")
+    print()
+    copiados = _asegurar_winring0(verbose=True)
+    if not copiados:
+        print("[nkio] no hubo que copiar nada")
+    print()
+    for nombre in WINRING0_FILES:
+        dst = os.path.join(destino, nombre)
+        estado = "OK" if os.path.isfile(dst) else "FALTA"
+        print(f"  {estado:6} {dst}")
+
+
 def _monitor():
     with NodkaIO(verbose=True) as io:
         print()
@@ -528,6 +602,8 @@ def main():
         cmd = args[0]
         if cmd == "info":
             _info()
+        elif cmd == "winring":
+            _winring()
         elif cmd == "monitor":
             _monitor()
         elif cmd == "set" and len(args) == 3:
