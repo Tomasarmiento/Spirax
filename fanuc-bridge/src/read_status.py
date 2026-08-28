@@ -64,7 +64,7 @@ def main() -> int:
     cfg.read(cfg_path)
 
     parser = argparse.ArgumentParser(description="Monitor del torno Fanuc")
-    parser.add_argument("--host", default=cfg.get("torno", "host", fallback="172.31.1.99"))
+    parser.add_argument("--host", default=cfg.get("torno", "host", fallback="192.168.1.10"))
     parser.add_argument("--port", type=int, default=cfg.getint("torno", "port", fallback=8193))
     parser.add_argument("--dlls", default=cfg.get("dlls", "path", fallback="./dlls"))
     parser.add_argument("--interval", type=float, default=2.0, help="segundos entre lecturas")

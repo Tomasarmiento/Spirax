@@ -5,7 +5,7 @@ Lo primero que hay que correr. Si esto anda, todo lo demás también.
 
 Uso:
     python -m src.test_connection
-    python -m src.test_connection --host 172.31.1.99
+    python -m src.test_connection --host 192.168.1.10
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def main() -> int:
     cfg_path = Path(__file__).resolve().parent.parent / "config.ini"
     cfg.read(cfg_path)
 
-    default_host = cfg.get("torno", "host", fallback="172.31.1.99")
+    default_host = cfg.get("torno", "host", fallback="192.168.1.10")
     default_port = cfg.getint("torno", "port", fallback=8193)
     default_timeout = cfg.getint("torno", "timeout", fallback=10)
     default_dlls = cfg.get("dlls", "path", fallback="./dlls")

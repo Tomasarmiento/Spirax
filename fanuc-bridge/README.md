@@ -10,7 +10,7 @@ Cliente Python para comunicarse con el torno Fanuc 0i-TF vía FOCAS2 sobre Ether
 
 ## Hardware
 
-- **Torno**: Fanuc 0i-TF en `172.31.1.99:8193`
+- **Torno**: Fanuc 0i-TF en `192.168.1.10:8193`
 - **PC visión**: Windows 64 bits + RealSense, en la misma red (`172.31.0.0/16`)
 
 ## Setup
@@ -43,8 +43,8 @@ https://github.com/TrakHound/Fanuc-MTConnect-Agent/tree/master/Adapter%20Templat
 
 Antes de correr nada:
 ```cmd
-ping 172.31.1.99
-telnet 172.31.1.99 8193
+ping 192.168.1.10
+telnet 192.168.1.10 8193
 ```
 Si el ping responde y telnet conecta (pantalla negra), todo OK.
 

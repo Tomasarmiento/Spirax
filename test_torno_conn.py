@@ -8,7 +8,7 @@ Corre tres tests aislados:
 
 Ejecuta:
     python test_torno_conn.py
-    python test_torno_conn.py 172.31.1.99 8193
+    python test_torno_conn.py 192.168.1.10 8193
 
 Util para discriminar entre problema de red, puerto cerrado, o
 problema de la libreria FOCAS / DLL.
@@ -130,7 +130,7 @@ def test_focas(host, port):
 
 
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else "172.31.1.99"
+    host = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.10"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8193
 
     print("=" * 60)

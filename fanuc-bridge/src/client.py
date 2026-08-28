@@ -3,7 +3,7 @@ client.py — Cliente de alto nivel para el torno Fanuc.
 
 Encapsula el ciclo handle FOCAS y expone métodos pythónicos:
 
-    with FanucClient("172.31.1.99") as t:
+    with FanucClient("192.168.1.10") as t:
         print(t.status())
         print(t.position())
         t.set_macro(500, 1)   # modelo de pieza

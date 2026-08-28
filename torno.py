@@ -63,7 +63,7 @@ except ImportError:
 # ======================================================================
 
 DEFAULTS = {
-    "torno_host": "172.31.1.99",
+    "torno_host": "192.168.1.10",
     "torno_port": 8193,
     "torno_timeout_focas": 10,
     "torno_dll_path": "./dlls",
