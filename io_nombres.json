@@ -1,0 +1,22 @@
+{
+  "di": [
+    "op_20 (pre-stopper)",
+    "presencia_pieza (pre-stopper)",
+    "linea_vida_robot",
+    "operation_mode",
+    "DI4",
+    "DI5",
+    "DI6",
+    "DI7"
+  ],
+  "do": [
+    "DO0",
+    "DO1",
+    "DO2",
+    "DO3",
+    "DO4",
+    "DO5",
+    "DO6",
+    "DO7"
+  ]
+}

@@ -93,6 +93,34 @@ DEFAULTS = {
     "heartbeat_byte": 50,          # R50
     "heartbeat_bit": 0,            # R50.0
     "usar_heartbeat": True,
+    # --- WATCHDOG DE LA LINEA DE VIDA DEL ROBOT (DI2 del panel Nodka) ---
+    # El SPS del robot INVIERTE $OUT[16] cada ~500ms. Esa salida entra por
+    # DI2. Lo que se mide NO es el nivel sino que CAMBIE: si el robot se
+    # apaga con la salida en 1, la señal se queda en 1 para siempre y un
+    # chequeo por nivel no se daria cuenta nunca.
+    #
+    # PARA QUE SIRVE: con el robot caido la cinta la sigue moviendo el
+    # Fammar, asi que los pallets pasan por el spot 1 sin que nadie los
+    # fotografie ni los encole. La cola se desfasa de la realidad fisica y
+    # ese desfase no se recupera. Al detectar la caida, la PC DEJA DE
+    # REPONER R50.0 y el ladder del Fammar corta la cinta.
+    "usar_watchdog_robot": True,
+    "watchdog_robot_ms": 5000,     # sin cambio de DI2 por mas de esto = caido
+    # True  = con el robot caido, tampoco liberar el pre-stopper (doble red)
+    "watchdog_bloquea_liberacion": True,
+    # --- SYSTEM LINK del Fammar (R55.0) ---
+    # En 1 el Fammar obedece las condiciones que le pusimos. En 0 funciona
+    # de fabrica: el pre-stopper libera solo y NADA de esto protege.
+    "system_link_pmc_tipo": 5,     # R = 5
+    "system_link_byte": 55,        # R55
+    "system_link_bit": 0,          # R55.0
+    "leer_system_link": True,
+    # MEDIDO EN LA MAQUINA (13/08): la señal esta INVERTIDA.
+    # Con el boton del System Link PRENDIDO en el torno, R55.0 vale 0.
+    #   R55.0 = 0  ->  System Link PRENDIDO
+    #   R55.0 = 1  ->  System Link APAGADO
+    # Si algun dia el ladder cambia y queda directa, poner esto en False.
+    "system_link_invertido": True,
     # --- Señal de "receta cargada" para el ladder del Fammar (R55.3) ---
     # La PC la pone en 1 cuando bajo #553 (receta lista). El ladder ve
     # R55.3=1, libera el pre-stopper del husillo y BAJA la R55.3 el mismo.
@@ -362,6 +390,15 @@ class TornoFanuc:
         # levanta #553 (el NC se clava en el M80), asi que el ciclo siguiente
         # no tiene que esperar esa señal. Se consume una sola vez.
         self._op3_en_el_torno = False
+        # --- Watchdog de la linea de vida del robot (DI2) ---
+        self.robot_lv_ultimo = None       # ultimo nivel visto del pulso
+        self.robot_lv_cambio_t = None     # cuando cambio por ultima vez
+        self.robot_vivo = None            # None = todavia sin dato
+        self.robot_en_auto = None         # DI3
+        self._avisado_robot_caido = False
+        # Estado del System Link del Fammar (R55.0)
+        self.system_link = None
+        self._avisado_sl_apagado = False
         # Control de reintentos de conexion
         self._reintento_desde = None
         self._reintento_agotado = False
@@ -1163,6 +1200,22 @@ class TornoFanuc:
         if getattr(self, "_verif_bloqueada", False):
             return   # bloqueada por un NO COINCIDE: espera accion del operador
 
+        # --- ROBOT CAIDO: no liberar ---
+        # Doble red. El corte principal es el heartbeat (el Fammar frena la
+        # cinta), pero mientras el ladder reacciona no tiene sentido seguir
+        # metiendo pallets al torno: el robot no los proceso y su entrada en
+        # la cola puede no existir.
+        if (self.config.get("watchdog_bloquea_liberacion", True)
+                and self.robot_vivo is False):
+            if not getattr(self, "_avisado_lib_robot_caido", False):
+                self._log("!!! [VERIF] Robot caido: NO libero el "
+                          "pre-stopper. El pallet queda frenado hasta que "
+                          "vuelva la linea de vida.")
+                self._avisado_lib_robot_caido = True
+            self.ultimo_error = "Robot caido: liberacion bloqueada"
+            return
+        self._avisado_lib_robot_caido = False
+
         # --- 0) LEER LA COLA PRIMERO ---
         # Hay que saber si el pallet es op=3 (dejar pasar) ANTES de mirar
         # #553, porque con op=3 no se espera esa señal (ver punto 1).
@@ -1594,6 +1647,10 @@ class TornoFanuc:
             "receta_a_mandar": (f"op={snap[i_rec]['op']}" if len(snap) > i_rec
                                 else "op=3 (sin entrada)"),
             "piezas_terminadas": self.piezas_terminadas,
+            "robot_vivo": self.robot_vivo,
+            "robot_en_auto": self.robot_en_auto,
+            "seg_sin_pulso": getattr(self, "segundos_sin_pulso", None),
+            "system_link": self.system_link,
             "ultimo_desencolado": getattr(self, "_ultimo_desencolado", None),
             "error": None,
         }
@@ -1617,11 +1674,108 @@ class TornoFanuc:
             self.ultimo_receta_lista = None
             return None
 
+    def _procesar_watchdog_robot(self):
+        """Vigila la linea de vida del robot (DI2 del panel Nodka).
+
+        El SPS invierte $OUT[16] cada ~500ms. Aca NO se mira el nivel sino
+        que CAMBIE: si el robot se apaga con la salida en 1, la señal queda
+        en 1 para siempre y un chequeo por nivel nunca se daria cuenta.
+
+        Lee del CACHE del monitor de dio.py, no del bus: el SMBus no es
+        thread-safe y el monitor ya lo pollea cada 100ms.
+        """
+        if not self.config.get("usar_watchdog_robot", True):
+            self.robot_vivo = None
+            return
+        try:
+            from dio import dio
+            lectura = dio.robot_desde_cache()
+        except Exception:
+            lectura = None
+        if lectura is None:
+            # Sin DIO no se puede saber. No se declara caido para no frenar
+            # la linea por un problema del panel de sensores.
+            return
+        lv, auto = lectura
+        self.robot_en_auto = auto
+        ahora = time.monotonic()
+
+        if self.robot_lv_ultimo is None:
+            # Primera lectura: arrancar el reloj, todavia no se sabe nada
+            self.robot_lv_ultimo = lv
+            self.robot_lv_cambio_t = ahora
+            return
+        if lv != self.robot_lv_ultimo:
+            self.robot_lv_ultimo = lv
+            self.robot_lv_cambio_t = ahora
+
+        limite = self.config.get("watchdog_robot_ms", 2000) / 1000.0
+        sin_cambio = ahora - (self.robot_lv_cambio_t or ahora)
+        vivo = (sin_cambio <= limite)
+
+        if vivo != self.robot_vivo:
+            if vivo:
+                self._log("[ROBOT] Linea de vida RECUPERADA. OJO: mientras "
+                          "estuvo caida pasaron pallets por el spot 1 sin "
+                          "foto, asi que la cola puede haber quedado CORTA. "
+                          "Verificar antes de seguir produciendo.")
+                self._avisado_robot_caido = False
+            else:
+                self._log(f"!!! [ROBOT] LINEA DE VIDA CAIDA: el pulso de DI2 "
+                          f"no cambia desde hace {sin_cambio:.1f}s. El robot "
+                          f"esta apagado o murio el Submit. Dejo de reponer "
+                          f"R50.0 para que el Fammar corte la cinta.")
+                self._avisado_robot_caido = True
+        self.robot_vivo = vivo
+        self.segundos_sin_pulso = round(sin_cambio, 1)
+
+    def _leer_system_link(self):
+        """Lee R55.0. En 1 el Fammar obedece nuestras condiciones; en 0
+        funciona de fabrica y NADA de lo que hacemos protege."""
+        if not self.config.get("leer_system_link", True):
+            return None
+        try:
+            with self._client_lock:
+                v = self._client.read_pmc_bit(
+                    self.config["system_link_pmc_tipo"],
+                    self.config["system_link_byte"],
+                    self.config["system_link_bit"])
+            v = bool(v)
+        except Exception:
+            return None
+        # La señal esta invertida en el ladder: R55.0=0 significa PRENDIDO.
+        # Se invierte aca, en el unico lugar donde se lee, asi el resto del
+        # codigo y la pantalla trabajan siempre con "True = prendido".
+        if self.config.get("system_link_invertido", True):
+            v = not v
+        if v != self.system_link:
+            if v:
+                self._log("[FAMMAR] System Link PRENDIDO (R55.0=1): el "
+                          "Fammar obedece las condiciones de la PC.")
+                self._avisado_sl_apagado = False
+            else:
+                self._log("!!! [FAMMAR] System Link APAGADO (R55.0=0): el "
+                          "Fammar esta funcionando de fabrica. El "
+                          "pre-stopper libera solo y las protecciones de la "
+                          "PC NO estan activas.")
+                self._avisado_sl_apagado = True
+        self.system_link = v
+        return v
+
     def _procesar_heartbeat(self):
         """Linea de vida PC<->torno por R50.0. El ladder del torno baja
         R50.0 a 0; la PC la vuelve a poner en 1 en cada tick. Mientras la
         PC este viva, R50.0 vuelve a 1 rapido. Si la PC muere, R50.0 queda
         en 0 y el ladder lo detecta (timeout de su lado)."""
+        # CORTE POR ROBOT CAIDO: si la linea de vida del robot se cayo, NO
+        # se repone R50.0. El ladder del Fammar ve la linea de vida en 0 y
+        # corta la cinta. Es la unica forma que tiene la PC de frenar la
+        # cinta, y hace falta: con el robot caido los pallets siguen pasando
+        # por el spot 1 sin que nadie los fotografie ni los encole, y la cola
+        # se desfasa de la realidad fisica sin recuperacion posible.
+        if (self.config.get("usar_watchdog_robot", True)
+                and self.robot_vivo is False):
+            return
         tipo = self.config["heartbeat_pmc_tipo"]
         byte = self.config["heartbeat_byte"]
         bit = self.config["heartbeat_bit"]
@@ -1664,6 +1818,11 @@ class TornoFanuc:
         if self._pedido_primera_pieza:
             self._pedido_primera_pieza = False
             self._ejecutar_primera_pieza()
+
+        # Watchdog de la linea de vida del robot: va ANTES del sensor de
+        # salida, porque _procesar_liberacion consulta self.robot_vivo.
+        self._procesar_watchdog_robot()
+        self._leer_system_link()
 
         self._procesar_sensor_salida()
 

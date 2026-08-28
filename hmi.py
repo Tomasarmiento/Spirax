@@ -3095,6 +3095,28 @@ class HMISpirax:
             bg='#4a3a10', fg='#ffd24a')
         self.lbl_primera_estado.pack(side='left', padx=(10, 0))
 
+        # ---------- CARTEL: robot caido / System Link apagado ----------
+        # Aparece y desaparece solo segun el estado. Va arriba de todo porque
+        # es lo que hay que ver antes que cualquier otra cosa.
+        self.f_robot_alarma = tk.Frame(cont, bg='#5c1a1a', bd=2,
+                                       relief='raised')
+        self.lbl_robot_titulo = tk.Label(
+            self.f_robot_alarma, text="", font=("Arial", 14, "bold"),
+            bg='#5c1a1a', fg='#ffdddd')
+        self.lbl_robot_titulo.pack(anchor='w', padx=10, pady=(8, 0))
+        self.lbl_robot_detalle = tk.Label(
+            self.f_robot_alarma, text="", font=("Arial", 10),
+            bg='#5c1a1a', fg='#ffdddd', wraplength=900, justify='left')
+        self.lbl_robot_detalle.pack(anchor='w', padx=10, pady=(4, 4))
+        f_btn_rb = tk.Frame(self.f_robot_alarma, bg='#5c1a1a')
+        f_btn_rb.pack(anchor='w', padx=10, pady=(0, 8))
+        tk.Button(f_btn_rb, text="HACER 0 LA COLA",
+                  font=("Arial", 11, "bold"), bg='#cc4444', fg='white',
+                  command=self._limpiar_cola_torno).pack(side='left')
+        tk.Button(f_btn_rb, text="Todo op=3 (drenar la cinta)",
+                  font=("Arial", 11), bg='#c8860a', fg='white',
+                  command=self._todos_op3_torno).pack(side='left', padx=(8, 0))
+
 
 
 
@@ -3544,6 +3566,57 @@ class HMISpirax:
 
 
 
+    def _forzar_manual_por_robot_caido(self):
+        """Si el robot se cae O el System Link esta apagado, pasar cinta y
+        mesa a MANUAL y bloquear el boton AUTOMATICO mientras dure.
+
+        Por que con el ROBOT CAIDO: no va a llegar ningun pedido de vision, y
+        dejar los selectores en automatico da la impresion de que la celda
+        esta produciendo. Ademas la cinta la sigue moviendo el Fammar, asi que
+        pallets pueden estar pasando por el spot 1 sin foto.
+
+        Por que con el SYSTEM LINK APAGADO: el Fammar ignora todo lo que le
+        dice la PC. El pre-stopper libera solo, no hay verificacion contra los
+        sensores y no hay corte por robot caido. Producir en automatico asi es
+        producir sin ninguna proteccion, creyendo que estan puestas.
+
+        Al recuperarse NO se vuelve a automatico solo: queda en manual a
+        proposito, para que el arranque sea explicito. Es justo el momento en
+        que hay que revisar la cola antes de seguir.
+        """
+        robot_caido = (getattr(torno, "robot_vivo", None) is False)
+        sl_apagado = (getattr(torno, "system_link", None) is False)
+        caido = robot_caido or sl_apagado
+        motivo = ("robot caido" if robot_caido else "System Link apagado")
+        if caido and not getattr(self, "_manual_forzado", False):
+            self._manual_forzado = True
+            cambio = []
+            if estado.get_estado()["modo_auto_cinta"]:
+                self._cambiar_modo_cinta(False)
+                cambio.append("cinta")
+            if estado.get_estado()["modo_auto_mesa"]:
+                self._cambiar_modo_mesa(False)
+                cambio.append("mesa")
+            if cambio:
+                self._agregar_log(
+                    f"!!! [CELDA] {motivo.capitalize()}: "
+                    f"{' y '.join(cambio)} pasada a MANUAL. Cuando se "
+                    f"resuelva hay que volver a AUTOMATICO a mano, despues "
+                    f"de revisar la cola.")
+        elif not caido and getattr(self, "_manual_forzado", False):
+            self._manual_forzado = False
+            self._agregar_log("[CELDA] Condicion resuelta: ya se puede volver "
+                              "a AUTOMATICO. Revisar la cola primero.")
+
+        # Bloquear / desbloquear el boton AUTOMATICO de las dos estaciones
+        for btn in (self.btn_auto_cinta, self.btn_auto_mesa):
+            if caido:
+                btn.configure(state='disabled', bg='#3a3a3a',
+                              disabledforeground='#777777')
+            elif str(btn.cget('state')) == 'disabled':
+                btn.configure(state='normal', bg='SystemButtonFace',
+                              fg='black')
+
     def _refrescar_verificacion_torno(self):
         """Muestra el estado de la verificacion del pre-stopper: pallet en
         posicion (PMC) y los dos sensores del modulo DIO."""
@@ -3573,6 +3646,46 @@ class HMISpirax:
             self.lbl_sensores_dio.configure(
                 text=f"Sensores: DIO no disponible ({type(e).__name__})",
                 fg='#ff6b6b')
+
+        # 2a-bis) Cartel de ROBOT CAIDO / SYSTEM LINK APAGADO
+        rv = getattr(torno, "robot_vivo", None)
+        sl = getattr(torno, "system_link", None)
+        ssp = getattr(torno, "segundos_sin_pulso", None)
+        if rv is False:
+            self.lbl_robot_titulo.configure(text="ROBOT CAIDO")
+            self.lbl_robot_detalle.configure(
+                text=(f"Sin pulso del robot en DI2"
+                      f"{f' desde hace {ssp} s' if ssp is not None else ''}. "
+                      f"El robot esta apagado o murio el Submit.\n\n"
+                      f"La PC dejo de reponer R50.0 y el Fammar corto la "
+                      f"cinta. Tampoco se libera el pre-stopper.\n\n"
+                      f"OJO CON LA COLA: mientras el robot estuvo caido "
+                      f"pasaron pallets por el spot 1 sin que nadie los "
+                      f"fotografie ni los encole, asi que la cola puede "
+                      f"haber quedado CORTA. Antes de seguir: vaciar la "
+                      f"cinta con 'Todo op=3', o hacer 0 la cola si la "
+                      f"cinta esta vacia."))
+            self.f_robot_alarma.configure(bg='#5c1a1a')
+            self.lbl_robot_titulo.configure(bg='#5c1a1a')
+            self.lbl_robot_detalle.configure(bg='#5c1a1a')
+            if not self.f_robot_alarma.winfo_ismapped():
+                self.f_robot_alarma.pack(fill='x', pady=(0, 10))
+        elif sl is False:
+            self.lbl_robot_titulo.configure(text="SYSTEM LINK APAGADO")
+            self.lbl_robot_detalle.configure(
+                text=("R55.0 = 0: el Fammar esta funcionando de fabrica.\n\n"
+                      "El pre-stopper libera solo y las condiciones que pone "
+                      "la PC NO estan activas: no hay verificacion, no hay "
+                      "corte por robot caido.\n\n"
+                      "Prender el System Link en el Fammar antes de producir."))
+            self.f_robot_alarma.configure(bg='#5c4a10')
+            self.lbl_robot_titulo.configure(bg='#5c4a10')
+            self.lbl_robot_detalle.configure(bg='#5c4a10')
+            if not self.f_robot_alarma.winfo_ismapped():
+                self.f_robot_alarma.pack(fill='x', pady=(0, 10))
+        else:
+            if self.f_robot_alarma.winfo_ismapped():
+                self.f_robot_alarma.pack_forget()
 
         # 2b) Cartel de alarma: solo cuando la verificacion frena
         frenado = (getattr(torno, "verificacion_fallida", False) or
@@ -4121,6 +4234,11 @@ class HMISpirax:
             font=("Consolas", 12), bg='#2b2b2b', fg='#cccccc')
         self.lbl_io_pallet_pos.pack(anchor='w')
 
+        self.lbl_io_system_link = tk.Label(
+            f_fanuc, text="System Link (R55.0): --",
+            font=("Consolas", 12), bg='#2b2b2b', fg='#cccccc')
+        self.lbl_io_system_link.pack(anchor='w')
+
         # ---------- Entradas del panel Nodka ----------
         f_di = tk.LabelFrame(cont, text=" ENTRADAS DIGITALES (panel Nodka) ",
                              font=("Arial", 11, "bold"),
@@ -4204,6 +4322,16 @@ class HMISpirax:
                 text=f"Paso de pallet (R54.0): {'1  PASANDO' if s else '0'}",
                 fg='#7ddc7d' if s else '#cccccc')
 
+        sl = getattr(torno, "system_link", None)
+        if sl is None:
+            self.lbl_io_system_link.configure(
+                text="System Link (R55.0): --", fg='#cccccc')
+        else:
+            self.lbl_io_system_link.configure(
+                text=(f"System Link (R55.0): "
+                      f"{'1  PRENDIDO' if sl else '0  APAGADO (Fammar de fabrica)'}"),
+                fg='#7ddc7d' if sl else '#ff6b6b')
+
         p = getattr(torno, "ultimo_pallet_en_pos", None)
         if p is None:
             self.lbl_io_pallet_pos.configure(
@@ -4279,6 +4407,11 @@ class HMISpirax:
         ("indice receta / indice verif", None),
         ("op esperado (de la cola)", "op_esperado"),
         ("receta que va a mandar", "receta_a_mandar"),
+        ("--- ROBOT (panel Nodka) ---", None),
+        ("DI2 linea de vida (pulso, invierte cada 500ms)", "robot_vivo"),
+        ("    seg sin cambio del pulso", "seg_sin_pulso"),
+        ("DI3 robot en automatico", "robot_en_auto"),
+        ("R55.0 System Link del Fammar", "system_link"),
         ("--- ESTADO INTERNO ---", None),
         ("liberacion pendiente", "receta_pendiente"),
         ("verificacion bloqueada", "verif_bloqueada"),
@@ -4395,6 +4528,31 @@ class HMISpirax:
                if ud else "--"))
         pinta("piezas_terminadas", str(d.get("piezas_terminadas")))
 
+        # --- robot ---
+        rv = d.get("robot_vivo")
+        if rv is None:
+            pinta("robot_vivo", "-- (sin DIO o watchdog apagado)", '#888888')
+        else:
+            pinta("robot_vivo",
+                  "1  VIVO" if rv else "0  CAIDO  <-- la cinta esta cortada",
+                  '#7ddc7d' if rv else '#ff6b6b')
+        ssp = d.get("seg_sin_pulso")
+        pinta("seg_sin_pulso", f"{ssp} s" if ssp is not None else "--")
+        ra = d.get("robot_en_auto")
+        if ra is None:
+            pinta("robot_en_auto", "--", '#888888')
+        else:
+            pinta("robot_en_auto",
+                  "1  SI" if ra else "0  no (T1/T2 o pausado)",
+                  '#7ddc7d' if ra else '#c8860a')
+        sl = d.get("system_link")
+        if sl is None:
+            pinta("system_link", "--", '#888888')
+        else:
+            pinta("system_link",
+                  "1  ok" if sl else "0  APAGADO  <-- el Fammar va de fabrica",
+                  '#7ddc7d' if sl else '#ff6b6b')
+
         booleano("receta_pendiente")
         booleano("verif_bloqueada", verdadero_ok=False)
         sd = d.get("seg_desde_descuento")
@@ -4402,6 +4560,15 @@ class HMISpirax:
 
         # alerta grande arriba de todo
         alertas = []
+        if d.get("robot_vivo") is False:
+            alertas.append("ROBOT CAIDO: sin pulso en DI2. La PC dejo de "
+                           "reponer R50.0 y el Fammar corto la cinta. La cola "
+                           "puede haber quedado CORTA: pasaron pallets sin "
+                           "foto.")
+        if d.get("system_link") is False:
+            alertas.append("SYSTEM LINK APAGADO (R55.0=0): el Fammar funciona "
+                           "de fabrica. El pre-stopper libera solo y las "
+                           "protecciones de la PC NO estan activas.")
         if rl:
             alertas.append("R55.3 EN 1: el ladder no la bajo. El pre-stopper "
                            "esta liberado y los pallets pasan sin nuestra "
@@ -6590,6 +6757,7 @@ class HMISpirax:
             self._refrescar_cola_torno()
             self._refrescar_verificacion_torno()
             self._refrescar_primera_pieza()
+            self._forzar_manual_por_robot_caido()
             try:
                 self._refrescar_tab_io()
             except AttributeError:

@@ -34,6 +34,16 @@ import threading
 # --- Canales de entrada ---
 DI_OP20 = 0        # DI0
 DI_PRESENCIA = 1   # DI1
+# --- Senales que manda el ROBOT a la PC (agregadas 13/08) ---
+# DI2 = linea de vida del robot. El SPS INVIERTE $OUT[16] cada ~500ms.
+#       No es un nivel: es un PULSO. Si el robot se apaga con la salida en
+#       1, la senal se queda en 1 para siempre y un chequeo por nivel no se
+#       daria cuenta nunca. Lo que se mide es que CAMBIE.
+# DI3 = robot en automatico. $OUT[17] en 1 cuando el robot corre en AUT/EX.
+#       Sirve para distinguir "robot apagado" de "robot en T1, alguien esta
+#       ensenando puntos".
+DI_ROBOT_LV = 2       # DI2
+DI_ROBOT_AUTO = 3     # DI3
 
 # Resultado de la lectura fisica
 OP_NINGUNA = 0     # no hay pieza
@@ -118,6 +128,29 @@ class _DioSingleton:
             self._asegurar()
             entradas = self._io.read_all_di()
             return bool(entradas[DI_OP20]), bool(entradas[DI_PRESENCIA])
+
+    def leer_robot(self):
+        """Devuelve (linea_vida, en_automatico) de DI2 y DI3.
+
+        OJO: linea_vida es el ESTADO INSTANTANEO del pulso, no dice si el
+        robot esta vivo. Para eso hay que ver si CAMBIA en el tiempo: lo
+        hace el watchdog de torno.py. Lanza DioNoDisponible.
+        """
+        with self._lock:
+            self._asegurar()
+            entradas = self._io.read_all_di()
+            return (bool(entradas[DI_ROBOT_LV]),
+                    bool(entradas[DI_ROBOT_AUTO]))
+
+    def robot_desde_cache(self):
+        """Igual que leer_robot pero del CACHE del monitor, sin tocar el bus.
+        Devuelve (lv, auto) o None si todavia no hay lectura.
+        Se usa desde la UI y desde el thread del torno, que no deben hacer
+        polling I2C por su cuenta (el bus no es thread-safe)."""
+        e = self.ultimas_entradas()
+        if e is None:
+            return None
+        return bool(e[DI_ROBOT_LV]), bool(e[DI_ROBOT_AUTO])
 
     def leer_todas(self):
         """Las 8 entradas, para mostrar en la HMI. Lanza DioNoDisponible."""
