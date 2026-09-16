@@ -1116,6 +1116,251 @@ def correr_servidor(log_callback):
 
 
 
+# ======================================================================
+#  USUARIOS Y PERMISOS
+# ----------------------------------------------------------------------
+#  Dos roles:
+#    OPERARIO (por defecto) - opera y diagnostica: todo OPERAR y TORNO,
+#      incluidas las senales del PMC y el inspector de macros, la cola
+#      completa, PRIMERA PIEZA. Ve DEBUG, LOG e I/O.
+#    ADMIN - ademas puede CALIBRAR, renombrar tipos y roscas, y guardar
+#      los nombres de I/O. O sea: cambiar la configuracion persistente.
+#
+#  La contrasenia se guarda HASHEADA (sha256) en usuarios.json, no en
+#  texto plano: si alguien abre el archivo no la ve.
+#
+#  Vuelve solo a OPERARIO despues de TIMEOUT_ADMIN_MIN sin actividad. Sin
+#  eso, alguien entra como admin a la mañana y queda abierto todo el turno,
+#  que es justo el problema que se quiere resolver.
+# ======================================================================
+
+import hashlib
+
+USUARIOS_PATH = "usuarios.json"
+PASS_DEFECTO = "moltech2025"
+TIMEOUT_ADMIN_MIN = 10
+
+
+def _hash_pass(texto):
+    return hashlib.sha256((texto or "").encode("utf-8")).hexdigest()
+
+
+def cargar_hash_admin():
+    """Hash de la contrasenia de admin. Si el archivo no esta, lo crea con
+    la de fabrica."""
+    try:
+        if os.path.exists(USUARIOS_PATH):
+            with open(USUARIOS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            h = data.get("admin_hash")
+            if h:
+                return h
+    except Exception as e:
+        print(f"[USUARIOS] No se pudo leer {USUARIOS_PATH}: {e}")
+    guardar_hash_admin(_hash_pass(PASS_DEFECTO))
+    return _hash_pass(PASS_DEFECTO)
+
+
+def guardar_hash_admin(h):
+    tmp = USUARIOS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"admin_hash": h,
+                   "timeout_min": TIMEOUT_ADMIN_MIN}, f, indent=2)
+    os.replace(tmp, USUARIOS_PATH)
+
+
+def verificar_pass_admin(texto):
+    return _hash_pass(texto) == cargar_hash_admin()
+
+
+# ======================================================================
+#  NOMBRES DE LOS TIPOS DE PIEZA
+# ----------------------------------------------------------------------
+#  Son GLOBALES de la aplicacion: se leen y escriben desde las dos
+#  pestanias (OPERAR y CALIBRAR) y desde el mismo archivo, asi que
+#  renombrar en una se ve en la otra al instante.
+#  Se guardan en un JSON al lado del script, igual que io_nombres.json.
+# ======================================================================
+
+NOMBRES_TIPO_PATH = "nombres_tipo.json"
+N_TIPOS = 12
+N_ROSCAS = 3
+
+# Cache en memoria. None = todavia no se leyo del disco.
+# El JSON guarda dos diccionarios: {"tipos": {...}, "roscas": {...}}. Se
+# acepta tambien el formato viejo (un dict plano de tipos) para no perder
+# los nombres ya guardados.
+_nombres_tipo = None
+_nombres_rosca = None
+
+
+def nombre_tipo(tipo):
+    """Nombre del tipo (1..12). Si no tiene uno puesto, devuelve 'Tipo N'."""
+    global _nombres_tipo
+    if _nombres_tipo is None:
+        cargar_nombres_tipo()
+    n = _nombres_tipo.get(str(int(tipo)))
+    return n if n else f"Tipo {int(tipo)}"
+
+
+def nombre_rosca(rosca):
+    """Nombre de la rosca (1..3). Por defecto 'Rosca N'."""
+    global _nombres_rosca
+    if _nombres_rosca is None:
+        cargar_nombres_tipo()
+    n = _nombres_rosca.get(str(int(rosca)))
+    return n if n else f"Rosca {int(rosca)}"
+
+
+def cargar_nombres_tipo():
+    """Lee el JSON de disco al cache. Si no existe o esta roto, arranca vacio
+    (todos los tipos con su nombre por defecto)."""
+    global _nombres_tipo, _nombres_rosca
+    _nombres_tipo = {}
+    _nombres_rosca = {}
+
+    def _cargar(dic, data, tope):
+        if not isinstance(data, dict):
+            return
+        for k, v in data.items():
+            if str(k).isdigit() and 1 <= int(k) <= tope and v:
+                dic[str(int(k))] = str(v)[:40]
+
+    try:
+        if os.path.exists(NOMBRES_TIPO_PATH):
+            with open(NOMBRES_TIPO_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if "tipos" in data or "roscas" in data:
+                    _cargar(_nombres_tipo, data.get("tipos"), N_TIPOS)
+                    _cargar(_nombres_rosca, data.get("roscas"), N_ROSCAS)
+                else:
+                    # Formato viejo: dict plano con los tipos nomas.
+                    _cargar(_nombres_tipo, data, N_TIPOS)
+    except Exception as e:
+        print(f"[NOMBRES] No se pudo leer {NOMBRES_TIPO_PATH}: {e}")
+    return _nombres_tipo
+
+
+def _persistir_nombres():
+    tmp = NOMBRES_TIPO_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"tipos": _nombres_tipo, "roscas": _nombres_rosca},
+                  f, indent=2, ensure_ascii=False)
+    os.replace(tmp, NOMBRES_TIPO_PATH)
+
+
+def guardar_nombre_tipo(tipo, nombre):
+    """Guarda el nombre de un tipo y persiste el JSON completo.
+    Un nombre vacio BORRA el personalizado y vuelve a 'Tipo N'."""
+    global _nombres_tipo
+    if _nombres_tipo is None:
+        cargar_nombres_tipo()
+    k = str(int(tipo))
+    nombre = (nombre or "").strip()[:40]
+    if nombre and nombre != f"Tipo {int(tipo)}":
+        _nombres_tipo[k] = nombre
+    else:
+        _nombres_tipo.pop(k, None)
+    _persistir_nombres()
+    return nombre_tipo(tipo)
+
+
+def guardar_nombre_rosca(rosca, nombre):
+    """Idem para las roscas. Vacio vuelve a 'Rosca N'."""
+    global _nombres_rosca
+    if _nombres_rosca is None:
+        cargar_nombres_tipo()
+    k = str(int(rosca))
+    nombre = (nombre or "").strip()[:40]
+    if nombre and nombre != f"Rosca {int(rosca)}":
+        _nombres_rosca[k] = nombre
+    else:
+        _nombres_rosca.pop(k, None)
+    _persistir_nombres()
+    return nombre_rosca(rosca)
+
+
+class Tooltip:
+    """Globo de ayuda que aparece al pasar el mouse sobre un widget.
+
+    Tkinter no trae tooltips, asi que se hace con un Toplevel sin bordes
+    posicionado al lado del cursor.
+
+    El texto se pide con un CALLBACK en el momento de mostrarlo, no se fija
+    al crear el tooltip: asi el globo dice el estado REAL de ese instante
+    (cuantas piezas hay en la cola ahora, en que modo esta cada estacion).
+    Si el callback devuelve None o cadena vacia, no se muestra nada.
+    """
+
+    # Un solo globo abierto en toda la app. Antes cada Tooltip manejaba el
+    # suyo y al pasar el mouse por varios botones quedaban apilados.
+    _abierto = None
+
+    def __init__(self, widget, texto_callback, demora_ms=350):
+        self.widget = widget
+        self.texto_callback = texto_callback
+        self.demora_ms = demora_ms
+        self._win = None
+        self._after = None
+        widget.bind("<Enter>", self._entrar, add="+")
+        widget.bind("<Leave>", self._salir, add="+")
+        widget.bind("<ButtonPress>", self._salir, add="+")
+
+    def _entrar(self, _evt=None):
+        self._cancelar()
+        self._after = self.widget.after(self.demora_ms, self._mostrar)
+
+    def _salir(self, _evt=None):
+        self._cancelar()
+        self._ocultar()
+
+    def _cancelar(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _mostrar(self):
+        self._after = None
+        Tooltip._cerrar_todos()
+        try:
+            texto = self.texto_callback()
+        except Exception:
+            texto = None
+        if not texto:
+            return
+        self._ocultar()
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        win = tk.Toplevel(self.widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{x}+{y}")
+        win.configure(bg='#5a5a5a')
+        tk.Label(win, text=texto, font=("Consolas", 9),
+                 bg='#1f1f1f', fg='#d6d6d6', justify='left',
+                 padx=10, pady=8).pack(padx=1, pady=1)
+        self._win = win
+        Tooltip._abierto = self
+
+    @classmethod
+    def _cerrar_todos(cls):
+        if cls._abierto is not None:
+            cls._abierto._ocultar()
+
+    def _ocultar(self):
+        if Tooltip._abierto is self:
+            Tooltip._abierto = None
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+
+
 class HMISpirax:
 
     def __init__(self, root):
@@ -1187,6 +1432,12 @@ class HMISpirax:
 
 
 
+        # Rol activo. Arranca como OPERARIO siempre: entrar como admin es
+        # una accion explicita.
+        self._es_admin = False
+        self._admin_desde = None      # time.monotonic() del ultimo login
+        self._admin_ultima_act = None  # ultima actividad como admin
+
         self._construir_ui()
 
         self._iniciar_servidor()
@@ -1221,19 +1472,35 @@ class HMISpirax:
 
         style.map('TNotebook.Tab',
 
-                  background=[('selected', '#4a90e2')],
+                  background=[('selected', '#4a90e2'),
 
-                  foreground=[('selected', 'white')])
+                              ('disabled', '#262626')],
+
+                  foreground=[('selected', 'white'),
+
+                              ('disabled', '#5a5a5a')])
 
 
 
-        titulo = tk.Label(self.root, text="SPIRAX HMI",
+        barra = tk.Frame(self.root, bg='#2b2b2b')
 
-                          font=("Arial", 18, "bold"),
+        barra.pack(fill='x', pady=(8, 4))
 
-                          bg='#2b2b2b', fg='white')
+        tk.Label(barra, text="SPIRAX HMI",
 
-        titulo.pack(pady=(8, 4))
+                 font=("Arial", 18, "bold"),
+
+                 bg='#2b2b2b', fg='white').pack(side='left', expand=True)
+
+        # Indicador de usuario. Siempre visible: quien esta manipulando el
+        # HMI y, si es admin, cuanto falta para volver a operario.
+        self.lbl_usuario = tk.Label(barra, text="OPERARIO",
+
+                                    font=("Arial", 11, "bold"),
+
+                                    bg='#2b2b2b', fg='#7fffd4')
+
+        self.lbl_usuario.pack(side='right', padx=(0, 20))
 
 
 
@@ -1252,6 +1519,7 @@ class HMISpirax:
 
         self.tab_debug = tk.Frame(self.nb, bg='#2b2b2b')
         self.tab_log = tk.Frame(self.nb, bg='#2b2b2b')
+        self.tab_login = tk.Frame(self.nb, bg='#2b2b2b')
 
 
 
@@ -1265,6 +1533,7 @@ class HMISpirax:
         self.nb.add(self.tab_debug, text='  DEBUG  ')
 
         self.nb.add(self.tab_log, text='  LOG  ')
+        self.nb.add(self.tab_login, text='  LOGIN  ')
 
 
 
@@ -1282,6 +1551,7 @@ class HMISpirax:
         self._construir_tab_debug()
 
         self._construir_tab_log()
+        self._construir_tab_login()
 
 
 
@@ -1298,6 +1568,14 @@ class HMISpirax:
         self._cambiar_modo_mesa(False)
 
         self._seleccionar_tipo_calibrar(1)
+
+        # Desde aca en adelante el cambio de tipo/rosca queda sujeto al
+
+        # bloqueo. Durante la construccion no, porque se llama para pintar
+
+        # los valores iniciales.
+
+        self._init_receta_hecho = True
 
 
 
@@ -1417,6 +1695,169 @@ class HMISpirax:
 
     # ==================================================================
 
+    #  Renombrar un tipo de pieza
+
+    # ------------------------------------------------------------------
+    #  Doble click sobre cualquier boton de tipo, en OPERAR o en CALIBRAR.
+    #  NO se bloquea con la celda produciendo: renombrar el Tipo 3 mientras
+    #  se produce el Tipo 1 no afecta nada. Lo que se bloquea es CAMBIAR de
+    #  tipo, que es otra cosa.
+    # ==================================================================
+    def _renombrar_tipo(self, tipo):
+        self._renombrar("tipo", tipo)
+
+    def _renombrar_rosca(self, rosca):
+        self._renombrar("rosca", rosca)
+
+    def _renombrar(self, que, num):
+        if not self._exigir_admin("Cambiar el nombre de un tipo o una rosca"):
+            return
+        """Ventanita con un Entry. Enter guarda, Escape cancela. Vacio vuelve
+        el nombre por defecto. `que` es "tipo" o "rosca"."""
+        if que == "rosca":
+            etiqueta, defecto = "ROSCA", f"Rosca {num}"
+            actual_fn, guardar_fn = nombre_rosca, guardar_nombre_rosca
+        else:
+            etiqueta, defecto = "TIPO", f"Tipo {num}"
+            actual_fn, guardar_fn = nombre_tipo, guardar_nombre_tipo
+        self._abrir_rename(etiqueta, num, defecto, actual_fn, guardar_fn)
+
+    def _abrir_rename(self, etiqueta, num, defecto, actual_fn, guardar_fn):
+        Tooltip._cerrar_todos()
+        win = tk.Toplevel(self.root)
+        win.title(f"Nombre de {etiqueta.lower()} {num}")
+        win.configure(bg='#2b2b2b')
+        win.transient(self.root)
+        win.resizable(False, False)
+        # Centrado sobre la ventana principal
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + self.root.winfo_width() // 2 - 190
+        y = self.root.winfo_rooty() + 180
+        win.geometry(f"380x190+{max(x, 0)}+{max(y, 0)}")
+
+        tk.Label(win, text=f"Nombre para {etiqueta} {num}",
+                 font=("Arial", 13, "bold"),
+                 bg='#2b2b2b', fg='white').pack(anchor='w', padx=16, pady=(16, 2))
+        tk.Label(win, text=("Enter guarda  -  Escape cancela  -  "
+                            "vacio vuelve a \"%s\"" % defecto),
+                 font=("Arial", 9), bg='#2b2b2b',
+                 fg='#a0a0a0').pack(anchor='w', padx=16, pady=(0, 10))
+
+        ent = tk.Entry(win, font=("Arial", 14), width=28,
+                       bg='#1e1e1e', fg='white', insertbackground='white')
+        actual = actual_fn(num)
+        ent.insert(0, "" if actual == defecto else actual)
+        ent.pack(padx=16, fill='x')
+        ent.focus_set()
+        ent.select_range(0, 'end')
+
+        lbl_err = tk.Label(win, text="", font=("Arial", 9),
+                           bg='#2b2b2b', fg='#ff6b6b')
+        lbl_err.pack(anchor='w', padx=16, pady=(4, 0))
+
+        def guardar(_evt=None):
+            txt = ent.get().strip()
+            if len(txt) > 40:
+                lbl_err.configure(text="Maximo 40 caracteres")
+                return
+            nuevo = guardar_fn(num, txt)
+            self._agregar_log(f"[NOMBRES] {etiqueta.capitalize()} {num} ahora "
+                              f"se llama \"{nuevo}\"")
+            win.destroy()
+            self._refrescar_nombres_tipos()
+
+        def cancelar(_evt=None):
+            win.destroy()
+
+        ent.bind("<Return>", guardar)
+        ent.bind("<KP_Enter>", guardar)
+        ent.bind("<Escape>", cancelar)
+        ent.bind("<KeyRelease>", lambda e: lbl_err.configure(text=""))
+
+        c = tk.Frame(win, bg='#2b2b2b')
+        c.pack(fill='x', padx=16, pady=(10, 12))
+        tk.Button(c, text="Guardar", font=("Arial", 10, "bold"),
+                  bg='#2d8f3a', fg='white', width=12,
+                  command=guardar).pack(side='left')
+        tk.Button(c, text="Cancelar", font=("Arial", 10), width=12,
+                  command=cancelar).pack(side='left', padx=(8, 0))
+
+        win.grab_set()
+
+    def _tooltip_tipo(self, tipo):
+        """Tooltip de un boton de tipo: nombre completo, como renombrar, y el
+        motivo del bloqueo si esta bloqueado."""
+        partes = [f"Tipo {tipo}: {nombre_tipo(tipo)}",
+                  "",
+                  "Doble click para cambiarle el nombre"]
+        bloqueo = self._texto_bloqueo_receta()
+        if bloqueo:
+            partes += ["", "-" * 44, "", bloqueo]
+        return "\n".join(partes)
+
+    def _refrescar_nombres_tipos(self):
+        """Repinta los botones de las dos pestanias con los nombres nuevos."""
+        est = estado.get_estado()
+        for i, btn in enumerate(self.btns_tipo_operar):
+            self._refrescar_boton_tipo(btn, i + 1,
+                                       seleccionado=(i + 1 == est["tipo"]),
+                                       estacion="cinta")
+        for i, btn in enumerate(self.btns_tipo_calibrar):
+            self._refrescar_boton_tipo(
+                btn, i + 1,
+                seleccionado=(i + 1 == self._tipo_calibrar),
+                estacion=self._estacion_calibrar)
+        for i, btn in enumerate(self.btns_rosca):
+            btn.configure(text=nombre_rosca(i + 1))
+        # El bloqueo repinta los de OPERAR: forzar que vuelva a evaluar
+        self._receta_desbloqueada = None
+        self._actualizar_label_seleccion()
+
+    def _click_tipo(self, tipo, en_calibrar=False):
+        """Click simple DEMORADO. Un doble click son dos clicks: sin la demora
+        el primero cambiaria de tipo (o dispararia el cartel de bloqueo) antes
+        de que llegue el doble. Se agenda y se cancela si aparece el doble."""
+        self._cancelar_click_tipo()
+        fn = (self._seleccionar_tipo_calibrar if en_calibrar
+              else self._seleccionar_tipo_operar)
+        self._click_tipo_after = self.root.after(260, lambda: fn(tipo))
+
+    def _cancelar_click_tipo(self):
+        a = getattr(self, "_click_tipo_after", None)
+        if a is not None:
+            try:
+                self.root.after_cancel(a)
+            except Exception:
+                pass
+            self._click_tipo_after = None
+
+    def _click_rosca(self, rosca):
+        """Click simple demorado, igual que en los tipos: sin la demora el
+        primer click del doble ya cambiaria la rosca."""
+        self._cancelar_click_tipo()
+        self._click_tipo_after = self.root.after(
+            260, lambda: self._seleccionar_rosca(rosca))
+
+    def _doble_click_rosca(self, rosca):
+        self._cancelar_click_tipo()
+        self._renombrar_rosca(rosca)
+
+    def _tooltip_rosca(self, rosca):
+        partes = [f"Rosca {rosca}: {nombre_rosca(rosca)}",
+                  "",
+                  "Doble click para cambiarle el nombre"]
+        bloqueo = self._texto_bloqueo_receta()
+        if bloqueo:
+            partes += ["", "-" * 44, "", bloqueo]
+        return "\n".join(partes)
+
+    def _doble_click_tipo(self, tipo):
+        """Doble click: cancela el click simple pendiente y abre el rename."""
+        self._cancelar_click_tipo()
+        self._renombrar_tipo(tipo)
+
+    # ==================================================================
+
     #  Boton de tipo (colores segun calibracion)
 
     # ==================================================================
@@ -1425,13 +1866,16 @@ class HMISpirax:
 
                                estacion="cinta"):
 
-        if tiene_referencia(tipo, estacion):
+        # Nombre arriba, estado de calibracion abajo. El nombre se trunca a 12
+        # caracteres para que no desarme el boton; el completo esta en el
+        # tooltip.
+        nom = nombre_tipo(tipo)
 
-            label = f"Tipo {tipo}\n  OK"
+        corto = nom if len(nom) <= 12 else nom[:11] + "\u2026"
 
-        else:
+        estado_cal = "OK" if tiene_referencia(tipo, estacion) else "--"
 
-            label = f"Tipo {tipo}\n  --"
+        label = f"{corto}\n{estado_cal}"
 
 
 
@@ -1481,9 +1925,9 @@ class HMISpirax:
 
         # Tipo (afecta tanto cinta como mesa)
 
-        # 12 modelos: 1-6 = ALUMINIO, 7-12 = FUNDICION.
-
-        # El modelo N+6 es la version fundicion de la forma N.
+        # 12 modelos. El nombre de cada uno es editable con doble click y se
+        # guarda en nombres_tipo.json, asi que la clasificacion por material
+        # o por codigo de pieza va en el nombre.
 
         f_tipo = tk.LabelFrame(col_izq, text=" TIPO DE PIEZA (Receta) ",
 
@@ -1495,41 +1939,41 @@ class HMISpirax:
 
 
 
+        self.f_tipo_operar = f_tipo
+
         c_tipos = tk.Frame(f_tipo, bg='#2b2b2b')
 
         c_tipos.pack(fill='x')
 
 
 
-        for material, rango, color in (
-
-                ("ALUMINIO", range(1, 7), '#c0c0c0'),
-
-                ("FUNDICION", range(7, 13), '#d59a6a')):
+        # Doce tipos en dos filas de seis. Sin etiqueta de material: los
+        # nombres son editables (doble click) asi que el material va en el
+        # nombre si hace falta.
+        for rango in (range(1, 7), range(7, 13)):
 
             row = tk.Frame(c_tipos, bg='#2b2b2b')
 
             row.pack(fill='x', pady=2)
 
-            tk.Label(row, text=material, width=10,
-
-                     font=("Arial", 10, "bold"),
-
-                     bg='#2b2b2b', fg=color).pack(side='left', padx=(0, 6))
-
             for i in rango:
 
                 btn = tk.Button(row, text=f"Tipo {i}",
 
-                                font=("Arial", 11, "bold"),
+                                font=("Arial", 10, "bold"),
 
-                                width=7, height=3,
+                                width=13, height=3,
 
-                                command=lambda t=i: self._seleccionar_tipo_operar(t))
+                                command=lambda t=i: self._click_tipo(t))
+
+                btn.bind("<Double-Button-1>",
+                         lambda e, t=i: self._doble_click_tipo(t))
 
                 btn.pack(side='left', padx=4, pady=4)
 
                 self.btns_tipo_operar.append(btn)
+
+                Tooltip(btn, lambda t=i: self._tooltip_tipo(t))
 
 
 
@@ -1545,23 +1989,30 @@ class HMISpirax:
 
 
 
+        self.f_rosca_operar = f_rosca
+
         c_rosca = tk.Frame(f_rosca, bg='#2b2b2b')
 
         c_rosca.pack()
 
         for r in range(1, 4):
 
-            btn = tk.Button(c_rosca, text=f"Rosca {r}",
+            btn = tk.Button(c_rosca, text=nombre_rosca(r),
 
-                            font=("Arial", 12, "bold"),
+                            font=("Arial", 11, "bold"),
 
-                            width=10, height=2,
+                            width=16, height=2,
 
-                            command=lambda x=r: self._seleccionar_rosca(x))
+                            command=lambda x=r: self._click_rosca(x))
+
+            btn.bind("<Double-Button-1>",
+                     lambda e, x=r: self._doble_click_rosca(x))
 
             btn.grid(row=0, column=r - 1, padx=6, pady=4)
 
             self.btns_rosca.append(btn)
+
+            Tooltip(btn, lambda x=r: self._tooltip_rosca(x))
 
 
 
@@ -2576,35 +3027,30 @@ class HMISpirax:
 
         # 12 modelos: 1-6 aluminio, 7-12 fundicion (una fila por material)
 
-        for material, rango, color in (
-
-                ("ALUMINIO", range(1, 7), '#c0c0c0'),
-
-                ("FUNDICION", range(7, 13), '#d59a6a')):
+        for rango in (range(1, 7), range(7, 13)):
 
             row = tk.Frame(c_tipos_cal, bg='#2b2b2b')
 
             row.pack(fill='x', pady=2)
 
-            tk.Label(row, text=material, width=10,
-
-                     font=("Arial", 10, "bold"),
-
-                     bg='#2b2b2b', fg=color).pack(side='left', padx=(0, 6))
-
             for i in rango:
 
                 btn = tk.Button(row, text=f"Tipo {i}",
 
-                                font=("Arial", 11, "bold"),
+                                font=("Arial", 10, "bold"),
 
-                                width=7, height=3,
+                                width=13, height=3,
 
-                                command=lambda t=i: self._seleccionar_tipo_calibrar(t))
+                                command=lambda t=i: self._click_tipo(t, True))
+
+                btn.bind("<Double-Button-1>",
+                         lambda e, t=i: self._doble_click_tipo(t))
 
                 btn.pack(side='left', padx=4, pady=3)
 
                 self.btns_tipo_calibrar.append(btn)
+
+                Tooltip(btn, lambda t=i: self._tooltip_tipo(t))
 
 
 
@@ -3440,6 +3886,8 @@ class HMISpirax:
 
         # Inspector de macros
 
+        # Ref guardada: _refrescar_login le cambia el titulo cuando el rol
+        # no alcanza.
         f_insp = tk.LabelFrame(col_der, text=" INSPECTOR DE MACROS ",
 
                                 font=("Arial", 11, "bold"),
@@ -3468,11 +3916,11 @@ class HMISpirax:
 
 
 
-        tk.Button(c_insp, text="Leer",
+        self.btn_leer_macro = tk.Button(
+            c_insp, text="Leer", command=self._leer_macro_torno,
+            font=("Arial", 9))
 
-                  command=self._leer_macro_torno,
-
-                  font=("Arial", 9)).grid(row=0, column=2, padx=2)
+        self.btn_leer_macro.grid(row=0, column=2, padx=2)
 
 
 
@@ -3486,13 +3934,12 @@ class HMISpirax:
 
 
 
-        tk.Button(c_insp, text="Escribir",
+        self.btn_escribir_macro = tk.Button(
+            c_insp, text="Escribir",
+            command=self._escribir_macro_torno,
+            font=("Arial", 9), bg='#cc7a00', fg='white')
 
-                  command=self._escribir_macro_torno,
-
-                  font=("Arial", 9),
-
-                  bg='#cc7a00', fg='white').grid(row=0, column=5, padx=2)
+        self.btn_escribir_macro.grid(row=0, column=5, padx=2)
 
 
 
@@ -3505,6 +3952,8 @@ class HMISpirax:
             bg='#2b2b2b', fg='#cfcfcf')
 
         self.lbl_insp_resultado.pack(anchor='w', pady=(8, 0))
+
+        self.f_insp_macros = f_insp
 
         # ---------- Inspeccion de senales del PMC (X, Y, R, D...) ----------
         f_pmc = tk.LabelFrame(col_der, text=" SENALES DEL PMC (LADDER) ",
@@ -3537,22 +3986,27 @@ class HMISpirax:
         self.cmb_pmc_bit.grid(row=0, column=5, padx=2)
         self.cmb_pmc_bit.set("0")
 
-        tk.Button(c_pmc, text="Leer", command=self._leer_pmc_torno,
-                  font=("Arial", 9)).grid(row=0, column=6, padx=(8, 2))
+        self.btn_leer_pmc = tk.Button(
+            c_pmc, text="Leer", command=self._leer_pmc_torno,
+            font=("Arial", 9))
+        self.btn_leer_pmc.grid(row=0, column=6, padx=(8, 2))
 
         tk.Label(c_pmc, text="Valor:", font=("Arial", 10),
                  bg='#2b2b2b', fg='white').grid(row=0, column=7, padx=2)
         self.ent_pmc_val = tk.Entry(c_pmc, width=8, font=("Consolas", 10))
         self.ent_pmc_val.grid(row=0, column=8, padx=2)
 
-        tk.Button(c_pmc, text="Escribir", command=self._escribir_pmc_torno,
-                  font=("Arial", 9),
-                  bg='#cc7a00', fg='white').grid(row=0, column=9, padx=2)
+        self.btn_escribir_pmc = tk.Button(
+            c_pmc, text="Escribir", command=self._escribir_pmc_torno,
+            font=("Arial", 9), bg='#cc7a00', fg='white')
+        self.btn_escribir_pmc.grid(row=0, column=9, padx=2)
 
         self.lbl_pmc_resultado = tk.Label(
             f_pmc, text="(sin lectura)", font=("Consolas", 10),
             bg='#2b2b2b', fg='#cfcfcf', justify='left')
         self.lbl_pmc_resultado.pack(anchor='w', pady=(8, 0))
+
+        self.f_pmc_senales = f_pmc
 
         tk.Label(f_pmc,
                  text=("Bit='byte' lee/escribe los 8 bits juntos (0-255). "
@@ -4030,6 +4484,9 @@ class HMISpirax:
 
     def _leer_macro_torno(self):
 
+        if not self._exigir_admin("El inspector de macros"):
+            return
+
         try:
 
             num = int(self.ent_insp_num.get())
@@ -4053,6 +4510,11 @@ class HMISpirax:
 
 
     def _escribir_macro_torno(self):
+
+        # Escribir una macro a mano puede hacer que el NC mecanice con la
+        # receta equivocada. Leer no rompe nada y queda como operario.
+        if not self._exigir_admin("Escribir una macro del torno"):
+            return
 
         try:
 
@@ -4088,6 +4550,8 @@ class HMISpirax:
 
     def _leer_pmc_torno(self):
         """Lee una senal del PMC (area + byte, o area + byte + bit)."""
+        if not self._exigir_admin("Las senales del PMC"):
+            return
         try:
             area = self.cmb_pmc_area.get().strip().upper()
             byte_num = int(self.ent_pmc_byte.get())
@@ -4117,6 +4581,11 @@ class HMISpirax:
 
     def _escribir_pmc_torno(self):
         """Escribe una senal del PMC. Con bit elegido respeta los otros 7."""
+        # Lo mas peligroso de toda la pantalla: escribir una senal que usa el
+        # ladder puede descolocar la maquina y hay que ciclar el control para
+        # recuperarla. Leer queda como operario.
+        if not self._exigir_admin("Escribir una senal del PMC"):
+            return
         try:
             area = self.cmb_pmc_area.get().strip().upper()
             byte_num = int(self.ent_pmc_byte.get())
@@ -4195,6 +4664,8 @@ class HMISpirax:
 
     def _guardar_nombres_io(self):
         """Persiste los nombres que el usuario escribio en los Entry."""
+        if not self._exigir_admin("Guardar los nombres de I/O"):
+            return
         try:
             di = [e.get().strip() or self.NOMBRES_DI_DEF[i]
                   for i, e in enumerate(self.ent_nombre_di)]
@@ -4605,12 +5076,433 @@ class HMISpirax:
 
 
     # ==================================================================
+    #  LOGIN
+    # ==================================================================
+    def _construir_tab_login(self):
+        cont = tk.Frame(self.tab_login, bg='#2b2b2b')
+        cont.pack(fill='both', expand=True, padx=15, pady=15)
+
+        tk.Label(cont, text="USUARIOS", font=("Arial", 15, "bold"),
+                 bg='#2b2b2b', fg='white').pack(anchor='w')
+
+        self.lbl_login_aviso = tk.Label(
+            cont, text="", font=("Arial", 11, "bold"),
+            bg='#2b2b2b', fg='#ffd24a', wraplength=800, justify='left')
+        self.lbl_login_aviso.pack(anchor='w', pady=(8, 0))
+
+        # --- Estado actual ---
+        f_est = tk.LabelFrame(cont, text=" USUARIO ACTIVO ",
+                              font=("Arial", 11, "bold"),
+                              bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_est.pack(fill='x', pady=(12, 0))
+
+        self.lbl_login_rol = tk.Label(f_est, text="OPERARIO",
+                                      font=("Arial", 16, "bold"),
+                                      bg='#2b2b2b', fg='#7fffd4')
+        self.lbl_login_rol.pack(anchor='w')
+
+        tk.Label(f_est,
+                 text=("OPERARIO: opera y diagnostica. Todo OPERAR y TORNO, "
+                       "las senales del PMC, la cola, PRIMERA PIEZA. Ve "
+                       "DEBUG, LOG e I/O.\n"
+                       "ADMIN: ademas puede CALIBRAR, renombrar tipos y "
+                       "roscas, y guardar los nombres de I/O."),
+                 font=("Arial", 9), bg='#2b2b2b', fg='#a0a0a0',
+                 justify='left').pack(anchor='w', pady=(4, 0))
+
+        self.lbl_login_timeout = tk.Label(
+            f_est, text="", font=("Arial", 10),
+            bg='#2b2b2b', fg='#cfcfcf')
+        self.lbl_login_timeout.pack(anchor='w', pady=(6, 0))
+
+        # --- Entrar / salir ---
+        f_in = tk.LabelFrame(cont, text=" ENTRAR COMO ADMINISTRADOR ",
+                             font=("Arial", 11, "bold"),
+                             bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_in.pack(fill='x', pady=(12, 0))
+
+        c1 = tk.Frame(f_in, bg='#2b2b2b')
+        c1.pack(anchor='w')
+        tk.Label(c1, text="Contrasenia:", font=("Arial", 11),
+                 bg='#2b2b2b', fg='white').pack(side='left')
+        self.ent_login_pass = tk.Entry(c1, show="*", font=("Arial", 13),
+                                       width=22, bg='#1e1e1e', fg='white',
+                                       insertbackground='white')
+        self.ent_login_pass.pack(side='left', padx=8)
+        self.ent_login_pass.bind("<Return>", lambda e: self._login_admin())
+        tk.Button(c1, text="Entrar", font=("Arial", 10, "bold"),
+                  bg='#2d8f3a', fg='white', width=12,
+                  command=self._login_admin).pack(side='left', padx=(4, 0))
+        self.btn_login_salir = tk.Button(
+            c1, text="Salir a operario", font=("Arial", 10), width=16,
+            command=self._logout_admin)
+        self.btn_login_salir.pack(side='left', padx=(12, 0))
+
+        self.lbl_login_err = tk.Label(f_in, text="", font=("Arial", 10),
+                                      bg='#2b2b2b', fg='#ff6b6b')
+        self.lbl_login_err.pack(anchor='w', pady=(6, 0))
+
+        # --- Cambiar contrasenia ---
+        f_cp = tk.LabelFrame(cont, text=" CAMBIAR CONTRASENIA ",
+                             font=("Arial", 11, "bold"),
+                             bg='#2b2b2b', fg='white', padx=12, pady=10)
+        f_cp.pack(fill='x', pady=(12, 0))
+
+        tk.Label(f_cp, text="Hay que poner la actual para poder cambiarla.",
+                 font=("Arial", 9), bg='#2b2b2b',
+                 fg='#a0a0a0').pack(anchor='w', pady=(0, 6))
+
+        g = tk.Frame(f_cp, bg='#2b2b2b')
+        g.pack(anchor='w')
+        etiquetas = ("Actual:", "Nueva:", "Repetir nueva:")
+        self.ent_pass_actual = None
+        entries = []
+        for i, txt in enumerate(etiquetas):
+            tk.Label(g, text=txt, font=("Arial", 11), width=14, anchor='w',
+                     bg='#2b2b2b', fg='white').grid(row=i, column=0, pady=3)
+            e = tk.Entry(g, show="*", font=("Arial", 13), width=22,
+                         bg='#1e1e1e', fg='white', insertbackground='white')
+            e.grid(row=i, column=1, pady=3)
+            entries.append(e)
+        self.ent_pass_actual, self.ent_pass_nueva, self.ent_pass_rep = entries
+        self.ent_pass_rep.bind("<Return>", lambda e: self._cambiar_pass())
+
+        tk.Button(f_cp, text="Cambiar contrasenia",
+                  font=("Arial", 10, "bold"), bg='#3a6ea5', fg='white',
+                  command=self._cambiar_pass).pack(anchor='w', pady=(8, 0))
+
+        self.lbl_pass_msg = tk.Label(f_cp, text="", font=("Arial", 10),
+                                     bg='#2b2b2b', fg='#cfcfcf')
+        self.lbl_pass_msg.pack(anchor='w', pady=(6, 0))
+
+        self._refrescar_login()
+
+    def _login_admin(self):
+        txt = self.ent_login_pass.get()
+        self.ent_login_pass.delete(0, 'end')
+        if not txt:
+            self.lbl_login_err.configure(text="Poner la contrasenia")
+            return
+        if not verificar_pass_admin(txt):
+            self.lbl_login_err.configure(text="Contrasenia incorrecta")
+            self._agregar_log("!!! [LOGIN] Intento fallido de entrar como "
+                              "administrador")
+            return
+        self._es_admin = True
+        self._admin_desde = time.monotonic()
+        self._admin_ultima_act = time.monotonic()
+        self.lbl_login_err.configure(text="")
+        self.lbl_login_aviso.configure(text="")
+        self._agregar_log(f"[LOGIN] Entro como ADMINISTRADOR. Vuelve a "
+                          f"operario solo despues de {TIMEOUT_ADMIN_MIN} min "
+                          f"sin actividad.")
+        self._refrescar_login()
+        # Si vino redirigido desde CALIBRAR, llevarlo ahi ahora que puede.
+        if getattr(self, "_venia_de_calibrar", False):
+            self._venia_de_calibrar = False
+            try:
+                self.nb.select(self.tab_calibrar)
+            except Exception:
+                pass
+
+    def _logout_admin(self, por_timeout=False):
+        if not self._es_admin:
+            return
+        self._es_admin = False
+        self._admin_desde = None
+        self._admin_ultima_act = None
+        if por_timeout:
+            self._agregar_log(f"[LOGIN] Volvio a OPERARIO solo: "
+                              f"{TIMEOUT_ADMIN_MIN} min sin actividad.")
+        else:
+            self._agregar_log("[LOGIN] Volvio a OPERARIO")
+        # Si estaba en CALIBRAR, sacarlo de ahi
+        try:
+            if self.nb.tab(self.nb.select(), 'text').strip() == 'CALIBRAR':
+                if self._preview_activo:
+                    self._detener_preview()
+                self.nb.select(self.tab_operar)
+        except Exception:
+            pass
+        self._refrescar_login()
+
+    def _cambiar_pass(self):
+        act = self.ent_pass_actual.get()
+        nue = self.ent_pass_nueva.get()
+        rep_ = self.ent_pass_rep.get()
+        if not verificar_pass_admin(act):
+            self.lbl_pass_msg.configure(text="La contrasenia actual no es "
+                                             "correcta", fg='#ff6b6b')
+            return
+        if len(nue) < 4:
+            self.lbl_pass_msg.configure(text="La nueva tiene que tener al "
+                                             "menos 4 caracteres",
+                                        fg='#ff6b6b')
+            return
+        if nue != rep_:
+            self.lbl_pass_msg.configure(text="Las dos nuevas no coinciden",
+                                        fg='#ff6b6b')
+            return
+        guardar_hash_admin(_hash_pass(nue))
+        for e in (self.ent_pass_actual, self.ent_pass_nueva,
+                  self.ent_pass_rep):
+            e.delete(0, 'end')
+        self.lbl_pass_msg.configure(text="Contrasenia cambiada", fg='#7fff7f')
+        self._agregar_log("[LOGIN] Contrasenia de administrador cambiada")
+
+    def _marcar_actividad_admin(self):
+        """Reinicia el reloj del timeout. Se llama desde las acciones de
+        admin, asi trabajar en CALIBRAR no lo saca en medio de una
+        calibracion."""
+        if self._es_admin:
+            self._admin_ultima_act = time.monotonic()
+
+    def _refrescar_login(self):
+        """Sincroniza el indicador de arriba, la pestania LOGIN y el timeout."""
+        # Timeout
+        if self._es_admin and self._admin_ultima_act is not None:
+            resta = (TIMEOUT_ADMIN_MIN * 60
+                     - (time.monotonic() - self._admin_ultima_act))
+            if resta <= 0:
+                self._logout_admin(por_timeout=True)
+                return
+        else:
+            resta = None
+
+        if self._es_admin:
+            m, sg = divmod(int(resta), 60)
+            self.lbl_usuario.configure(text=f"ADMIN  ({m}:{sg:02d})",
+                                       fg='#ffd24a')
+        else:
+            self.lbl_usuario.configure(text="OPERARIO", fg='#7fffd4')
+
+        # INSPECTOR DE MACROS y SENALES DEL PMC: los dos paneles enteros
+        # quedan grises para el operario, ni leer ni escribir. Los botones
+        # siguen habilitados por dentro para que al apretarlos mande a LOGIN
+        # con el motivo, en vez de no pasar nada.
+        try:
+            adm = self._es_admin
+            for b_ in (self.btn_escribir_macro, self.btn_escribir_pmc):
+                b_.configure(bg='#cc7a00' if adm else '#3a3a3a',
+                             fg='white' if adm else '#6e6e6e')
+            for b_ in (self.btn_leer_macro, self.btn_leer_pmc):
+                b_.configure(bg='SystemButtonFace' if adm else '#3a3a3a',
+                             fg='black' if adm else '#6e6e6e')
+            for f_, txt in ((self.f_insp_macros, "INSPECTOR DE MACROS"),
+                            (self.f_pmc_senales, "SENALES DEL PMC (LADDER)")):
+                f_.configure(
+                    text=f" {txt} " if adm else f" {txt}  -  solo ADMIN ",
+                    fg='white' if adm else '#6e6e6e')
+            for e_ in (self.ent_insp_num, self.ent_insp_val,
+                       self.ent_pmc_byte, self.ent_pmc_val):
+                e_.configure(state='normal' if adm else 'disabled',
+                             disabledbackground='#2b2b2b',
+                             disabledforeground='#6e6e6e')
+            for c_ in (self.cmb_pmc_area, self.cmb_pmc_bit):
+                c_.configure(state='readonly' if adm else 'disabled')
+        except AttributeError:
+            pass
+
+        # La pestania CALIBRAR se deshabilita de verdad cuando no es admin:
+        # gris y no se puede clickear. Con "(admin)" en el titulo para que se
+        # entienda por que, y la pestania LOGIN al lado para saber donde ir.
+        try:
+            if self._es_admin:
+                self.nb.tab(self.tab_calibrar, state='normal',
+                            text='  CALIBRAR  ')
+            else:
+                self.nb.tab(self.tab_calibrar, state='disabled',
+                            text='  CALIBRAR (admin)  ')
+        except Exception:
+            pass
+
+        try:
+            if self._es_admin:
+                m, sg = divmod(int(resta), 60)
+                self.lbl_login_rol.configure(text="ADMINISTRADOR",
+                                             fg='#ffd24a')
+                self.lbl_login_timeout.configure(
+                    text=f"Vuelve a operario solo en {m}:{sg:02d} "
+                         f"(el reloj se reinicia con cada accion de admin)")
+                self.btn_login_salir.configure(state='normal')
+            else:
+                self.lbl_login_rol.configure(text="OPERARIO", fg='#7fffd4')
+                self.lbl_login_timeout.configure(text="")
+                self.btn_login_salir.configure(state='disabled')
+        except AttributeError:
+            pass
+
+    def _exigir_admin(self, accion="esta accion"):
+        """True si es admin. Si no, avisa y manda a la pestania LOGIN."""
+        if self._es_admin:
+            self._marcar_actividad_admin()
+            return True
+        try:
+            self.lbl_login_aviso.configure(
+                text=f"{accion} necesita permisos de ADMINISTRADOR. "
+                     f"Poner la contrasenia para continuar.")
+            self.nb.select(self.tab_login)
+            self.ent_login_pass.focus_set()
+        except Exception:
+            pass
+        return False
+
+    # ==================================================================
 
     #  Handlers OPERAR
 
     # ==================================================================
 
+    # ==================================================================
+    #  BLOQUEO DEL CAMBIO DE TIPO Y DE ROSCA
+    # ------------------------------------------------------------------
+    #  El tipo de pantalla es el que se usa al ENCOLAR (torno.encolar) y el
+    #  que viaja al robot como TIPO_GLOBAL en la respuesta de vision. Si se
+    #  cambia con pallets en circulacion, esas piezas -que son del modelo
+    #  VIEJO- se encolan y se manipulan como si fueran del nuevo: pick_mesa
+    #  con la calibracion equivocada, dar_vuelta con la rutina equivocada.
+    #
+    #  OJO: la receta que ya esta EN LA COLA no corre riesgo. Esa la escribe
+    #  _liberar_ahora desde _receta_esperada, que sale del snapshot de la
+    #  cola, no de la pantalla. El problema son los pallets que todavia no
+    #  se encolaron.
+    #
+    #  Dos condiciones para poder cambiar:
+    #    1) Cinta y mesa en MANUAL. En automatico la celda esta produciendo.
+    #    2) Cola en CERO. Manual no alcanza: se puede estar en manual con 15
+    #       pallets circulando, y esos siguen teniendo el tipo anterior.
+    #
+    #  El tipo de la pestania CALIBRAR NO se bloquea: es independiente, solo
+    #  elige que archivo de calibracion se edita, y calibrar un modelo nuevo
+    #  mientras se produce otro es justamente lo que se quiere poder hacer.
+    # ==================================================================
+    def _puede_cambiar_receta(self):
+        """(bool, lista de motivos) para cambiar tipo o rosca."""
+        est = estado.get_estado()
+        motivos = []
+        if est["modo_auto_cinta"]:
+            motivos.append("La CINTA esta en AUTOMATICO")
+        if est["modo_auto_mesa"]:
+            motivos.append("La MESA esta en AUTOMATICO")
+        try:
+            n = len(torno.cola)
+        except Exception:
+            n = 0
+        if n > 0:
+            motivos.append(f"Hay {n} pieza(s) en la cola del torno")
+        return (len(motivos) == 0), motivos
+
+    def _texto_bloqueo_receta(self):
+        """Texto del tooltip. Se arma en el momento de mostrarlo, asi refleja
+        el estado real de ese instante. None = no mostrar nada."""
+        ok, motivos = self._puede_cambiar_receta()
+        if ok:
+            return None
+        lineas = ["NO se puede cambiar el tipo ni la rosca", ""]
+        for m in motivos:
+            lineas.append(f"  - {m}")
+        lineas += [
+            "",
+            "Los pallets que ya circulan tienen piezas del",
+            "modelo VIEJO. El tipo de pantalla es el que se usa",
+            "al ENCOLAR y el que se le manda al robot, asi que",
+            "esas piezas se encolarian y se manipularian como",
+            "si fueran del modelo nuevo.",
+            "",
+            "Para poder cambiar:",
+            "  1. Pasar CINTA y MESA a MANUAL",
+            "  2. Vaciar la cinta con 'Todo op=3 (dejar pasar)'",
+            "     en la pestania TORNO y esperar que la cola",
+            "     llegue a 0",
+        ]
+        return "\n".join(lineas)
+
+    def _avisar_bloqueo_receta(self):
+        """Cartel cuando se aprieta un boton bloqueado."""
+        ok, motivos = self._puede_cambiar_receta()
+        if ok:
+            return True
+        messagebox.showwarning(
+            "No se puede cambiar la receta",
+            "No se puede cambiar el tipo de pieza ni la rosca ahora:\n\n"
+            + "\n".join(f"  \u2022 {m}" for m in motivos)
+            + "\n\nLos pallets que ya circulan tienen piezas del modelo "
+              "VIEJO. El tipo de pantalla es el que se usa al ENCOLAR y el "
+              "que se le manda al robot (TIPO_GLOBAL), asi que esas piezas se "
+              "encolarian y se manipularian como si fueran del modelo nuevo: "
+              "calibracion de mesa equivocada, rutina de dar vuelta "
+              "equivocada.\n\n"
+              "La receta que ya esta en la cola NO se toca: esa se escribe "
+              "desde la entrada encolada, no desde la pantalla.\n\n"
+              "Para cambiar:\n"
+              "  1. Pasar CINTA y MESA a MANUAL\n"
+              "  2. En la pestania TORNO, 'Todo op=3 (dejar pasar)' y "
+              "esperar que la cola llegue a 0")
+        return False
+
+    def _refrescar_bloqueo_receta(self):
+        """Pinta los botones de tipo y rosca segun se pueda cambiar o no.
+        Los botones quedan HABILITADOS a proposito: asi el tooltip funciona
+        (un widget disabled no dispara <Enter>) y al apretarlos sale el
+        cartel con el motivo, en vez de no pasar nada."""
+        ok, _ = self._puede_cambiar_receta()
+        if ok == getattr(self, "_receta_desbloqueada", None):
+            return                      # sin cambios, no repintar
+        self._receta_desbloqueada = ok
+        # Pintar los botones. Quedan HABILITADOS a proposito (un widget
+        # disabled no dispara <Enter> y el tooltip no apareceria), pero se
+        # ven grises y apagados para que se entienda que no se pueden usar.
+        est = estado.get_estado()
+        for i, btn in enumerate(self.btns_tipo_operar):
+            if not ok:
+                btn.configure(bg='#3a3a3a', fg='#6e6e6e', relief='flat',
+                              activebackground='#3a3a3a')
+            else:
+                self._refrescar_boton_tipo(btn, i + 1,
+                                           seleccionado=(i + 1 == est["tipo"]),
+                                           estacion="cinta")
+        for i, btn in enumerate(self.btns_rosca):
+            nom = nombre_rosca(i + 1)
+            if not ok:
+                btn.configure(text=nom, bg='#3a3a3a', fg='#6e6e6e',
+                              relief='flat', activebackground='#3a3a3a')
+            elif i + 1 == est["rosca"]:
+                btn.configure(text=nom, bg='#4a90e2', fg='white',
+                              relief='sunken', activebackground='#4a90e2')
+            else:
+                btn.configure(text=nom, bg='SystemButtonFace', fg='black',
+                              relief='raised', activebackground='#dddddd')
+        # El fondo de los frames NO se toca: pintarlo de otro color quedaba
+        # horrible. Alcanza con el titulo apagado y los botones en gris.
+        try:
+            txt_t = (" TIPO DE PIEZA (Receta) " if ok
+                     else " TIPO DE PIEZA (Receta)   -  BLOQUEADO ")
+            txt_r = (" TIPO DE ROSCA (solo torno) " if ok
+                     else " TIPO DE ROSCA (solo torno)   -  BLOQUEADO ")
+            self.f_tipo_operar.configure(text=txt_t,
+                                         fg='white' if ok else '#8a8a8a')
+            self.f_rosca_operar.configure(text=txt_r,
+                                          fg='white' if ok else '#8a8a8a')
+        except AttributeError:
+            pass
+
     def _seleccionar_tipo_operar(self, tipo):
+
+        # Bloqueo: no cambiar la receta con la celda produciendo o con
+
+        # pallets en circulacion. La comprobacion va ACA y no en el estado
+
+        # 'disabled' del boton para que el tooltip funcione y para que al
+
+        # apretar salga el cartel con el motivo. Durante la construccion de
+
+        # la UI se llama para pintar los valores iniciales: ahi no bloquea.
+
+        if getattr(self, "_init_receta_hecho", False):
+
+            if not self._avisar_bloqueo_receta():
+
+                return
 
         estado.set_tipo(tipo)
 
@@ -4630,19 +5522,37 @@ class HMISpirax:
 
         """Selecciona el tipo de rosca global (1-3). Solo se manda al torno."""
 
+        # Bloqueo: no cambiar la receta con la celda produciendo o con
+
+        # pallets en circulacion. La comprobacion va ACA y no en el estado
+
+        # 'disabled' del boton para que el tooltip funcione y para que al
+
+        # apretar salga el cartel con el motivo. Durante la construccion de
+
+        # la UI se llama para pintar los valores iniciales: ahi no bloquea.
+
+        if getattr(self, "_init_receta_hecho", False):
+
+            if not self._avisar_bloqueo_receta():
+
+                return
+
         estado.set_rosca(rosca)
 
         for i, btn in enumerate(self.btns_rosca):
 
+            nom = nombre_rosca(i + 1)
+
             if i + 1 == rosca:
 
-                btn.configure(bg='#4a90e2', fg='white', relief='sunken',
+                btn.configure(text=nom, bg='#4a90e2', fg='white',
 
-                              activebackground='#4a90e2')
+                              relief='sunken', activebackground='#4a90e2')
 
             else:
 
-                btn.configure(bg='SystemButtonFace', fg='black',
+                btn.configure(text=nom, bg='SystemButtonFace', fg='black',
 
                               relief='raised', activebackground='#dddddd')
 
@@ -6386,7 +7296,22 @@ class HMISpirax:
 
             self._detener_preview()
 
+        if tab == 'CALIBRAR' and not self._es_admin:
+
+            # Sin permisos: manda a LOGIN con el aviso. No se queda en una
+            # pestania vacia sin saber donde loguearse. (Con la pestania
+            # deshabilitada esto casi no se alcanza, pero queda por si el
+            # estado quedo desfasado.)
+            self._venia_de_calibrar = True
+
+            self._exigir_admin("La pestania CALIBRAR")
+
+            return
+
         if tab == 'CALIBRAR':
+
+            self._marcar_actividad_admin()
+
 
             # Calibrar y Automatico NO conviven (usan las mismas camaras).
 
@@ -6758,6 +7683,8 @@ class HMISpirax:
             self._refrescar_verificacion_torno()
             self._refrescar_primera_pieza()
             self._forzar_manual_por_robot_caido()
+            self._refrescar_bloqueo_receta()
+            self._refrescar_login()
             try:
                 self._refrescar_tab_io()
             except AttributeError:
